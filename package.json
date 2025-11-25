@@ -1,0 +1,24 @@
+{
+  "name": "fyp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "nodemon index.js",
+    "test": "node test-api.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.56.1",
+    "axios": "^1.7.8",
+    "dotenv": "^17.2.1",
+    "express": "^4.21.1",
+    "googleapis": "^159.0.0",
+    "nodemon": "^3.1.10",
+    "openai": "^5.16.0"
+  }
+}
