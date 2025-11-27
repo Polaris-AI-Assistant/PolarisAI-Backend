@@ -101,10 +101,20 @@ router.put('/sessions/:chatId/messages', verifyAuth, async (req, res) => {
       });
     }
     
+    // Filter out messages with empty content before processing
+    const validMessages = messages.filter(msg => msg.content && msg.content.trim() !== '');
+    
+    if (validMessages.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid messages to save',
+      });
+    }
+    
     const updatedSession = await chatData.addMessagesToSession(
       chatId,
       req.userId,
-      messages
+      validMessages
     );
     
     res.json({

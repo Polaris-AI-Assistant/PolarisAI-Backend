@@ -183,7 +183,10 @@ async function addMessagesToSession(chatId, userId, messages) {
     const existingMessageIds = new Set(existingMessages?.map((m) => m.id) || []);
 
     // Find new messages that need to be inserted
-    const newMessages = messages.filter((msg) => !existingMessageIds.has(msg.id));
+    // Filter out messages with empty content to avoid database constraint violations
+    const newMessages = messages
+      .filter((msg) => !existingMessageIds.has(msg.id))
+      .filter((msg) => msg.content && msg.content.trim() !== '');
 
     if (newMessages.length > 0) {
       // Insert new messages with frontend-generated IDs

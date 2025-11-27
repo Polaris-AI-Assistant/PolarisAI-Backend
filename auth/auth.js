@@ -4,13 +4,13 @@ const { isValidEmail, isValidPassword, validateRequiredFields, sanitizeInput } =
 
 const router = express.Router();
 
-// Sign up with email and password
-router.post('/signup', async (req, res) => {
+// Step 1: Send OTP for signup (creates user and sends OTP)
+router.post('/signup/send-otp', async (req, res) => {
   try {
-    let { email, password, firstName, lastName } = req.body;
+    let { email, fullName, password } = req.body;
 
     // Validate required fields
-    const missingFields = validateRequiredFields(req.body, ['email', 'password']);
+    const missingFields = validateRequiredFields(req.body, ['email', 'password', 'fullName']);
     if (missingFields.length > 0) {
       return res.status(400).json({ 
         error: `Missing required fields: ${missingFields.join(', ')}` 
@@ -19,8 +19,7 @@ router.post('/signup', async (req, res) => {
 
     // Sanitize inputs
     email = sanitizeInput(email?.toLowerCase());
-    firstName = sanitizeInput(firstName);
-    lastName = sanitizeInput(lastName);
+    fullName = sanitizeInput(fullName);
 
     // Validate email format
     if (!isValidEmail(email)) {
@@ -34,36 +33,144 @@ router.post('/signup', async (req, res) => {
       });
     }
 
-    const { data, error } = await supabase.auth.signUp({
+    // First, create the user with password
+    const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
       email,
       password,
       options: {
+        emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL}/auth/callback`,
         data: {
-          first_name: firstName || null,
-          last_name: lastName || null,
+          full_name: fullName,
         }
       }
+    });
+
+    if (signUpError) {
+      return res.status(400).json({ error: signUpError.message });
+    }
+
+    // Then send OTP for email verification
+    const { data: otpData, error: otpError } = await supabase.auth.signInWithOtp({
+      email,
+      options: {
+        shouldCreateUser: false, // User already created above
+      },
+    });
+
+    if (otpError) {
+      console.error('OTP send error:', otpError);
+      // User is created but OTP failed - still return success
+    }
+
+    res.status(201).json({
+      message: 'OTP sent to your email',
+      email: email,
+      userId: signUpData.user?.id,
+    });
+  } catch (err) {
+    console.error('Signup OTP error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Step 2: Verify OTP and complete signup with metadata
+router.post('/signup/verify-otp', async (req, res) => {
+  try {
+    let { email, token, metadata } = req.body;
+
+    // Validate required fields
+    if (!email || !token) {
+      return res.status(400).json({ 
+        error: 'Email and OTP token are required' 
+      });
+    }
+
+    // Sanitize email
+    email = sanitizeInput(email?.toLowerCase());
+
+    // Verify OTP
+    const { data, error } = await supabase.auth.verifyOtp({
+      email,
+      token,
+      type: 'email',
     });
 
     if (error) {
       return res.status(400).json({ error: error.message });
     }
 
-    res.status(201).json({
-      message: 'User created successfully',
+    // Update user metadata if provided
+    if (metadata && data.session) {
+      const { error: updateError } = await supabase.auth.updateUser({
+        data: {
+          full_name: metadata.fullName || null,
+          use_cases: metadata.useCases || [],
+          user_type: metadata.userType || null,
+          onboarding_completed: false,
+        }
+      });
+
+      if (updateError) {
+        console.error('Metadata update error:', updateError);
+      }
+    }
+
+    res.status(200).json({
+      message: 'Email verified successfully',
       user: {
         id: data.user?.id,
         email: data.user?.email,
-        emailConfirmed: data.user?.email_confirmed_at ? true : false
+        emailConfirmed: true,
+        metadata: data.user?.user_metadata,
       },
-      session: data.session ? {
-        access_token: data.session.access_token,
-        refresh_token: data.session.refresh_token,
-        expires_at: data.session.expires_at
-      } : null
+      session: {
+        access_token: data.session?.access_token,
+        refresh_token: data.session?.refresh_token,
+        expires_in: data.session?.expires_in,
+        expires_at: data.session?.expires_at,
+        token_type: data.session?.token_type,
+      }
     });
   } catch (err) {
-    console.error('Signup error:', err);
+    console.error('Verify OTP error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Resend OTP
+router.post('/signup/resend-otp', async (req, res) => {
+  try {
+    let { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Sanitize email
+    email = sanitizeInput(email?.toLowerCase());
+
+    // Validate email format
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    const { data, error } = await supabase.auth.signInWithOtp({
+      email,
+      options: {
+        shouldCreateUser: false,
+      },
+    });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({
+      message: 'OTP resent successfully',
+      email: email,
+    });
+  } catch (err) {
+    console.error('Resend OTP error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -118,6 +225,36 @@ router.post('/signin', async (req, res) => {
   }
 });
 
+
+// Google OAuth Sign In/Sign Up
+router.get('/google', async (req, res) => {
+  try {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3001'}/auth/callback`,
+        queryParams: {
+          access_type: 'offline',
+          prompt: 'consent',
+        },
+        skipBrowserRedirect: true, // Return URL instead of redirecting
+      }
+    });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    // Return the OAuth URL to the frontend
+    res.json({
+      url: data.url,
+      provider: data.provider
+    });
+  } catch (err) {
+    console.error('Google OAuth error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // Handle OAuth callback
 router.get('/callback', async (req, res) => {
