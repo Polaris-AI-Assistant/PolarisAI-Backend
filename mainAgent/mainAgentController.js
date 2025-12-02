@@ -4,10 +4,16 @@
  * HTTP endpoint for interacting with the Main Coordinator Agent.
  * This is the primary entry point for users to send queries that may
  * involve one or multiple specialized agents.
+ * 
+ * Includes:
+ * - Streaming query processing with SSE
+ * - Confirmation flow for sensitive actions
+ * - Confirm/Cancel action endpoints
  */
 
 const express = require('express');
 const MainAgent = require('./mainAgent');
+const confirmationStore = require('./confirmationStore');
 const { authenticateToken } = require('../middleware/auth');
 
 const router = express.Router();
@@ -140,6 +146,195 @@ router.post('/query', authenticateToken, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to process query',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * POST /agent/confirm-action
+ * Confirm and execute a pending action that requires user approval
+ * 
+ * Request body:
+ * {
+ *   "requestId": "uuid-of-pending-action"
+ * }
+ * 
+ * Response: Server-Sent Events (SSE) stream with execution result
+ */
+router.post('/confirm-action', authenticateToken, async (req, res) => {
+  try {
+    const { requestId } = req.body;
+    const userId = req.user.id;
+
+    // Validate input
+    if (!requestId || typeof requestId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'requestId is required and must be a string'
+      });
+    }
+
+    console.log(`[MainAgentController] User ${userId} confirming action: ${requestId}`);
+
+    // Verify the pending action exists and belongs to this user
+    const pendingAction = confirmationStore.getPendingAction(requestId, userId);
+    if (!pendingAction) {
+      return res.status(404).json({
+        success: false,
+        error: 'Action not found, expired, or unauthorized',
+        message: 'The action you are trying to confirm is no longer available. It may have expired or been canceled.'
+      });
+    }
+
+    // Set up SSE headers for streaming response
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+    // Send thinking indicator
+    res.write(`data: ${JSON.stringify({ type: 'thinking', status: 'start' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'status', message: 'Executing your confirmed action...' })}\n\n`);
+
+    try {
+      // Execute the confirmed action
+      const executionResult = await mainAgent.executeConfirmedAction(requestId, userId);
+
+      if (!executionResult.success) {
+        res.write(`data: ${JSON.stringify({ 
+          type: 'error', 
+          error: executionResult.error || 'Failed to execute action'
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // Stream the response after successful execution
+      await mainAgent.streamConfirmedActionResponse(executionResult, (chunk) => {
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      });
+
+      // Send completion signal
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.end();
+
+    } catch (error) {
+      console.error('[MainAgentController] Confirm action error:', error);
+      res.write(`data: ${JSON.stringify({ 
+        type: 'error', 
+        error: error.message || 'Failed to execute confirmed action'
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.end();
+    }
+
+  } catch (error) {
+    console.error('[MainAgentController] Confirm action setup error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process confirmation',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * POST /agent/cancel-action
+ * Cancel a pending action that requires user approval
+ * 
+ * Request body:
+ * {
+ *   "requestId": "uuid-of-pending-action"
+ * }
+ * 
+ * Response:
+ * {
+ *   "success": true,
+ *   "message": "Action canceled...",
+ *   "canceledAction": {...}
+ * }
+ */
+router.post('/cancel-action', authenticateToken, async (req, res) => {
+  try {
+    const { requestId } = req.body;
+    const userId = req.user.id;
+
+    // Validate input
+    if (!requestId || typeof requestId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'requestId is required and must be a string'
+      });
+    }
+
+    console.log(`[MainAgentController] User ${userId} canceling action: ${requestId}`);
+
+    // Cancel the pending action
+    const result = mainAgent.cancelPendingAction(requestId, userId);
+
+    if (!result.success) {
+      return res.status(404).json({
+        success: false,
+        error: result.error || 'Action not found',
+        message: 'The action you are trying to cancel is no longer available.'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: result.message,
+      canceledAction: result.canceledAction,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('[MainAgentController] Cancel action error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to cancel action',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * GET /agent/pending-actions
+ * Get all pending actions for the current user
+ * 
+ * Response:
+ * {
+ *   "success": true,
+ *   "pendingActions": [...]
+ * }
+ */
+router.get('/pending-actions', authenticateToken, (req, res) => {
+  try {
+    const userId = req.user.id;
+    const pendingActions = confirmationStore.getUserPendingActions(userId);
+
+    res.json({
+      success: true,
+      pendingActions: pendingActions.map(action => ({
+        requestId: action.requestId,
+        toolName: action.toolName,
+        agentName: action.agentName,
+        previewContent: action.previewContent,
+        createdAt: action.createdAt,
+        expiresAt: action.expiresAt
+      })),
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('[MainAgentController] Get pending actions error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve pending actions',
       message: error.message,
       timestamp: new Date().toISOString()
     });
