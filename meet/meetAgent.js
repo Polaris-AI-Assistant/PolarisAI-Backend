@@ -205,7 +205,18 @@ class MeetAgent {
    * Create the system prompt that defines agent behavior
    */
   createSystemPrompt() {
+    // Get current date dynamically
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString('en-US', { 
+      weekday: 'long',
+      month: 'long', 
+      day: 'numeric', 
+      year: 'numeric' 
+    });
+    
     return `You are a helpful AI assistant specialized in Google Meet management.
+
+**IMPORTANT - Current date is ${currentDateStr}**. Use this as reference for any date-related queries like "today", "tomorrow", etc.
 
 Your capabilities:
 - Create new meeting spaces with unique meeting links
@@ -253,12 +264,42 @@ Always confirm successful operations and provide relevant details like meeting l
    * Process a natural language query
    * @param {string} query - The user's natural language query
    * @param {string} userId - The user ID for authentication
-   * @param {Object} options - Additional options (conversationHistory, etc.)
+   * @param {Object} options - Additional options (conversationHistory, forceToolExecution, etc.)
    * @returns {Promise<Object>} - The processed result
    */
   async processQuery(query, userId, options = {}) {
     try {
       console.log(`[MeetAgent] Processing query for user ${userId}: "${query}"`);
+
+      // If forceToolExecution is set, directly execute the tool without LLM
+      if (options.forceToolExecution && options.forceToolExecution.toolName && options.forceToolExecution.params) {
+        console.log(`[MeetAgent] Force executing tool: ${options.forceToolExecution.toolName}`);
+        console.log(`[MeetAgent] With exact params:`, JSON.stringify(options.forceToolExecution.params, null, 2));
+        
+        const functionToCall = this.functionMap[options.forceToolExecution.toolName];
+        if (!functionToCall) {
+          throw new Error(`Unknown function: ${options.forceToolExecution.toolName}`);
+        }
+
+        const result = await functionToCall(userId, options.forceToolExecution.params);
+        
+        let responseText = result.success ? `Successfully created your Google Meet!` : result.error;
+        if (result.success && result.space) {
+          responseText = `Your Google Meet has been created! Join here: ${result.space.meetingUri}`;
+        }
+        
+        return {
+          success: true,
+          response: responseText,
+          query: query,
+          tools_used: [{
+            name: options.forceToolExecution.toolName,
+            arguments: options.forceToolExecution.params
+          }],
+          raw_results: [result],
+          timestamp: new Date().toISOString()
+        };
+      }
 
       // Build messages array with conversation history if provided
       const messages = [
@@ -335,12 +376,24 @@ Always confirm successful operations and provide relevant details like meeting l
         assistantMessage = response.choices[0].message;
       }
 
-      // Return final response
+      // Collect raw results from tool calls for artifact extraction
+      const rawResults = messages
+        .filter(m => m.role === 'tool')
+        .map(m => {
+          try {
+            return JSON.parse(m.content);
+          } catch {
+            return { success: false, error: 'Parse error' };
+          }
+        });
+
+      // Return final response with raw_results for artifact extraction
       return {
         success: true,
         response: assistantMessage.content,
         query: query,
         tools_used: toolsUsed,
+        raw_results: rawResults,
         timestamp: new Date().toISOString()
       };
 

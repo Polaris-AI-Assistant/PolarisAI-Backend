@@ -330,6 +330,37 @@ function createFunctionMap(userId) {
  */
 async function processQuery(query, userId, options = {}) {
   try {
+    // If forceToolExecution is set, directly execute the tool without LLM
+    if (options.forceToolExecution && options.forceToolExecution.toolName && options.forceToolExecution.params) {
+      console.log(`[DocsAgent] Force executing tool: ${options.forceToolExecution.toolName}`);
+      console.log(`[DocsAgent] With exact params:`, JSON.stringify(options.forceToolExecution.params, null, 2));
+      
+      const functionMap = createFunctionMap(userId);
+      const functionToCall = functionMap[options.forceToolExecution.toolName];
+      if (!functionToCall) {
+        throw new Error(`Unknown function: ${options.forceToolExecution.toolName}`);
+      }
+
+      const result = await functionToCall(options.forceToolExecution.params);
+      
+      let responseText = result.success ? `Successfully executed ${options.forceToolExecution.toolName}` : result.error;
+      if (options.forceToolExecution.toolName === 'createDocument' && result.success) {
+        responseText = `Your document "${options.forceToolExecution.params.title}" has been created! ${result.documentUrl ? `View it here: ${result.documentUrl}` : ''}`;
+      }
+      
+      return {
+        success: true,
+        response: responseText,
+        toolCalls: [{
+          function: options.forceToolExecution.toolName,
+          arguments: options.forceToolExecution.params,
+          result: result
+        }],
+        raw_results: [result],
+        conversationHistory: []
+      };
+    }
+
     const messages = [
       {
         role: 'system',
@@ -464,6 +495,7 @@ Be proactive, accurate, and user-friendly!`
       success: true,
       response: assistantMessage.content,
       toolCalls: toolCalls,
+      raw_results: toolCalls.map(tc => tc.result),  // Include raw results for artifact extraction
       conversationHistory: messages
     };
   } catch (error) {

@@ -32,10 +32,25 @@ const CalendarAgent = require('../calendar/calendarAgent');
 const docsAgent = require('../docs/docsAgent'); // Note: This exports functions, not a class
 const FormsAgent = require('../forms/formsAgent');
 const GitHubAgent = require('../github/githubAgent');
+const GmailAgent = require('../gmail/gmailAgent');
 const MeetAgent = require('../meet/meetAgent');
 const SheetsAgent = require('../sheets/sheetsAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
+
+// Artifact Memory imports
+const { 
+    extractAndStoreArtifact, 
+    formatArtifactsForPrompt,
+    getArtifacts,
+    getLastArtifact,
+    getLastArtifactByType
+} = require('../utils/artifactMemory');
+const { 
+    buildArtifactContext, 
+    generateArtifactPromptEnhancement,
+    containsArtifactReference 
+} = require('../middleware/artifactContext');
 
 class MainAgent {
   constructor() {
@@ -53,6 +68,7 @@ class MainAgent {
       },
       forms: new FormsAgent(),
       github: new GitHubAgent(),
+      gmail: new GmailAgent(),
       meet: new MeetAgent(),
       sheets: new SheetsAgent()
     };
@@ -122,9 +138,10 @@ class MainAgent {
     }
 
     try {
-      const { agentName, toolName, params, query, conversationHistory } = pendingAction;
+      const { agentName, toolName, params, query, conversationHistory, conversationId } = pendingAction;
       
-      console.log(`[MainAgent] Executing confirmed action: ${toolName} on ${agentName}`);
+      console.log(`\n[MainAgent] 🚀 Executing confirmed action: ${toolName} on ${agentName}`);
+      console.log(`[MainAgent]   ConversationId: ${conversationId || 'NOT SET'}`);
       
       // Get the specialized agent
       const agent = this.agents[agentName];
@@ -144,6 +161,27 @@ class MainAgent {
         }
       });
 
+      // CRITICAL: Store artifact after confirmed action execution
+      let storedArtifact = null;
+      if (conversationId && result.success) {
+        console.log(`[MainAgent] 💾 Storing artifact for confirmed action...`);
+        try {
+          storedArtifact = await extractAndStoreArtifact(
+            conversationId,
+            agentName,
+            toolName,
+            result
+          );
+          if (storedArtifact) {
+            console.log(`[MainAgent] ✅ Artifact stored: ${storedArtifact.type} - ${storedArtifact.title} (${storedArtifact.id})`);
+          }
+        } catch (artifactError) {
+          console.error(`[MainAgent] ⚠️ Error storing artifact:`, artifactError);
+        }
+      } else if (!conversationId) {
+        console.log(`[MainAgent] ⚠️ No conversationId - artifact NOT stored`);
+      }
+
       // Remove the pending action after successful execution
       confirmationStore.removePendingAction(requestId);
 
@@ -152,7 +190,9 @@ class MainAgent {
         result: result,
         query: query,
         toolName: toolName,
-        agentName: agentName
+        agentName: agentName,
+        storedArtifact: storedArtifact,
+        conversationId: conversationId
       };
 
     } catch (error) {
@@ -200,7 +240,25 @@ class MainAgent {
    * Create the system prompt that defines the main agent's behavior
    */
   createSystemPrompt() {
+    const currentDate = new Date();
+    const dateString = currentDate.toLocaleDateString('en-US', { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric' 
+    });
+    const timeString = currentDate.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'short'
+    });
+    
     return `You are an intelligent Main Coordinator Agent that manages multiple specialized agents for different services.
+
+**IMPORTANT - CURRENT DATE AND TIME**:
+Today's date is: ${dateString}
+Current time is: ${timeString}
+Always use this date/time as reference for any date-related queries like "today", "tomorrow", "next week", etc.
 
 Your responsibilities:
 1. Analyze user requests to understand their intent
@@ -209,6 +267,7 @@ Your responsibilities:
 4. Combine and structure responses from multiple agents when needed
 5. Ensure responses are coherent, non-repetitive, and user-friendly
 6. Provide helpful, conversational responses
+7. **IMPORTANT**: Track and use artifact memory for cross-query context
 
 Available specialized agents and their capabilities:
 
@@ -239,6 +298,14 @@ Available specialized agents and their capabilities:
 - View repository statistics
 - Filter by language, date, etc.
 
+**GmailAgent**: Gmail operations
+- Send, reply, and forward emails
+- Read and search emails
+- Manage drafts (create, update, delete, send)
+- Label management (create, apply, remove labels)
+- Filter management (create email rules)
+- Email actions (star, archive, trash, mark read/unread)
+
 **MeetAgent**: Google Meet operations
 - Create meeting spaces
 - Get meeting details
@@ -260,24 +327,69 @@ Guidelines:
 - Always provide context about what actions were taken
 - Handle errors gracefully and provide helpful error messages
 - Combine related information to avoid redundancy
-- Maintain conversation context across multiple queries`;
+- Maintain conversation context across multiple queries
+
+**ARTIFACT MEMORY SYSTEM**:
+You have access to conversation artifact memory. This allows you to remember and operate on previously created items.
+
+When user refers to:
+- "it", "that", "this", "the previous one" → Use the most recently created artifact
+- "the form", "the document", "the sheet" → Use the most recent artifact of that type
+- "update it", "modify that", "add to it" → Identify the target artifact from memory
+
+When you create or modify something:
+- Note the artifact ID (formId, documentId, spreadsheetId, eventId, etc.) in your response
+- Use the existing artifact ID for follow-up modifications
+- Always confirm successful operations with the artifact details
+
+Remember: Artifacts are preserved within a conversation thread. Use this context to provide seamless multi-step interactions.`;
+  }
+
+  /**
+   * Create dynamic system prompt with artifact context
+   * @param {string} conversationId - Conversation ID for artifact lookup
+   */
+  async createDynamicSystemPrompt(conversationId) {
+    let basePrompt = this.createSystemPrompt();
+    
+    if (conversationId) {
+      const artifactEnhancement = await generateArtifactPromptEnhancement(conversationId);
+      if (artifactEnhancement) {
+        basePrompt += '\n\n' + artifactEnhancement;
+      }
+    }
+    
+    return basePrompt;
   }
 
   /**
    * Analyze the query and determine which agents are needed
    * Uses OpenAI to intelligently route the request
+   * Now includes artifact context for better query understanding
    */
-  async analyzeQuery(query, conversationHistory = []) {
+  async analyzeQuery(query, conversationHistory = [], artifactContext = null) {
     try {
+      // Build artifact context section for the prompt
+      let artifactSection = '';
+      if (artifactContext && artifactContext.allArtifacts && artifactContext.allArtifacts.length > 0) {
+        artifactSection = `\n\nCONVERSATION ARTIFACTS (Previously created items in this conversation):
+${artifactContext.allArtifacts.map(a => `- [${a.type.toUpperCase()}] "${a.title}" (ID: ${a.id})`).join('\n')}
+
+IMPORTANT: If the user refers to "it", "the form", "that document", etc., they are referring to one of the artifacts above. 
+Include the specific artifact ID in the query you generate for the agent.`;
+      }
+
       const analysisPrompt = `Analyze the following user query and determine which specialized agent(s) are needed to fulfill it.
 
 User Query: "${query}"
+${artifactSection}
 
 Available agents:
 - calendar: Google Calendar operations (events, meetings, schedules)
 - docs: Google Docs operations (create/edit documents, text formatting)
 - forms: Google Forms operations (create forms, manage questions, view responses)
 - github: GitHub operations (repos, commits, issues, PRs, profile)
+- gmail: Gmail operations (send/read/search emails, drafts, labels, filters)
 - meet: Google Meet operations (create meetings, view history, recordings)
 - sheets: Google Sheets operations (create/edit spreadsheets, data management)
 
@@ -285,7 +397,7 @@ Respond with a JSON object containing:
 {
   "agents": ["agent1", "agent2"],  // Array of agent names needed (can be one or multiple)
   "reasoning": "Why these agents were chosen",
-  "queries": {  // Specific queries to send to each agent
+  "queries": {  // Specific queries to send to each agent - MUST include artifact IDs if referencing existing items
     "agent1": "query for agent1",
     "agent2": "query for agent2"
   },
@@ -297,7 +409,11 @@ Examples:
 - "schedule a meeting tomorrow" -> {"agents": ["calendar"], ...}
 - "create a document and add it to my calendar" -> {"agents": ["docs", "calendar"], "requiresSequential": true, ...}
 - "show me my GitHub repos" -> {"agents": ["github"], ...}
+- "send an email to john@example.com" -> {"agents": ["gmail"], ...}
+- "check my unread emails" -> {"agents": ["gmail"], ...}
 - "create a form about customer feedback and a spreadsheet to track responses" -> {"agents": ["forms", "sheets"], ...}
+- "send an email about the meeting I scheduled" -> {"agents": ["gmail", "calendar"], "requiresSequential": true, ...}
+- "add a question to it" (with artifact FORM "Survey" formId=abc123) -> {"agents": ["forms"], "queries": {"forms": "add a question to form with formId abc123"}}
 
 Important:
 - Only include agents that are actually needed
@@ -331,10 +447,12 @@ Important:
 
   /**
    * Execute queries on the specified agents
+   * Now includes artifact storage after successful operations
    */
-  async executeAgentQueries(analysis, userId) {
+  async executeAgentQueries(analysis, userId, conversationId = null) {
     const results = {};
     const errors = {};
+    const storedArtifacts = [];
 
     try {
       if (analysis.requiresSequential) {
@@ -351,6 +469,26 @@ Important:
 
             const result = await agent.processQuery(agentQuery, userId);
             results[agentName] = result;
+
+            // Store artifacts from successful tool executions
+            if (conversationId && result.success && result.tools_used) {
+              for (const tool of result.tools_used) {
+                try {
+                  const rawResult = result.raw_results?.find(r => r.success !== false) || result;
+                  const artifact = await extractAndStoreArtifact(
+                    conversationId, 
+                    agentName, 
+                    tool.name || tool, 
+                    rawResult
+                  );
+                  if (artifact) {
+                    storedArtifacts.push(artifact);
+                  }
+                } catch (artifactError) {
+                  console.error(`[MainAgent] Error storing artifact:`, artifactError);
+                }
+              }
+            }
 
           } catch (error) {
             console.error(`[MainAgent] Error executing ${agentName}:`, error);
@@ -390,16 +528,36 @@ Important:
         const agentResults = await Promise.all(agentPromises);
         
         // Organize results and errors
-        agentResults.forEach(({ agentName, result, error }) => {
+        for (const { agentName, result, error } of agentResults) {
           if (error) {
             errors[agentName] = error;
           } else {
             results[agentName] = result;
+
+            // Store artifacts from successful tool executions
+            if (conversationId && result.success && result.tools_used) {
+              for (const tool of result.tools_used) {
+                try {
+                  const rawResult = result.raw_results?.find(r => r.success !== false) || result;
+                  const artifact = await extractAndStoreArtifact(
+                    conversationId, 
+                    agentName, 
+                    tool.name || tool, 
+                    rawResult
+                  );
+                  if (artifact) {
+                    storedArtifacts.push(artifact);
+                  }
+                } catch (artifactError) {
+                  console.error(`[MainAgent] Error storing artifact:`, artifactError);
+                }
+              }
+            }
           }
-        });
+        }
       }
 
-      return { results, errors };
+      return { results, errors, storedArtifacts };
 
     } catch (error) {
       console.error('[MainAgent] Error executing agent queries:', error);
@@ -488,19 +646,59 @@ Instead, present the information as if you're directly reporting the results.`;
   /**
    * Main method to process user queries with streaming support
    * This orchestrates the entire flow from analysis to final response with SSE streaming
-   * Now includes confirmation flow for sensitive operations
+   * Now includes confirmation flow for sensitive operations and artifact memory
    */
   async processQueryWithStreaming(query, userId, options = {}, onChunk) {
     const startTime = Date.now();
+    const conversationId = options.conversationId;
     
     try {
-      console.log(`[MainAgent] Processing streaming query for user ${userId}: "${query}"`);
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`[MainAgent] Processing streaming query for user ${userId}`);
+      console.log(`[MainAgent] Query: "${query}"`);
+      console.log(`[MainAgent] Conversation ID: ${conversationId || 'NOT PROVIDED'}`);
+      console.log(`${'='.repeat(60)}`);
 
       // Send initial status
       onChunk({ type: 'status', message: 'Analyzing your request...' });
 
+      // Build artifact context if conversationId is provided
+      let artifactContext = null;
+      let enhancedQuery = query;
+      
+      if (conversationId) {
+        console.log(`\n[ArtifactMemory] 🔍 Building artifact context for conversation: ${conversationId}`);
+        artifactContext = await buildArtifactContext(conversationId, query);
+        
+        console.log(`[ArtifactMemory] 📦 All artifacts in conversation: ${artifactContext.allArtifacts.length}`);
+        if (artifactContext.allArtifacts.length > 0) {
+          artifactContext.allArtifacts.forEach((a, i) => {
+            console.log(`[ArtifactMemory]   ${i + 1}. [${a.type}] ${a.title} (ID: ${a.id})`);
+          });
+        }
+        
+        console.log(`[ArtifactMemory] 🎯 Has artifact reference: ${artifactContext.hasArtifactReference}`);
+        if (artifactContext.hasArtifactReference) {
+          enhancedQuery = artifactContext.enhancedQuery;
+          console.log(`[ArtifactMemory] ✅ Resolved artifact: ${artifactContext.resolvedArtifact?.title}`);
+          console.log(`[ArtifactMemory] ✅ Artifact ID: ${artifactContext.resolvedArtifact?.id}`);
+          console.log(`[ArtifactMemory] ✅ Artifact Type: ${artifactContext.resolvedArtifact?.type}`);
+          console.log(`[ArtifactMemory] 📝 Enhanced query: ${enhancedQuery}`);
+        } else {
+          console.log(`[ArtifactMemory] ⚠️ No artifact reference detected in query`);
+        }
+      } else {
+        console.log(`\n[ArtifactMemory] ⚠️ No conversationId provided - artifact memory disabled`);
+      }
+
       // Step 1: Analyze the query to determine which agents are needed
-      const analysis = await this.analyzeQuery(query, options.conversationHistory);
+      // Pass artifact context to analysis for better routing
+      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext);
+      
+      console.log(`\n[MainAgent] 🤖 Query Analysis Result:`);
+      console.log(`[MainAgent]   Agents: ${analysis.agents.join(', ')}`);
+      console.log(`[MainAgent]   Reasoning: ${analysis.reasoning}`);
+      console.log(`[MainAgent]   Queries:`, JSON.stringify(analysis.queries, null, 2));
       
       // Send analysis result
       onChunk({ 
@@ -519,11 +717,12 @@ Instead, present the information as if you're directly reporting the results.`;
       // Step 2: Check if any agent actions require confirmation
       // For now, we execute queries and check if any tool in the result needs confirmation
       // This will be enhanced when specialized agents report their intended tools
-      const { results, errors, confirmationRequest } = await this.executeAgentQueriesWithConfirmation(
+      const { results, errors, confirmationRequest, storedArtifacts } = await this.executeAgentQueriesWithConfirmation(
         analysis, 
         userId, 
-        query, 
-        options.conversationHistory || []
+        enhancedQuery, 
+        options.conversationHistory || [],
+        conversationId
       );
 
       // If a confirmation is required, send confirmation_request and stop
@@ -540,17 +739,27 @@ Instead, present the information as if you're directly reporting the results.`;
       onChunk({ type: 'status', message: 'Generating response...' });
 
       // Step 3: Stream the final response generation
-      await this.streamCombinedResponse(query, analysis, results, errors, onChunk);
+      await this.streamCombinedResponse(enhancedQuery, analysis, results, errors, onChunk, conversationId);
 
       const processingTime = Date.now() - startTime;
 
-      // Send metadata
-      onChunk({ 
+      // Send metadata including any stored artifacts
+      const metadata = {
         type: 'metadata',
         agentsUsed: analysis.agents,
         processingTime: `${processingTime}ms`,
         timestamp: new Date().toISOString()
-      });
+      };
+      
+      if (storedArtifacts && storedArtifacts.length > 0) {
+        metadata.storedArtifacts = storedArtifacts.map(a => ({
+          id: a.id,
+          type: a.type,
+          title: a.title
+        }));
+      }
+      
+      onChunk(metadata);
 
     } catch (error) {
       console.error('[MainAgent] Error processing streaming query:', error);
@@ -565,8 +774,9 @@ Instead, present the information as if you're directly reporting the results.`;
   /**
    * Execute agent queries with confirmation checking
    * Checks if the analysis indicates a confirmation-required action
+   * Now includes artifact storage via conversationId
    */
-  async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory) {
+  async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory, conversationId = null) {
     // First, determine if any agent+query combination will require confirmation
     // We analyze the queries to detect confirmation-required intents
     for (const agentName of analysis.agents) {
@@ -586,6 +796,7 @@ Instead, present the information as if you're directly reporting the results.`;
         
         console.log(`[Confirmation] Generated preview:`, previewContent);
         
+        // IMPORTANT: Pass conversationId for artifact storage after confirmation
         const requestId = confirmationStore.storePendingAction(
           userId,
           detectedAction.toolName,
@@ -593,12 +804,14 @@ Instead, present the information as if you're directly reporting the results.`;
           detectedAction.inferredParams,
           previewContent,
           query,
-          conversationHistory
+          conversationHistory,
+          conversationId  // Pass conversationId for artifact memory
         );
 
         return {
           results: {},
           errors: {},
+          storedArtifacts: [],
           confirmationRequest: {
             requestId: requestId,
             toolName: detectedAction.toolName,
@@ -614,8 +827,9 @@ Instead, present the information as if you're directly reporting the results.`;
     }
 
     // No confirmation required, proceed with normal execution
-    const { results, errors } = await this.executeAgentQueries(analysis, userId);
-    return { results, errors, confirmationRequest: null };
+    // Pass conversationId for artifact storage
+    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId);
+    return { results, errors, storedArtifacts, confirmationRequest: null };
   }
 
   /**
@@ -754,6 +968,46 @@ Instead, present the information as if you're directly reporting the results.`;
           extractParams: () => ({ owner: 'pending', repo: 'pending', title: 'pending' }),
           isAsync: false
         }
+      ],
+      gmail: [
+        {
+          // Only match when user explicitly wants to SEND an email
+          // Exclude read/search/get/show/check/find/what patterns
+          patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
+          keywords: ['email', 'mail', 'message'],
+          toolName: 'sendEmail',
+          extractParams: (q) => this.extractEmailParams(q),
+          isAsync: false,
+          excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox']
+        },
+        {
+          patterns: ['reply', 'respond'],
+          keywords: ['email', 'mail', 'message'],
+          toolName: 'replyToEmail',
+          extractParams: () => ({ messageId: 'pending', body: 'pending' }),
+          isAsync: false
+        },
+        {
+          patterns: ['forward'],
+          keywords: ['email', 'mail', 'message'],
+          toolName: 'forwardEmail',
+          extractParams: () => ({ messageId: 'pending', to: 'pending' }),
+          isAsync: false
+        },
+        {
+          patterns: ['delete', 'trash', 'remove'],
+          keywords: ['email', 'mail', 'message'],
+          toolName: 'trashEmail',
+          extractParams: () => ({ messageId: 'pending' }),
+          isAsync: false
+        },
+        {
+          patterns: ['create', 'make', 'new', 'set up'],
+          keywords: ['filter', 'rule'],
+          toolName: 'createFilter',
+          extractParams: () => ({ criteria: 'pending', action: 'pending' }),
+          isAsync: false
+        }
       ]
     };
 
@@ -764,7 +1018,12 @@ Instead, present the information as if you're directly reporting the results.`;
       const hasAction = pattern.patterns.some(p => query.includes(p));
       const hasTarget = pattern.keywords.some(k => query.includes(k));
       
-      if (hasAction && hasTarget) {
+      // Check for exclusion patterns - if any exclusion pattern is found, skip this pattern
+      const hasExclusion = pattern.excludePatterns 
+        ? pattern.excludePatterns.some(p => query.includes(p))
+        : false;
+      
+      if (hasAction && hasTarget && !hasExclusion) {
         // Handle async extractors (like forms with AI-generated questions)
         const inferredParams = pattern.isAsync 
           ? await pattern.extractParams(agentQuery)
@@ -1091,6 +1350,42 @@ Respond with ONLY valid JSON, no markdown formatting.`
   }
 
   /**
+   * Extract email parameters from query
+   */
+  extractEmailParams(query) {
+    const params = { to: '', subject: '', body: '' };
+    
+    // Extract email address
+    const emailMatch = query.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+    if (emailMatch) {
+      params.to = emailMatch[1];
+    }
+    
+    // Extract subject from quotes or after "about", "subject", "regarding"
+    const subjectMatch = query.match(/(?:about|subject|regarding|titled?)\s+["']?([^"'\n,]+)["']?/i) ||
+                         query.match(/["']([^"']+)["']/);
+    if (subjectMatch) {
+      params.subject = subjectMatch[1].trim();
+    } else {
+      // Try to infer subject from query context
+      const lowerQuery = query.toLowerCase();
+      if (lowerQuery.includes('meeting')) params.subject = 'Meeting';
+      else if (lowerQuery.includes('follow up')) params.subject = 'Follow Up';
+      else if (lowerQuery.includes('update')) params.subject = 'Update';
+      else if (lowerQuery.includes('reminder')) params.subject = 'Reminder';
+      else params.subject = 'New Message';
+    }
+    
+    // Extract body content after "saying", "message", "body", "content"
+    const bodyMatch = query.match(/(?:saying|message|body|content|that)\s+["']?(.+)$/i);
+    if (bodyMatch) {
+      params.body = bodyMatch[1].trim().replace(/["']$/, '');
+    }
+    
+    return params;
+  }
+
+  /**
    * Stream response after a confirmed action is executed
    * This provides a smooth word-by-word streaming experience like ChatGPT
    */
@@ -1163,8 +1458,9 @@ If a document was created, include the title and link if available.`;
 
   /**
    * Stream the combined response using OpenAI's streaming API
+   * Now includes artifact context in the system prompt
    */
-  async streamCombinedResponse(query, analysis, results, errors, onChunk) {
+  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null) {
     try {
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
@@ -1174,6 +1470,12 @@ If a document was created, include the title and link if available.`;
       const agentErrors = Object.entries(errors).map(([agent, error]) => {
         return `${agent.toUpperCase()} Agent Error: ${error}`;
       }).join('\n');
+
+      // Build artifact context for the prompt
+      let artifactContext = '';
+      if (conversationId) {
+        artifactContext = await formatArtifactsForPrompt(conversationId);
+      }
 
       const responsePrompt = `The user asked: "${query}"
 
@@ -1185,19 +1487,27 @@ ${agentResults}
 
 ${agentErrors ? `Errors encountered:\n${agentErrors}\n` : ''}
 
+${artifactContext ? `\n--- Conversation Artifacts ---\n${artifactContext}\n---\n` : ''}
+
 Please provide a natural, conversational response to the user that:
 1. Directly addresses their request
 2. Summarizes what was accomplished
-3. Includes relevant details from the agent results
+3. Includes relevant details from the agent results (include IDs like formId, documentId, eventId for reference)
 4. Mentions any errors or limitations encountered
 5. Is friendly and helpful in tone
 
 Format the response in a clear, readable way. Use bullet points or numbered lists where appropriate.
 If events were created, include key details like title, date, time, and location.
+If forms/docs/sheets were created, include the ID and a link if available.
 Do not include raw JSON or technical details unless specifically relevant.`;
 
+      // Get dynamic system prompt with artifact context
+      const systemPrompt = conversationId 
+        ? await this.createDynamicSystemPrompt(conversationId)
+        : this.systemPrompt;
+
       const messages = [
-        { role: 'system', content: this.systemPrompt },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: responsePrompt }
       ];
 
@@ -1327,6 +1637,17 @@ Do not include raw JSON or technical details unless specifically relevant.`;
             'List commits and issues',
             'Search code',
             'View pull requests'
+          ]
+        },
+        gmail: {
+          name: 'Gmail Agent',
+          service: 'Gmail',
+          capabilities: [
+            'Send, reply, and forward emails',
+            'Read and search emails',
+            'Manage drafts',
+            'Label and filter management',
+            'Email actions (star, archive, trash)'
           ]
         },
         meet: {

@@ -34,6 +34,7 @@ const CLEANUP_INTERVAL_MS = 2 * 60 * 1000;
  *   previewContent: string,
  *   query: string,
  *   conversationHistory: array,
+ *   conversationId: string,   // For artifact memory
  *   createdAt: number,
  *   expiresAt: number
  * }
@@ -56,10 +57,11 @@ function generateRequestId() {
  * @param {string} previewContent - Human-readable preview of the action
  * @param {string} query - Original user query
  * @param {array} conversationHistory - Conversation context
+ * @param {string} conversationId - Conversation ID for artifact memory
  * @param {number} ttlMs - Time to live in milliseconds (optional)
  * @returns {string} - Request ID for this pending action
  */
-function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], ttlMs = DEFAULT_TTL_MS) {
+function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS) {
   const requestId = generateRequestId();
   const now = Date.now();
   
@@ -72,13 +74,14 @@ function storePendingAction(userId, toolName, agentName, params, previewContent,
     previewContent,
     query,
     conversationHistory,
+    conversationId,  // Store conversationId for artifact memory
     createdAt: now,
     expiresAt: now + ttlMs
   };
   
   pendingActions.set(requestId, pendingAction);
   
-  console.log(`[ConfirmationStore] Stored pending action: ${requestId} for tool: ${toolName}`);
+  console.log(`[ConfirmationStore] Stored pending action: ${requestId} for tool: ${toolName} (conversation: ${conversationId || 'none'})`);
   
   return requestId;
 }

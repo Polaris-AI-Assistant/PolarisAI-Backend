@@ -5,6 +5,7 @@ const supabase = require('./supabase/supabaseConnect');
 const agentRoutes = require('./gmail/agentConnect');
 const authRoutes = require('./auth/auth');
 const gmailRoutes = require('./gmail/gmailData');
+const gmailAgentRoutes = require('./gmail/gmailAgentController');
 const embeddingRoutes = require('./gmail/embeddingRoutes');
 const githubRoutes = require('./github/connectGithub');
 const githubStatusRoutes = require('./github/githubStatus');
@@ -70,6 +71,9 @@ app.use('/api', agentRoutes);
 
 // Use Gmail data routes
 app.use('/api', gmailRoutes);
+
+// Use Gmail AI Agent routes
+app.use('/api/gmail', gmailAgentRoutes);
 
 // Use embedding routes
 app.use('/api', embeddingRoutes);
@@ -165,6 +169,9 @@ app.get('/api', (req, res) => {
         'POST /api/docs/agent/query': 'Google Docs AI Agent',
         'POST /api/forms/agent/query': 'Google Forms AI Agent',
         'POST /api/github/agent/query': 'GitHub AI Agent',
+        'POST /api/gmail/agent/query': 'Gmail AI Agent',
+        'GET /api/gmail/agent/examples': 'Get Gmail agent example queries',
+        'GET /api/gmail/agent/capabilities': 'Get Gmail agent capabilities',
         'POST /api/meet/agent/query': 'Google Meet AI Agent',
         'POST /api/sheets/agent/query': 'Google Sheets AI Agent'
       },

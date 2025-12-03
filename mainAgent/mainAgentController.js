@@ -9,12 +9,20 @@
  * - Streaming query processing with SSE
  * - Confirmation flow for sensitive actions
  * - Confirm/Cancel action endpoints
+ * - Artifact memory management
  */
 
 const express = require('express');
 const MainAgent = require('./mainAgent');
 const confirmationStore = require('./confirmationStore');
 const { authenticateToken } = require('../middleware/auth');
+
+// Artifact Memory imports
+const { 
+    listArtifacts, 
+    getArtifacts, 
+    clearArtifacts 
+} = require('../utils/artifactMemory');
 
 const router = express.Router();
 
@@ -28,14 +36,15 @@ const mainAgent = new MainAgent();
  * Request body:
  * {
  *   "query": "schedule a meeting tomorrow and create a document for it",
- *   "conversationHistory": [] // optional
+ *   "conversationHistory": [], // optional
+ *   "conversationId": "uuid" // optional - for artifact memory
  * }
  * 
  * Response: Server-Sent Events (SSE) stream
  */
 router.post('/query/stream', authenticateToken, async (req, res) => {
   try {
-    const { query, conversationHistory } = req.body;
+    const { query, conversationHistory, conversationId } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -47,6 +56,9 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     }
 
     console.log(`[MainAgentController] User ${userId} streaming query: "${query}"`);
+    if (conversationId) {
+      console.log(`[MainAgentController] Conversation ID: ${conversationId}`);
+    }
 
     // Set up SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
@@ -59,7 +71,11 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
 
     try {
       // Process the query through the main agent with streaming
-      await mainAgent.processQueryWithStreaming(query, userId, { conversationHistory }, (chunk) => {
+      // Now includes conversationId for artifact memory
+      await mainAgent.processQueryWithStreaming(query, userId, { 
+        conversationHistory,
+        conversationId  // Pass conversationId for artifact memory
+      }, (chunk) => {
         // Send each chunk to the client
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       });
@@ -525,5 +541,134 @@ if (process.env.NODE_ENV === 'development') {
     }
   });
 }
+
+// ========== ARTIFACT MEMORY ENDPOINTS ==========
+
+/**
+ * GET /agent/artifacts/:conversationId
+ * Get all artifacts for a conversation
+ * 
+ * Response:
+ * {
+ *   "success": true,
+ *   "conversationId": "uuid",
+ *   "artifacts": [{ id, type, title, createdAt, createdAtFormatted }, ...]
+ * }
+ */
+router.get('/artifacts/:conversationId', authenticateToken, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        error: 'conversationId is required'
+      });
+    }
+
+    const artifacts = await listArtifacts(conversationId);
+
+    res.json({
+      success: true,
+      conversationId,
+      artifacts,
+      count: artifacts.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('[MainAgentController] Get artifacts error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve artifacts',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * GET /agent/artifacts/:conversationId/full
+ * Get all artifacts with full data for a conversation
+ * 
+ * Response:
+ * {
+ *   "success": true,
+ *   "conversationId": "uuid",
+ *   "artifacts": [{ id, type, title, data, createdAt }, ...]
+ * }
+ */
+router.get('/artifacts/:conversationId/full', authenticateToken, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        error: 'conversationId is required'
+      });
+    }
+
+    const artifacts = await getArtifacts(conversationId);
+
+    res.json({
+      success: true,
+      conversationId,
+      artifacts,
+      count: artifacts.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('[MainAgentController] Get full artifacts error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve artifacts',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * DELETE /agent/artifacts/:conversationId
+ * Clear all artifacts for a conversation
+ * 
+ * Response:
+ * {
+ *   "success": true,
+ *   "message": "Artifacts cleared"
+ * }
+ */
+router.delete('/artifacts/:conversationId', authenticateToken, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        error: 'conversationId is required'
+      });
+    }
+
+    await clearArtifacts(conversationId);
+
+    res.json({
+      success: true,
+      message: 'Artifacts cleared successfully',
+      conversationId,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('[MainAgentController] Clear artifacts error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to clear artifacts',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
 
 module.exports = router;

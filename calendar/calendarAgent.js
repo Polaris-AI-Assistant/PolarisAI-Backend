@@ -417,6 +417,17 @@ class CalendarAgent {
    * Create system prompt for the AI agent
    */
   createSystemPrompt() {
+    // Get current date dynamically
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString('en-US', { 
+      weekday: 'long',
+      month: 'long', 
+      day: 'numeric', 
+      year: 'numeric' 
+    });
+    const currentYear = now.getFullYear();
+    const endOfYear = `December 31, ${currentYear}`;
+    
     return `You are an intelligent Google Calendar assistant. You help users manage their calendar events and schedules through natural language.
 
 Your capabilities:
@@ -429,11 +440,11 @@ Your capabilities:
 
 Important guidelines:
 - When creating events, always include start and end times
-- Use ISO 8601 format for dates and times (e.g., "2025-10-28T14:00:00Z")
-- **Current date is October 28, 2025**. Use this as reference for relative dates.
-- **CRITICAL**: Unless user specifies a year or specific date range, ONLY retrieve events from the current year (2025)
-- When user asks for "all events" or "list events" without specifying dates, default to current year only (Oct 28, 2025 - Dec 31, 2025)
-- If user wants events from other years, they must explicitly mention the year (e.g., "events in 2026")
+- Use ISO 8601 format for dates and times
+- **IMPORTANT - Current date is ${currentDateStr}**. Use this as reference for relative dates like "today", "tomorrow", "next week", etc.
+- **CRITICAL**: Unless user specifies a year or specific date range, ONLY retrieve events from the current year (${currentYear})
+- When user asks for "all events" or "list events" without specifying dates, default to current year only (today - ${endOfYear})
+- If user wants events from other years, they must explicitly mention the year
 - Default to showing 10-20 events maximum unless user specifically asks for more
 - For recurring events, use RRULE format (e.g., "RRULE:FREQ=WEEKLY;COUNT=10")
 - Always provide clear, helpful responses with event summaries in a readable format
@@ -470,10 +481,52 @@ Be conversational, helpful, and proactive in your assistance. Always interpret u
    * Process a natural language query
    */
   async processQuery(query, userId, options = {}) {
-    const { conversationHistory = [] } = options;
+    const { conversationHistory = [], forceToolExecution } = options;
 
     try {
       console.log(`[CalendarAgent] Processing query for user ${userId}: "${query}"`);
+
+      // If forceToolExecution is set, directly execute the tool without LLM
+      if (forceToolExecution && forceToolExecution.toolName && forceToolExecution.params) {
+        console.log(`[CalendarAgent] Force executing tool: ${forceToolExecution.toolName}`);
+        console.log(`[CalendarAgent] With exact params:`, JSON.stringify(forceToolExecution.params, null, 2));
+        
+        const functionToCall = this.functionMap[forceToolExecution.toolName];
+        if (!functionToCall) {
+          throw new Error(`Unknown function: ${forceToolExecution.toolName}`);
+        }
+
+        const result = await functionToCall(userId, forceToolExecution.params);
+        
+        // Generate a response message based on the result
+        let responseText = "I've completed your request.";
+        if (result.success && result.data) {
+          if (forceToolExecution.toolName === 'createEvent') {
+            const event = result.data;
+            responseText = `I've created your calendar event "${event.summary || 'Event'}".`;
+            if (event.htmlLink) {
+              responseText += ` You can view it here: ${event.htmlLink}`;
+            }
+          }
+        }
+
+        return {
+          success: true,
+          response: responseText,
+          query: query,
+          tools_used: [{
+            name: forceToolExecution.toolName,
+            arguments: forceToolExecution.params
+          }],
+          function_results: [{
+            function: forceToolExecution.toolName,
+            result: result
+          }],
+          raw_results: [result],
+          timestamp: new Date().toISOString(),
+          iterations: 0
+        };
+      }
 
       // Build messages array with conversation history
       const messages = [
@@ -579,6 +632,7 @@ Be conversational, helpful, and proactive in your assistance. Always interpret u
         query: query,
         tools_used: toolsUsed,
         function_results: functionResults,
+        raw_results: functionResults.map(fr => fr.result),  // Include raw results for artifact extraction
         timestamp: new Date().toISOString(),
         iterations: iterationCount
       };

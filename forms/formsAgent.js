@@ -244,7 +244,18 @@ class FormsAgent {
    * Create system prompt that defines the agent's behavior
    */
   createSystemPrompt() {
+    // Get current date dynamically
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString('en-US', { 
+      weekday: 'long',
+      month: 'long', 
+      day: 'numeric', 
+      year: 'numeric' 
+    });
+    
     return `You are a helpful Google Forms AI Assistant that helps users interact with their Google Forms through natural language queries.
+
+**IMPORTANT - Current date is ${currentDateStr}**. Use this as reference for any date-related queries.
 
 Your capabilities include:
 - Listing all forms accessible to the user
@@ -445,12 +456,37 @@ Always confirm successful operations and provide relevant links or IDs for refer
    * 
    * @param {string} query - Natural language query from the user
    * @param {string} userId - User ID for authentication
-   * @param {Object} options - Additional options (conversationHistory)
+   * @param {Object} options - Additional options (conversationHistory, forceToolExecution)
    * @returns {Promise<Object>} Processed response with Forms data
    */
   async processQuery(query, userId, options = {}) {
     try {
       console.log(`[FormsAgent] Processing query: "${query}" for user: ${userId}`);
+
+      // If forceToolExecution is set, directly execute the tool without LLM
+      if (options.forceToolExecution && options.forceToolExecution.toolName && options.forceToolExecution.params) {
+        console.log(`[FormsAgent] Force executing tool: ${options.forceToolExecution.toolName}`);
+        console.log(`[FormsAgent] With exact params:`, JSON.stringify(options.forceToolExecution.params, null, 2));
+        
+        const functionToCall = this.functionMap[options.forceToolExecution.toolName];
+        if (!functionToCall) {
+          throw new Error(`Unknown function: ${options.forceToolExecution.toolName}`);
+        }
+
+        const result = await functionToCall(userId, options.forceToolExecution.params);
+        
+        return {
+          success: true,
+          response: result.success ? `Successfully executed ${options.forceToolExecution.toolName}` : result.error,
+          query: query,
+          tools_used: [{
+            name: options.forceToolExecution.toolName,
+            arguments: options.forceToolExecution.params
+          }],
+          raw_results: [result],
+          timestamp: new Date().toISOString()
+        };
+      }
 
       // Build messages array with conversation history if provided
       const messages = [

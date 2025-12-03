@@ -555,7 +555,18 @@ class SheetsAgent {
    * Create system prompt for the AI agent
    */
   createSystemPrompt() {
+    // Get current date dynamically
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString('en-US', { 
+      weekday: 'long',
+      month: 'long', 
+      day: 'numeric', 
+      year: 'numeric' 
+    });
+    
     return `You are an intelligent Google Sheets assistant. Your role is to help users manage their Google Spreadsheets through natural language queries.
+
+**IMPORTANT - Current date is ${currentDateStr}**. Use this as reference for any date-related queries.
 
 **Capabilities:**
 - Create and manage spreadsheets
@@ -601,7 +612,38 @@ Remember to be helpful and guide users through their spreadsheet tasks efficient
    */
   async processQuery(query, userId, options = {}) {
     try {
-      const { conversationHistory = [] } = options;
+      const { conversationHistory = [], forceToolExecution } = options;
+
+      // If forceToolExecution is set, directly execute the tool without LLM
+      if (forceToolExecution && forceToolExecution.toolName && forceToolExecution.params) {
+        console.log(`[SheetsAgent] Force executing tool: ${forceToolExecution.toolName}`);
+        console.log(`[SheetsAgent] With exact params:`, JSON.stringify(forceToolExecution.params, null, 2));
+        
+        const functionToCall = this.functionMap[forceToolExecution.toolName];
+        if (!functionToCall) {
+          throw new Error(`Unknown function: ${forceToolExecution.toolName}`);
+        }
+
+        const result = await functionToCall(userId, ...Object.values(forceToolExecution.params));
+        
+        let responseText = result.success ? `Successfully executed ${forceToolExecution.toolName}` : result.error;
+        if (forceToolExecution.toolName === 'createSpreadsheet' && result.success) {
+          responseText = `Your spreadsheet "${forceToolExecution.params.title}" has been created! ${result.spreadsheetUrl ? `View it here: ${result.spreadsheetUrl}` : ''}`;
+        }
+        
+        return {
+          success: true,
+          response: responseText,
+          tools_used: [{
+            function: forceToolExecution.toolName,
+            arguments: forceToolExecution.params,
+            result: result
+          }],
+          raw_results: [result],
+          query: query,
+          timestamp: new Date().toISOString()
+        };
+      }
 
       // Build conversation messages
       const messages = [
@@ -710,6 +752,7 @@ Remember to be helpful and guide users through their spreadsheet tasks efficient
         success: true,
         response: finalResponse,
         tools_used: toolsUsed,
+        raw_results: toolsUsed.map(t => t.result),  // Include raw results for artifact extraction
         query: query,
         timestamp: new Date().toISOString()
       };

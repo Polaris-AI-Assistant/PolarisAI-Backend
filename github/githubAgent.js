@@ -290,7 +290,18 @@ class GitHubAgent {
    * This helps the AI understand its role and how to interact with users
    */
   createSystemPrompt() {
+    // Get current date dynamically
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString('en-US', { 
+      weekday: 'long',
+      month: 'long', 
+      day: 'numeric', 
+      year: 'numeric' 
+    });
+    
     return `You are a helpful GitHub AI Assistant that helps users interact with their GitHub data through natural language queries.
+
+**IMPORTANT - Current date is ${currentDateStr}**. Use this as reference for any date-related queries like commits "today", "this week", etc.
 
 Your capabilities include:
 - Checking GitHub connection status
@@ -332,12 +343,41 @@ Remember: You can only access GitHub data for the authenticated user. You cannot
    * 
    * @param {string} query - Natural language query from the user
    * @param {string} userId - User ID for authentication
-   * @param {Object} options - Additional options like repoCount
+   * @param {Object} options - Additional options like repoCount, forceToolExecution
    * @returns {Promise<Object>} Processed response with GitHub data
    */
   async processQuery(query, userId, options = {}) {
     try {
       console.log(`Processing query: "${query}" for user: ${userId}`);
+
+      // If forceToolExecution is set, directly execute the tool without LLM
+      if (options.forceToolExecution && options.forceToolExecution.toolName && options.forceToolExecution.params) {
+        console.log(`[GitHubAgent] Force executing tool: ${options.forceToolExecution.toolName}`);
+        console.log(`[GitHubAgent] With exact params:`, JSON.stringify(options.forceToolExecution.params, null, 2));
+        
+        const functionToCall = this.functionMap[options.forceToolExecution.toolName];
+        if (!functionToCall) {
+          throw new Error(`Unknown function: ${options.forceToolExecution.toolName}`);
+        }
+
+        const result = await functionToCall(userId, options.forceToolExecution.params);
+        
+        let responseText = result.success ? `Successfully executed ${options.forceToolExecution.toolName}` : result.error;
+        
+        return {
+          success: true,
+          response: responseText,
+          data: [{ tool: options.forceToolExecution.toolName, result: result, arguments: options.forceToolExecution.params }],
+          tools_used: [{
+            name: options.forceToolExecution.toolName,
+            arguments: options.forceToolExecution.params,
+            success: result.success
+          }],
+          raw_results: [result],
+          query: query,
+          timestamp: new Date().toISOString()
+        };
+      }
 
       // Create messages array for OpenAI chat completion with user context
       const githubUsername = options.githubUsername;
@@ -468,6 +508,7 @@ Remember: You can only access GitHub data for the authenticated user. You cannot
         response: naturalResponse,
         data: toolResults,
         tools_used: toolsUsed,
+        raw_results: toolResults.map(tr => tr.result),  // Include raw results for artifact extraction
         query: originalQuery,
         timestamp: new Date().toISOString()
       };

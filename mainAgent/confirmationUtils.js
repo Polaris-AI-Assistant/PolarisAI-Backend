@@ -337,11 +337,82 @@ const confirmationConfig = {
         lines.push(`**To:** ${params.to}`);
         if (params.cc) lines.push(`**CC:** ${params.cc}`);
         if (params.bcc) lines.push(`**BCC:** ${params.bcc}`);
-        lines.push(`**Subject:** ${params.subject}`);
-        lines.push('\n**Body:**');
+        lines.push(`**Subject:** ${params.subject === 'New Message' ? '_(AI will generate based on content)_' : params.subject}`);
+        lines.push('\n**Intent/Content:**');
+        if (params.body && params.body.trim()) {
+          lines.push(params.body);
+          lines.push('\n_✨ AI will compose a proper email based on this intent_');
+        } else {
+          lines.push('_(AI will generate appropriate email content)_');
+        }
+        return lines.join('\n');
+      }
+    },
+    replyToEmail: {
+      confirmationRequired: true,
+      actionType: 'reply_email',
+      description: 'Reply to an email',
+      generatePreview: (params) => {
+        const lines = ['↩️ **Reply to Email**\n'];
+        lines.push(`**Original Message ID:** ${params.messageId}`);
+        lines.push(`**Reply All:** ${params.replyAll ? 'Yes' : 'No'}`);
+        lines.push('\n**Reply Body:**');
         if (params.body) {
           const preview = params.body.substring(0, 500);
           lines.push(preview + (params.body.length > 500 ? '...' : ''));
+        }
+        return lines.join('\n');
+      }
+    },
+    forwardEmail: {
+      confirmationRequired: true,
+      actionType: 'forward_email',
+      description: 'Forward an email',
+      generatePreview: (params) => {
+        const lines = ['➡️ **Forward Email**\n'];
+        lines.push(`**Original Message ID:** ${params.messageId}`);
+        lines.push(`**Forward To:** ${params.to}`);
+        if (params.additionalMessage) {
+          lines.push('\n**Additional Message:**');
+          lines.push(params.additionalMessage);
+        }
+        return lines.join('\n');
+      }
+    },
+    trashEmail: {
+      confirmationRequired: true,
+      actionType: 'trash_email',
+      description: 'Move email to trash',
+      generatePreview: (params) => {
+        const lines = ['🗑️ **Move to Trash**\n'];
+        lines.push(`**Message ID:** ${params.messageId}`);
+        lines.push('\n⚠️ The email will be moved to trash.');
+        return lines.join('\n');
+      }
+    },
+    createFilter: {
+      confirmationRequired: true,
+      actionType: 'create_filter',
+      description: 'Create an email filter',
+      generatePreview: (params) => {
+        const lines = ['🔧 **Create Email Filter**\n'];
+        lines.push('**Criteria:**');
+        if (params.criteria) {
+          if (params.criteria.from) lines.push(`  • From: ${params.criteria.from}`);
+          if (params.criteria.to) lines.push(`  • To: ${params.criteria.to}`);
+          if (params.criteria.subject) lines.push(`  • Subject contains: ${params.criteria.subject}`);
+          if (params.criteria.query) lines.push(`  • Query: ${params.criteria.query}`);
+          if (params.criteria.hasAttachment) lines.push(`  • Has attachment: Yes`);
+        }
+        lines.push('\n**Actions:**');
+        if (params.action) {
+          if (params.action.addLabelIds) lines.push(`  • Add labels: ${params.action.addLabelIds.join(', ')}`);
+          if (params.action.removeLabelIds) lines.push(`  • Remove labels: ${params.action.removeLabelIds.join(', ')}`);
+          if (params.action.forward) lines.push(`  • Forward to: ${params.action.forward}`);
+          if (params.action.markAsRead) lines.push(`  • Mark as read`);
+          if (params.action.star) lines.push(`  • Star`);
+          if (params.action.archive) lines.push(`  • Archive`);
+          if (params.action.trash) lines.push(`  • Move to trash`);
         }
         return lines.join('\n');
       }
