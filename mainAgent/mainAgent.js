@@ -385,13 +385,20 @@ User Query: "${query}"
 ${artifactSection}
 
 Available agents:
-- calendar: Google Calendar operations (events, meetings, schedules)
+- calendar: Google Calendar operations (events, meetings, schedules). IMPORTANT: Calendar agent can create events WITH Google Meet video conferencing attached. Use ONLY calendar for "create a google meet at [time]" or "schedule a meeting with video call".
 - docs: Google Docs operations (create/edit documents, text formatting)
 - forms: Google Forms operations (create forms, manage questions, view responses)
 - github: GitHub operations (repos, commits, issues, PRs, profile)
 - gmail: Gmail operations (send/read/search emails, drafts, labels, filters)
-- meet: Google Meet operations (create meetings, view history, recordings)
+- meet: Google Meet operations (ONLY for standalone meeting spaces without calendar events, viewing meeting history, recordings, participants). Do NOT use meet agent if user wants a scheduled meeting with a time - use calendar instead.
 - sheets: Google Sheets operations (create/edit spreadsheets, data management)
+
+CRITICAL RULES for Google Meet:
+1. "Create a google meet tomorrow at 11am" -> Use ONLY calendar agent with query "create a google meet event tomorrow at 11am with video call"
+2. "Schedule a meeting with video call" -> Use ONLY calendar agent
+3. "Create a standalone meeting room/space" (no time specified) -> Use meet agent
+4. "Show my meeting recordings" -> Use meet agent
+5. When user wants a SCHEDULED meeting with a specific time, ALWAYS use calendar agent which will automatically add Google Meet conferencing
 
 Respond with a JSON object containing:
 {
@@ -406,6 +413,9 @@ Respond with a JSON object containing:
 }
 
 Examples:
+- "create a google meet tomorrow at 3pm" -> {"agents": ["calendar"], "queries": {"calendar": "create a google meet event tomorrow at 3pm with video call"}}
+- "schedule a video call for monday at 10am" -> {"agents": ["calendar"], "queries": {"calendar": "schedule a video call meeting for monday at 10am with google meet"}}
+- "create a meeting room" (no time) -> {"agents": ["meet"], ...}
 - "schedule a meeting tomorrow" -> {"agents": ["calendar"], ...}
 - "create a document and add it to my calendar" -> {"agents": ["docs", "calendar"], "requiresSequential": true, ...}
 - "show me my GitHub repos" -> {"agents": ["github"], ...}
@@ -782,7 +792,7 @@ Instead, present the information as if you're directly reporting the results.`;
     for (const agentName of analysis.agents) {
       const agentQuery = analysis.queries[agentName];
       console.log(`[Confirmation] Checking agent: ${agentName}, query: ${agentQuery}`);
-      const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery);
+      const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery, userId);
       
       if (detectedAction) {
         console.log(`[Confirmation] Detected action:`, JSON.stringify(detectedAction, null, 2));
@@ -838,9 +848,9 @@ Instead, present the information as if you're directly reporting the results.`;
    */
   /**
    * Detect if the query requires confirmation before execution
-   * Returns async because some extractors (like forms) need AI generation
+   * Returns async because some extractors (like forms, gmail) need AI generation
    */
-  async detectConfirmationRequiredAction(agentName, agentQuery) {
+  async detectConfirmationRequiredAction(agentName, agentQuery, userId = null) {
     const query = agentQuery.toLowerCase();
     
     // Define patterns for each agent's confirmation-required actions
@@ -976,8 +986,8 @@ Instead, present the information as if you're directly reporting the results.`;
           patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
           keywords: ['email', 'mail', 'message'],
           toolName: 'sendEmail',
-          extractParams: (q) => this.extractEmailParams(q),
-          isAsync: false,
+          extractParams: (q, userId) => this.extractEmailParamsWithAI(q, userId),
+          isAsync: true,  // Changed to async for AI generation
           excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox']
         },
         {
@@ -1024,10 +1034,11 @@ Instead, present the information as if you're directly reporting the results.`;
         : false;
       
       if (hasAction && hasTarget && !hasExclusion) {
-        // Handle async extractors (like forms with AI-generated questions)
+        // Handle async extractors (like forms with AI-generated questions, gmail with AI content)
+        // Pass userId for extractors that need it (like gmail for user signature)
         const inferredParams = pattern.isAsync 
-          ? await pattern.extractParams(agentQuery)
-          : pattern.extractParams(agentQuery);
+          ? await pattern.extractParams(agentQuery, userId)
+          : pattern.extractParams(agentQuery, userId);
           
         return {
           toolName: pattern.toolName,
@@ -1100,7 +1111,19 @@ Instead, present the information as if you're directly reporting the results.`;
     
     // Parse time
     // Match patterns like "11am", "11:30am", "11 am", "at 11", "at 11:30", "11:00", "3pm", "15:00"
-    const timeMatch = lowerQuery.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+    // Be careful not to match dates - prioritize patterns with am/pm or "at" keyword
+    // First try to match time with am/pm suffix (most reliable)
+    let timeMatch = lowerQuery.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+    
+    // If no am/pm found, look for "at X" or "at X:XX" pattern
+    if (!timeMatch) {
+      timeMatch = lowerQuery.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\b/i);
+    }
+    
+    // Also try matching time formats like "15:00" (24-hour format)
+    if (!timeMatch) {
+      timeMatch = lowerQuery.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+    }
     
     if (timeMatch) {
       let hours = parseInt(timeMatch[1]);
@@ -1112,9 +1135,13 @@ Instead, present the information as if you're directly reporting the results.`;
         hours += 12;
       } else if (period === 'am' && hours === 12) {
         hours = 0;
-      } else if (!period && hours < 8) {
-        // Assume PM for times like "at 3" (likely means 3pm)
-        hours += 12;
+      } else if (!period && hours <= 12 && hours >= 1) {
+        // For "at X" without am/pm, assume PM for typical meeting times (1-7)
+        // and AM for early hours (8-12)
+        if (hours >= 1 && hours <= 7) {
+          hours += 12; // Assume PM for "at 3" means 3pm
+        }
+        // hours 8-12 without am/pm could be either, default to keeping as-is (AM)
       }
       
       startDate.setHours(hours, minutes, 0, 0);
@@ -1139,36 +1166,52 @@ Instead, present the information as if you're directly reporting the results.`;
     
     // Build params
     const params = {
-      summary: 'New Event',
+      summary: 'Google Meet', // Default title for meetings
       startDateTime: startDate.toISOString(),
       endDateTime: endDate.toISOString()
     };
 
-    // Try to extract title from quotes or after "called" or "titled"
-    // Or extract what the event is about
+    // Check for Google Meet / video call first to set addGoogleMeet flag
+    const isGoogleMeet = lowerQuery.includes('google meet') || 
+                         lowerQuery.includes('video call') ||
+                         lowerQuery.includes('virtual meeting') ||
+                         lowerQuery.includes('video meeting');
+    
+    if (isGoogleMeet) {
+      params.addGoogleMeet = true;
+    }
+
+    // Try to extract explicit title from quotes or after "called" or "titled" or "about/for"
+    // Be very careful not to match date/time patterns
     const titleMatch = query.match(/["']([^"']+)["']/) || 
-                       query.match(/called\s+([^,\.\n]+)/) ||
-                       query.match(/titled\s+([^,\.\n]+)/) ||
-                       query.match(/(?:event|meeting|meet)\s+(?:about|for|on)\s+([^,\.\n]+)/i);
+                       query.match(/called\s+["']?([^"',\.\n]+)["']?/i) ||
+                       query.match(/titled\s+["']?([^"',\.\n]+)["']?/i) ||
+                       query.match(/named\s+["']?([^"',\.\n]+)["']?/i) ||
+                       query.match(/(?:meeting|event)\s+(?:about|for|regarding)\s+["']?([^"',\.\n]+)["']?/i);
+    
     if (titleMatch) {
-      params.summary = titleMatch[1].trim();
-    } else {
-      // Try to create a meaningful title from the query
-      // "create a google meet tomorrow at 11am" -> "Google Meet"
-      if (lowerQuery.includes('google meet')) {
-        params.summary = 'Google Meet';
-      } else if (lowerQuery.includes('meeting')) {
+      const extractedTitle = titleMatch[1].trim();
+      // Only use extracted title if it's meaningful (not just date/time info)
+      // Also exclude patterns that look like "on <date>" or contain date-related words
+      const isJustDateTime = /^(\d|at|on|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|video call|with video|\s|st|nd|rd|th|am|pm|:|-|,|\.)+$/i.test(extractedTitle);
+      if (!isJustDateTime && extractedTitle.length > 2) {
+        params.summary = extractedTitle;
+      }
+    }
+    
+    // If no explicit title was found, use smart defaults
+    if (params.summary === 'Google Meet' && !isGoogleMeet) {
+      if (lowerQuery.includes('meeting')) {
         params.summary = 'Meeting';
       } else if (lowerQuery.includes('call')) {
         params.summary = 'Call';
+      } else if (lowerQuery.includes('event')) {
+        params.summary = 'Event';
+      } else if (lowerQuery.includes('appointment')) {
+        params.summary = 'Appointment';
+      } else {
+        params.summary = 'Meeting'; // Generic fallback
       }
-    }
-
-    // Check for Google Meet
-    if (lowerQuery.includes('google meet') || 
-        lowerQuery.includes('video call') ||
-        lowerQuery.includes('virtual')) {
-      params.addGoogleMeet = true;
     }
 
     // Extract attendees (emails)
@@ -1354,6 +1397,7 @@ Respond with ONLY valid JSON, no markdown formatting.`
    */
   extractEmailParams(query) {
     const params = { to: '', subject: '', body: '' };
+    const lowerQuery = query.toLowerCase();
     
     // Extract email address
     const emailMatch = query.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
@@ -1361,28 +1405,309 @@ Respond with ONLY valid JSON, no markdown formatting.`
       params.to = emailMatch[1];
     }
     
-    // Extract subject from quotes or after "about", "subject", "regarding"
-    const subjectMatch = query.match(/(?:about|subject|regarding|titled?)\s+["']?([^"'\n,]+)["']?/i) ||
-                         query.match(/["']([^"']+)["']/);
-    if (subjectMatch) {
-      params.subject = subjectMatch[1].trim();
+    // Parse date/time for better subject formatting
+    const now = new Date();
+    let dateStr = '';
+    let timeStr = '';
+    let eventDate = null;
+    
+    // Check for tomorrow/today
+    if (lowerQuery.includes('tomorrow')) {
+      eventDate = new Date(now);
+      eventDate.setDate(eventDate.getDate() + 1);
+      dateStr = eventDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    } else if (lowerQuery.includes('today')) {
+      eventDate = new Date(now);
+      dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
     } else {
-      // Try to infer subject from query context
-      const lowerQuery = query.toLowerCase();
-      if (lowerQuery.includes('meeting')) params.subject = 'Meeting';
-      else if (lowerQuery.includes('follow up')) params.subject = 'Follow Up';
-      else if (lowerQuery.includes('update')) params.subject = 'Update';
-      else if (lowerQuery.includes('reminder')) params.subject = 'Reminder';
-      else params.subject = 'New Message';
+      // Check for specific date like "6 December 2025" or "December 6, 2025" or "6th December"
+      const months = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+      const dateMatch1 = lowerQuery.match(/(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})?/i);
+      const dateMatch2 = lowerQuery.match(/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})?/i);
+      
+      if (dateMatch1) {
+        const day = parseInt(dateMatch1[1]);
+        const monthStr = dateMatch1[2].toLowerCase();
+        const month = months.findIndex(m => m.startsWith(monthStr));
+        const year = dateMatch1[3] ? parseInt(dateMatch1[3]) : now.getFullYear();
+        if (month >= 0) {
+          eventDate = new Date(year, month, day);
+          dateStr = eventDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+        }
+      } else if (dateMatch2) {
+        const monthStr = dateMatch2[1].toLowerCase();
+        const month = months.findIndex(m => m.startsWith(monthStr));
+        const day = parseInt(dateMatch2[2]);
+        const year = dateMatch2[3] ? parseInt(dateMatch2[3]) : now.getFullYear();
+        if (month >= 0) {
+          eventDate = new Date(year, month, day);
+          dateStr = eventDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+        }
+      }
     }
     
-    // Extract body content after "saying", "message", "body", "content"
-    const bodyMatch = query.match(/(?:saying|message|body|content|that)\s+["']?(.+)$/i);
-    if (bodyMatch) {
-      params.body = bodyMatch[1].trim().replace(/["']$/, '');
+    // Extract time
+    const timeMatch = lowerQuery.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+    if (timeMatch) {
+      let hours = parseInt(timeMatch[1]);
+      const minutes = timeMatch[2] ? timeMatch[2] : '00';
+      const period = timeMatch[3].toUpperCase();
+      timeStr = `${hours}:${minutes} ${period}`;
     }
+    
+    // Determine the event type and purpose
+    let eventType = '';
+    let purpose = '';
+    
+    // Check for specific event types first
+    if (lowerQuery.includes('birthday party') || lowerQuery.includes('birthday')) {
+      eventType = 'birthday party';
+      purpose = 'Birthday Party Invitation';
+    } else if (lowerQuery.includes('wedding')) {
+      eventType = 'wedding';
+      purpose = 'Wedding Invitation';
+    } else if (lowerQuery.includes('party') || lowerQuery.includes('celebration')) {
+      eventType = 'party';
+      purpose = 'Party Invitation';
+    } else if (lowerQuery.includes('dinner') || lowerQuery.includes('lunch') || lowerQuery.includes('breakfast')) {
+      eventType = lowerQuery.includes('dinner') ? 'dinner' : lowerQuery.includes('lunch') ? 'lunch' : 'breakfast';
+      purpose = `${eventType.charAt(0).toUpperCase() + eventType.slice(1)} Invitation`;
+    } else if (lowerQuery.includes('project review')) {
+      purpose = 'Project Review Meeting';
+    } else if (lowerQuery.includes('meeting')) {
+      purpose = 'Meeting Request';
+    } else if (lowerQuery.includes('follow up') || lowerQuery.includes('follow-up')) {
+      purpose = 'Follow Up';
+    } else if (lowerQuery.includes('update')) {
+      purpose = 'Update';
+    } else if (lowerQuery.includes('reminder')) {
+      purpose = 'Reminder';
+    } else if (lowerQuery.includes('introduction') || lowerQuery.includes('introduce')) {
+      purpose = 'Introduction';
+    } else if (lowerQuery.includes('inquiry') || lowerQuery.includes('question')) {
+      purpose = 'Inquiry';
+    } else if (lowerQuery.includes('invitation') || lowerQuery.includes('invite') || lowerQuery.includes('inviting')) {
+      purpose = 'Invitation';
+    } else if (lowerQuery.includes('thank')) {
+      purpose = 'Thank You';
+    } else if (lowerQuery.includes('feedback')) {
+      purpose = 'Feedback Request';
+    } else if (lowerQuery.includes('schedule') || lowerQuery.includes('scheduling')) {
+      purpose = 'Schedule Request';
+    } else if (lowerQuery.includes('congratulat')) {
+      purpose = 'Congratulations';
+    } else if (lowerQuery.includes('welcome')) {
+      purpose = 'Welcome';
+    }
+    
+    // Build a proper subject line
+    if (purpose) {
+      if (dateStr) {
+        params.subject = `${purpose} - ${dateStr}${timeStr ? ` at ${timeStr}` : ''}`;
+      } else if (timeStr) {
+        params.subject = `${purpose} at ${timeStr}`;
+      } else {
+        params.subject = purpose;
+      }
+    } else {
+      // Fallback: extract from quotes or use generic
+      const quotedMatch = query.match(/["']([^"']+)["']/);
+      if (quotedMatch) {
+        params.subject = quotedMatch[1].trim();
+      } else {
+        params.subject = 'New Message';
+      }
+    }
+    
+    // Generate contextual email body
+    let bodyLines = [];
+    bodyLines.push('Hi,');
+    bodyLines.push('');
+    bodyLines.push('I hope this email finds you well.');
+    bodyLines.push('');
+    
+    // Generate body based on event type or purpose
+    if (eventType === 'birthday party') {
+      bodyLines.push(`I am excited to invite you to my birthday party${dateStr ? ` on ${dateStr}` : ''}${timeStr ? ` at ${timeStr}` : ''}!`);
+      bodyLines.push('');
+      bodyLines.push('It would mean a lot to me if you could join us for this special celebration. We will have food, music, and lots of fun!');
+      bodyLines.push('');
+      bodyLines.push('Please let me know if you can make it. I really hope to see you there!');
+    } else if (eventType === 'wedding') {
+      bodyLines.push(`You are cordially invited to our wedding${dateStr ? ` on ${dateStr}` : ''}${timeStr ? ` at ${timeStr}` : ''}.`);
+      bodyLines.push('');
+      bodyLines.push('We would be honored to have you celebrate this special day with us.');
+      bodyLines.push('');
+      bodyLines.push('Please RSVP at your earliest convenience.');
+    } else if (eventType === 'party' || eventType === 'celebration') {
+      bodyLines.push(`You are invited to our ${eventType}${dateStr ? ` on ${dateStr}` : ''}${timeStr ? ` at ${timeStr}` : ''}!`);
+      bodyLines.push('');
+      bodyLines.push('We would love to have you join us for this special occasion.');
+      bodyLines.push('');
+      bodyLines.push('Please let me know if you can attend!');
+    } else if (eventType === 'dinner' || eventType === 'lunch' || eventType === 'breakfast') {
+      bodyLines.push(`I would like to invite you to ${eventType}${dateStr ? ` on ${dateStr}` : ''}${timeStr ? ` at ${timeStr}` : ''}.`);
+      bodyLines.push('');
+      bodyLines.push('It would be great to catch up and spend some time together.');
+      bodyLines.push('');
+      bodyLines.push('Please let me know if this works for you!');
+    } else if (purpose.includes('Meeting') || purpose.includes('Review')) {
+      bodyLines.push(`I would like to schedule a ${purpose.toLowerCase().replace(' meeting', '').replace(' request', '')} meeting with you${dateStr ? ` on ${dateStr}` : ''}${timeStr ? ` at ${timeStr}` : ''}.`);
+      bodyLines.push('');
+      bodyLines.push("We'll discuss the current project status, progress updates, and next steps. Please let me know if this time works for you or if you need to reschedule.");
+    } else if (purpose === 'Follow Up') {
+      bodyLines.push('I wanted to follow up on our previous conversation and check if there are any updates.');
+      bodyLines.push('');
+      bodyLines.push('Please let me know if you need any additional information from my end.');
+    } else if (purpose === 'Invitation') {
+      bodyLines.push(`You are invited${dateStr ? ` on ${dateStr}` : ''}${timeStr ? ` at ${timeStr}` : ''}.`);
+      bodyLines.push('');
+      bodyLines.push('I hope you can join us! Please let me know if you can make it.');
+    } else if (purpose === 'Thank You') {
+      bodyLines.push('I wanted to take a moment to thank you for your time and support.');
+      bodyLines.push('');
+      bodyLines.push('Your help has been greatly appreciated!');
+    } else if (purpose === 'Congratulations') {
+      bodyLines.push('Congratulations on your achievement!');
+      bodyLines.push('');
+      bodyLines.push('Wishing you continued success and happiness!');
+    } else {
+      bodyLines.push('I wanted to reach out to you regarding an important matter.');
+      bodyLines.push('');
+      bodyLines.push('Please let me know when you have a moment to discuss.');
+    }
+    
+    bodyLines.push('');
+    bodyLines.push('Looking forward to hearing from you!');
+    bodyLines.push('');
+    bodyLines.push('Best regards');
+    
+    params.body = bodyLines.join('\n');
     
     return params;
+  }
+
+  /**
+   * Extract email parameters with AI-generated content
+   * This generates the actual email content that will be sent, so preview matches reality
+   */
+  async extractEmailParamsWithAI(query, userId) {
+    // First extract basic params using the existing method
+    const basicParams = this.extractEmailParams(query);
+    
+    try {
+      console.log(`[MainAgent] Generating AI email content for preview...`);
+      
+      // Try to get user's display name from various sources
+      let userName = '';
+      try {
+        const supabase = require('../supabase/supabaseConnect');
+        
+        // First try: Get from calendar_tokens (has name field from Google profile)
+        const { data: calendarData, error: calendarError } = await supabase
+          .from('calendar_tokens')
+          .select('name')
+          .eq('user_id', userId)
+          .single();
+        
+        if (!calendarError && calendarData?.name) {
+          userName = calendarData.name;
+          console.log(`[MainAgent] Got user display name from calendar_tokens: "${userName}"`);
+        }
+        
+        // Second try: Get from Supabase Auth Admin API
+        if (!userName) {
+          try {
+            const { data: userData, error: userError } = await supabase.auth.admin.getUserById(userId);
+            
+            if (!userError && userData?.user) {
+              userName = userData.user.user_metadata?.full_name || 
+                         userData.user.user_metadata?.name ||
+                         userData.user.user_metadata?.display_name || '';
+              if (userName) {
+                console.log(`[MainAgent] Got user display name from auth: "${userName}"`);
+              }
+            }
+          } catch (authError) {
+            console.log(`[MainAgent] Auth admin API not available: ${authError.message}`);
+          }
+        }
+        
+        if (!userName) {
+          console.log(`[MainAgent] No display name found in any source`);
+        }
+      } catch (dbError) {
+        console.log(`[MainAgent] Could not get user name: ${dbError.message}`);
+      }
+      
+      // Generate the AI email body
+      const generationResponse = await this.openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `You are an email writing assistant. Generate a complete, well-formatted email with:
+1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
+2. The main message body (friendly, professional tone as appropriate)
+3. A proper sign-off with the sender's name
+
+Only output the email body text. Do not include "Subject:" line.
+Make the email feel natural and personal, not robotic.
+${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
+          },
+          {
+            role: "user",
+            content: `Write an email for:
+To: ${basicParams.to}
+Subject: ${basicParams.subject}
+Context/Intent from user: "${query}"
+
+Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') || query.toLowerCase().includes('party') || query.toLowerCase().includes('birthday') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`
+          }
+        ],
+        max_tokens: 600,
+        temperature: 0.7
+      });
+      
+      const aiGeneratedBody = generationResponse.choices[0].message.content;
+      
+      // Generate a better subject if it's too generic
+      let finalSubject = basicParams.subject;
+      if (basicParams.subject === 'New Message' || basicParams.subject === 'Meeting') {
+        const subjectResponse = await this.openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: "Generate a short, catchy email subject line (max 60 chars). Only output the subject text, nothing else. Do not use quotes."
+            },
+            {
+              role: "user",
+              content: `Generate a subject line for this email context: "${query}"`
+            }
+          ],
+          max_tokens: 50,
+          temperature: 0.7
+        });
+        finalSubject = subjectResponse.choices[0].message.content.replace(/^["']|["']$/g, '').trim();
+      }
+      
+      console.log(`[MainAgent] AI generated subject: ${finalSubject}`);
+      console.log(`[MainAgent] AI generated body preview: ${aiGeneratedBody.substring(0, 100)}...`);
+      
+      return {
+        to: basicParams.to,
+        subject: finalSubject,
+        body: aiGeneratedBody,
+        isAIGenerated: true,  // Flag to prevent re-generation in gmailAgent
+        userName: userName || null
+      };
+      
+    } catch (error) {
+      console.error(`[MainAgent] Error generating AI email content:`, error);
+      // Fall back to basic params if AI generation fails
+      return basicParams;
+    }
   }
 
   /**

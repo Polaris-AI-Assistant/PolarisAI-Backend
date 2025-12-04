@@ -800,62 +800,70 @@ Remember: You have full access to Gmail operations. Help users manage their emai
         const toolName = options.forceToolExecution.toolName;
         let params = { ...options.forceToolExecution.params };
         
-        // Special handling for sendEmail - ALWAYS generate proper email content with AI
-        // The extracted body from confirmation is usually just a description, not actual email content
+        // Special handling for sendEmail
         if (toolName === 'sendEmail') {
-          console.log(`[GmailAgent] Generating proper email content with AI...`);
-          
-          const generationResponse = await this.openai.chat.completions.create({
-            model: "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content: `You are an email writing assistant. Generate a complete, well-formatted email with:
+          // Check if email content was already AI-generated during confirmation preview
+          if (params.isAIGenerated) {
+            console.log(`[GmailAgent] Using pre-generated AI email content (matches preview)`);
+            // Remove the flag before sending - it's not needed by the API
+            delete params.isAIGenerated;
+            delete params.userName;
+          } else {
+            // Only regenerate if not already AI-generated (legacy path or fallback)
+            console.log(`[GmailAgent] Generating email content with AI (no pre-generated content)...`);
+            
+            const generationResponse = await this.openai.chat.completions.create({
+              model: "gpt-4o-mini",
+              messages: [
+                {
+                  role: "system",
+                  content: `You are an email writing assistant. Generate a complete, well-formatted email with:
 1. A warm, appropriate greeting
 2. The main message body (friendly, professional tone as appropriate)
 3. A proper sign-off
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.`
-              },
-              {
-                role: "user",
-                content: `Write an email for:
+                },
+                {
+                  role: "user",
+                  content: `Write an email for:
 To: ${params.to}
 Subject: ${params.subject}
 Context/Intent: ${params.body || query}
 
 Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`
-              }
-            ],
-            max_tokens: 500,
-            temperature: 0.7
-          });
-          
-          params.body = generationResponse.choices[0].message.content;
-          
-          // Also generate a better subject if it's generic
-          if (params.subject === 'New Message' || params.subject === 'Meeting' || !params.subject) {
-            const subjectResponse = await this.openai.chat.completions.create({
-              model: "gpt-4o-mini",
-              messages: [
-                {
-                  role: "system",
-                  content: "Generate a short, catchy email subject line (max 50 chars). Only output the subject text, nothing else."
-                },
-                {
-                  role: "user",
-                  content: `Generate subject for: ${params.body || query}`
                 }
               ],
-              max_tokens: 50,
+              max_tokens: 500,
               temperature: 0.7
             });
-            params.subject = subjectResponse.choices[0].message.content.replace(/^["']|["']$/g, '').trim();
+            
+            params.body = generationResponse.choices[0].message.content;
+            
+            // Also generate a better subject if it's generic
+            if (params.subject === 'New Message' || params.subject === 'Meeting' || !params.subject) {
+              const subjectResponse = await this.openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                  {
+                    role: "system",
+                    content: "Generate a short, catchy email subject line (max 50 chars). Only output the subject text, nothing else."
+                  },
+                  {
+                    role: "user",
+                    content: `Generate subject for: ${params.body || query}`
+                  }
+                ],
+                max_tokens: 50,
+                temperature: 0.7
+              });
+              params.subject = subjectResponse.choices[0].message.content.replace(/^["']|["']$/g, '').trim();
+            }
+            
+            console.log(`[GmailAgent] Generated subject: ${params.subject}`);
+            console.log(`[GmailAgent] Generated body: ${params.body.substring(0, 100)}...`);
           }
-          
-          console.log(`[GmailAgent] Generated subject: ${params.subject}`);
-          console.log(`[GmailAgent] Generated body: ${params.body.substring(0, 100)}...`);
         }
         
         console.log(`[GmailAgent] Force executing tool: ${toolName}`);

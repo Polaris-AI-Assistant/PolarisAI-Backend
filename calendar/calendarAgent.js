@@ -500,12 +500,47 @@ Be conversational, helpful, and proactive in your assistance. Always interpret u
         
         // Generate a response message based on the result
         let responseText = "I've completed your request.";
-        if (result.success && result.data) {
+        if (result.success) {
           if (forceToolExecution.toolName === 'createEvent') {
-            const event = result.data;
-            responseText = `I've created your calendar event "${event.summary || 'Event'}".`;
-            if (event.htmlLink) {
-              responseText += ` You can view it here: ${event.htmlLink}`;
+            const event = result.event || result.data;
+            let eventTitle = event?.summary || forceToolExecution.params.summary || 'Event';
+            const startDateTime = event?.start?.dateTime || forceToolExecution.params.startDateTime;
+            const endDateTime = event?.end?.dateTime || forceToolExecution.params.endDateTime;
+            const hangoutLink = result.hangoutLink || event?.hangoutLink;
+            const hasGoogleMeet = !!hangoutLink || forceToolExecution.params.addGoogleMeet;
+            
+            // Validate that the title isn't just date/time info
+            const isJustDateTime = /^(\d|at|on|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december|\s|st|nd|rd|th|am|pm|:|-|,|\.|with video call)+$/i.test(eventTitle);
+            if (isJustDateTime || eventTitle === 'New Event' || eventTitle === 'Event') {
+              eventTitle = hasGoogleMeet ? 'Google Meet' : 'Meeting';
+            }
+            
+            // Format date and time nicely
+            let dateStr = '';
+            let timeStr = '';
+            if (startDateTime) {
+              const start = new Date(startDateTime);
+              const end = endDateTime ? new Date(endDateTime) : null;
+              dateStr = start.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+              timeStr = start.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+              if (end) {
+                timeStr += ` - ${end.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`;
+              }
+            }
+            
+            // Build response with Google Meet link if available
+            responseText = `I've successfully created your event! 🎉\n\nHere are the details for your ${hasGoogleMeet ? 'Google Meet' : 'event'}${dateStr ? ` scheduled for ${dateStr.split(',')[0]}` : ''}:\n\n`;
+            responseText += `• **Event Title:** ${eventTitle}\n`;
+            if (dateStr) responseText += `• **Date:** ${dateStr}\n`;
+            if (timeStr) responseText += `• **Time:** ${timeStr}\n`;
+            
+            if (hangoutLink) {
+              responseText += `• **Google Meet Link:** ${hangoutLink}\n`;
+              responseText += `\nYou can join the meeting by clicking the link above.`;
+            }
+            
+            if (result.htmlLink) {
+              responseText += `\n\n[View in Google Calendar](${result.htmlLink})`;
             }
           }
         }
