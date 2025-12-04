@@ -337,9 +337,13 @@ const confirmationConfig = {
         lines.push(`**To:** ${params.to}`);
         if (params.cc) lines.push(`**CC:** ${params.cc}`);
         if (params.bcc) lines.push(`**BCC:** ${params.bcc}`);
-        lines.push(`**Subject:** ${params.subject === 'New Message' ? '_(AI will generate based on content)_' : params.subject}`);
-        lines.push('\n**Intent/Content:**');
-        if (params.body && params.body.trim()) {
+        lines.push(`**Subject:** ${params.subject}`);
+        lines.push('\n**Content:**');
+        
+        // If AI has already generated the content, show it
+        if (params.isAIGenerated && params.body) {
+          lines.push(params.body);
+        } else if (params.body && params.body.trim()) {
           lines.push(params.body);
           lines.push('\n_✨ AI will compose a proper email based on this intent_');
         } else {
