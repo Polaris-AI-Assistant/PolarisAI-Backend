@@ -37,6 +37,9 @@ const meetAuthRoutes = require('./meet/meetAuth');
 const meetDataRoutes = require('./meet/meetData');
 const meetAgentRoutes = require('./meet/meetAgentController');
 
+// Flights routes
+const flightsAgentRoutes = require('./flights/flightsAgentController');
+
 // Main Coordinator Agent routes
 const mainAgentRoutes = require('./mainAgent/mainAgentController');
 
@@ -113,6 +116,9 @@ app.use('/api', meetDataRoutes);
 // Use Meet AI Agent routes
 app.use('/api/meet', meetAgentRoutes);
 
+// Use Flights AI Agent routes
+app.use('/api/flights', flightsAgentRoutes);
+
 // Use GitHub authentication routes
 app.use('/api/auth/github', githubRoutes);
 
@@ -173,7 +179,11 @@ app.get('/api', (req, res) => {
         'GET /api/gmail/agent/examples': 'Get Gmail agent example queries',
         'GET /api/gmail/agent/capabilities': 'Get Gmail agent capabilities',
         'POST /api/meet/agent/query': 'Google Meet AI Agent',
-        'POST /api/sheets/agent/query': 'Google Sheets AI Agent'
+        'POST /api/sheets/agent/query': 'Google Sheets AI Agent',
+        'POST /api/flights/agent/query': 'Flights Search AI Agent (SerpAPI Google Flights)',
+        'GET /api/flights/agent/examples': 'Get flight search example queries',
+        'GET /api/flights/agent/airports': 'Get list of common airport codes',
+        'GET /api/flights/agent/status': 'Check flights agent status'
       },
       auth: {
         'POST /api/auth/signup': 'Create new user account',

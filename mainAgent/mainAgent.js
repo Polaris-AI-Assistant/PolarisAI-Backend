@@ -21,6 +21,7 @@
  * - GitHubAgent: GitHub operations
  * - MeetAgent: Google Meet operations
  * - SheetsAgent: Google Sheets operations
+ * - FlightsAgent: Flight search operations via SerpAPI
  * 
  * Usage:
  * const mainAgent = new MainAgent();
@@ -35,6 +36,7 @@ const GitHubAgent = require('../github/githubAgent');
 const GmailAgent = require('../gmail/gmailAgent');
 const MeetAgent = require('../meet/meetAgent');
 const SheetsAgent = require('../sheets/sheetsAgent');
+const FlightsAgent = require('../flights/flightsAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 
@@ -70,7 +72,8 @@ class MainAgent {
       github: new GitHubAgent(),
       gmail: new GmailAgent(),
       meet: new MeetAgent(),
-      sheets: new SheetsAgent()
+      sheets: new SheetsAgent(),
+      flights: new FlightsAgent()
     };
 
     // System prompt for the main coordinator
@@ -320,6 +323,22 @@ Available specialized agents and their capabilities:
 - Format cells and ranges
 - Share and manage permissions
 
+**FlightsAgent**: Flight search operations (via SerpAPI Google Flights)
+- Search for flights between cities/airports
+- Compare flight prices and options
+- Get price insights and trends
+- Support for one-way and round-trip searches
+- Multi-currency support
+
+**FLIGHTS TOOLS INSTRUCTIONS**:
+You have access to two flights-related tools:
+- **getFlightsList**: Use this when the user wants to find or compare flights between cities/airports on specific dates. Returns available flights with prices, times, and airlines.
+- **getFlightsPriceInsights**: Use this when the user wants price trends, cheapest days to fly, or when to book for the best deals.
+
+When the user mentions flights, airlines, ticket prices, or asks to find/compare flights, route to the flights agent and summarize the tool result in a clear, concise human-friendly way.
+
+Flight-related keywords to recognize: "flight", "flights", "airline", "ticket price", "book a flight", "find me a flight", "Mumbai to Delhi flight", "cheap flights", "compare flights", "airfare", "plane ticket"
+
 Guidelines:
 - If a request involves multiple services, coordinate the agents appropriately
 - Be conversational and friendly in your responses
@@ -392,6 +411,7 @@ Available agents:
 - gmail: Gmail operations (send/read/search emails, drafts, labels, filters)
 - meet: Google Meet operations (create meetings, view history, recordings)
 - sheets: Google Sheets operations (create/edit spreadsheets, data management)
+- flights: Flight search operations (search flights, compare prices, price insights, airlines, tickets)
 
 Respond with a JSON object containing:
 {
@@ -414,6 +434,9 @@ Examples:
 - "create a form about customer feedback and a spreadsheet to track responses" -> {"agents": ["forms", "sheets"], ...}
 - "send an email about the meeting I scheduled" -> {"agents": ["gmail", "calendar"], "requiresSequential": true, ...}
 - "add a question to it" (with artifact FORM "Survey" formId=abc123) -> {"agents": ["forms"], "queries": {"forms": "add a question to form with formId abc123"}}
+- "find flights from Mumbai to Delhi tomorrow" -> {"agents": ["flights"], ...}
+- "compare flight prices from BOM to BLR" -> {"agents": ["flights"], ...}
+- "what are the cheapest flights to Goa next week" -> {"agents": ["flights"], ...}
 
 Important:
 - Only include agents that are actually needed
@@ -1668,6 +1691,17 @@ Do not include raw JSON or technical details unless specifically relevant.`;
             'Manage data',
             'Format cells',
             'Share spreadsheets'
+          ]
+        },
+        flights: {
+          name: 'Flights Agent',
+          service: 'SerpAPI Google Flights',
+          capabilities: [
+            'Search for flights between cities/airports',
+            'Compare flight prices',
+            'Get price insights and trends',
+            'One-way and round-trip searches',
+            'Multi-currency support'
           ]
         }
       }
