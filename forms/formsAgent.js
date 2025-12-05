@@ -473,7 +473,27 @@ Always confirm successful operations and provide relevant links or IDs for refer
           throw new Error(`Unknown function: ${options.forceToolExecution.toolName}`);
         }
 
-        const result = await functionToCall(userId, options.forceToolExecution.params);
+        const toolName = options.forceToolExecution.toolName;
+        const params = options.forceToolExecution.params;
+        let result;
+
+        // Call each function with proper parameter destructuring
+        if (toolName === 'listForms') {
+          result = await functionToCall(userId, params.pageSize, params.pageNumber);
+        } else if (toolName === 'createForm') {
+          result = await functionToCall(userId, params.title, params.description, params.questions);
+        } else if (toolName === 'getResponses') {
+          result = await functionToCall(userId, params.formId, params.pageSize, params.pageNumber);
+        } else if (toolName === 'getForm') {
+          result = await functionToCall(userId, params.formId);
+        } else if (toolName === 'updateForm') {
+          result = await functionToCall(userId, params.formId, params.title, params.description, params.questions);
+        } else if (toolName === 'publishForm') {
+          result = await functionToCall(userId, params.formId, params.isPublished, params.isAcceptingResponses);
+        } else {
+          // Fallback for unknown functions
+          result = await functionToCall(userId, params);
+        }
         
         return {
           success: true,
@@ -573,7 +593,20 @@ Always confirm successful operations and provide relevant links or IDs for refer
         if (functionName === 'listForms') {
           result = await functionToCall(userId, functionArgs.pageSize, functionArgs.pageNumber);
         } else if (functionName === 'createForm') {
-          result = await functionToCall(userId, functionArgs.title, functionArgs.description, functionArgs.questions);
+          // Handle case where OpenAI might nest all params under title
+          let title = functionArgs.title;
+          let description = functionArgs.description;
+          let questions = functionArgs.questions;
+          
+          // If title is an object (nested structure), extract properly
+          if (typeof title === 'object' && title !== null) {
+            console.log('[FormsAgent] Detected nested title object, extracting fields');
+            description = title.description || description;
+            questions = title.questions || questions;
+            title = title.title || 'Untitled Form';
+          }
+          
+          result = await functionToCall(userId, title, description, questions);
         } else if (functionName === 'getResponses') {
           result = await functionToCall(userId, functionArgs.formId, functionArgs.pageSize, functionArgs.pageNumber);
         } else if (functionName === 'getForm') {

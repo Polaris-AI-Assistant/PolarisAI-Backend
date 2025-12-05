@@ -40,11 +40,18 @@ const meetAgentRoutes = require('./meet/meetAgentController');
 // Flights routes
 const flightsAgentRoutes = require('./flights/flightsAgentController');
 
+// Maps routes
+const mapsAgentRoutes = require('./maps/mapsAgentController');
+
 // Main Coordinator Agent routes
 const mainAgentRoutes = require('./mainAgent/mainAgentController');
 
 // Chat History routes
 const chatRoutes = require('./chat/chatController');
+
+// Memory routes
+const memoryRoutes = require('./memory/memoryController');
+const memorySettingsRoutes = require('./memory/memorySettingsController');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -119,6 +126,9 @@ app.use('/api/meet', meetAgentRoutes);
 // Use Flights AI Agent routes
 app.use('/api/flights', flightsAgentRoutes);
 
+// Use Maps AI Agent routes
+app.use('/api/maps', mapsAgentRoutes);
+
 // Use GitHub authentication routes
 app.use('/api/auth/github', githubRoutes);
 
@@ -133,6 +143,12 @@ app.use('/api/agent', mainAgentRoutes);
 
 // Use Chat History routes
 app.use('/api/chat', chatRoutes);
+
+// Use Memory routes
+app.use('/api/memory', memoryRoutes);
+
+// Use Memory Settings routes
+app.use('/api/settings', memorySettingsRoutes);
 
 // Health check route
 app.get('/health', async (req, res) => {
@@ -170,6 +186,12 @@ app.get('/api', (req, res) => {
         'GET /api/agent/health': 'Health check for the main agent system',
         'POST /api/agent/test': 'Test endpoint (development only)'
       },
+      memory: {
+        'POST /api/memory/add': 'Add a conversation to long-term memory',
+        'POST /api/memory/retrieve': 'Retrieve relevant memories using semantic search',
+        'GET /api/memory/list': 'List all memories for a user',
+        'DELETE /api/memory/:id': 'Delete a specific memory'
+      },
       specializedAgents: {
         'POST /api/calendar/agent/query': 'Google Calendar AI Agent',
         'POST /api/docs/agent/query': 'Google Docs AI Agent',
@@ -183,7 +205,12 @@ app.get('/api', (req, res) => {
         'POST /api/flights/agent/query': 'Flights Search AI Agent (SerpAPI Google Flights)',
         'GET /api/flights/agent/examples': 'Get flight search example queries',
         'GET /api/flights/agent/airports': 'Get list of common airport codes',
-        'GET /api/flights/agent/status': 'Check flights agent status'
+        'GET /api/flights/agent/status': 'Check flights agent status',
+        'POST /api/maps/agent/query': 'Google Maps AI Agent (places, directions, geocoding)',
+        'GET /api/maps/agent/examples': 'Get Maps agent example queries',
+        'GET /api/maps/agent/capabilities': 'Get Maps agent capabilities',
+        'GET /api/maps/agent/place-types': 'Get list of supported place types',
+        'GET /api/maps/agent/status': 'Check Maps agent status'
       },
       auth: {
         'POST /api/auth/signup': 'Create new user account',
@@ -213,6 +240,7 @@ app.get('/api', (req, res) => {
     },
     features: [
       'Main Coordinator Agent for multi-service queries',
+      'Long-term semantic memory with vector embeddings',
       'Specialized agents for each service',
       'Parallel and sequential execution',
       'Intelligent query routing',

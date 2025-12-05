@@ -43,7 +43,8 @@ const ARTIFACT_TYPES = {
     ISSUE: 'issue',
     PR: 'pull_request',
     LABEL: 'label',
-    FILTER: 'filter'
+    FILTER: 'filter',
+    FLIGHT_SEARCH: 'flight_search'
 };
 
 // Type display names for human-readable output
@@ -60,7 +61,8 @@ const TYPE_DISPLAY_NAMES = {
     issue: 'Issue',
     pull_request: 'Pull Request',
     label: 'Label',
-    filter: 'Filter'
+    filter: 'Filter',
+    flight_search: 'Flight Search'
 };
 
 /**
@@ -151,6 +153,9 @@ const extractAndStoreArtifact = async (conversationId, agentType, toolName, resu
             break;
         case 'github':
             artifact = extractGitHubArtifact(toolName, result);
+            break;
+        case 'flights':
+            artifact = extractFlightsArtifact(toolName, result);
             break;
         default:
             console.log(`[ArtifactMemory]   ⚠️ Unknown agent type: ${agentType}`);
@@ -555,6 +560,82 @@ const extractGitHubArtifact = (toolName, result) => {
 };
 
 /**
+ * Extract artifact from Flights tool result
+ * Stores flight search results so user can reference them later (e.g., "book that flight", "the IndiGo flight")
+ */
+const extractFlightsArtifact = (toolName, result) => {
+    console.log(`[ArtifactMemory] 🔍 extractFlightsArtifact called for tool: ${toolName}`);
+    console.log(`[ArtifactMemory]   Result success: ${result?.success}`);
+    
+    if (!result || !result.success) {
+        console.log(`[ArtifactMemory]   ❌ Result is null or not successful`);
+        return null;
+    }
+
+    // Unwrap agent result to get actual tool output
+    let toolResult = result;
+    if (result.raw_results && Array.isArray(result.raw_results) && result.raw_results.length > 0) {
+        const successResult = result.raw_results.find(r => r.success && r.data);
+        if (successResult) {
+            toolResult = successResult;
+        }
+    }
+    
+    console.log(`[ArtifactMemory]   toolResult keys: ${Object.keys(toolResult).join(', ')}`);
+
+    switch (toolName) {
+        case 'getFlightsList':
+        case 'getFlightsPriceInsights':
+            // Extract search parameters and flight data
+            const data = toolResult.data || toolResult;
+            const searchParams = data.search_metadata?.search_params || data.search_params || {};
+            const bestFlights = data.best_flights || [];
+            const otherFlights = data.other_flights || [];
+            
+            // Generate a unique search ID based on route and date
+            const searchId = `${searchParams.from || 'unknown'}-${searchParams.to || 'unknown'}-${searchParams.date || Date.now()}`;
+            const routeTitle = `${searchParams.from || '?'} to ${searchParams.to || '?'}`;
+            
+            // Extract flight details for quick reference
+            const flightsList = [...bestFlights, ...otherFlights].slice(0, 10).map(flight => {
+                const firstLeg = flight.flights?.[0] || {};
+                return {
+                    airline: firstLeg.airline || flight.airline,
+                    flightNumber: firstLeg.flight_number || flight.flight_number,
+                    price: flight.price,
+                    departureTime: firstLeg.departure_airport?.time,
+                    arrivalTime: firstLeg.arrival_airport?.time || flight.flights?.[flight.flights.length - 1]?.arrival_airport?.time,
+                    duration: flight.total_duration,
+                    stops: (flight.flights?.length || 1) - 1
+                };
+            });
+
+            console.log(`[ArtifactMemory]   ✅ Extracted ${flightsList.length} flights for route: ${routeTitle}`);
+            
+            return {
+                id: searchId,
+                type: ARTIFACT_TYPES.FLIGHT_SEARCH,
+                title: `Flights: ${routeTitle} on ${searchParams.date || 'unknown date'}`,
+                data: {
+                    from: searchParams.from,
+                    to: searchParams.to,
+                    date: searchParams.date,
+                    returnDate: searchParams.returnDate,
+                    currency: searchParams.currency || 'INR',
+                    travelers: searchParams.travelers || 1,
+                    flightsCount: bestFlights.length + otherFlights.length,
+                    flights: flightsList,
+                    bestFlights: bestFlights,
+                    otherFlights: otherFlights
+                }
+            };
+    }
+
+    console.log(`[ArtifactMemory]   ❌ No artifact could be extracted for tool: ${toolName}`);
+    return null;
+};
+
+/**
  * Format artifacts for inclusion in AI system prompt
  * 
  * @param {string} conversationId - Unique conversation/chat ID
@@ -577,13 +658,37 @@ const formatArtifactsForPrompt = async (conversationId) => {
     artifacts.forEach((artifact, index) => {
         const displayType = TYPE_DISPLAY_NAMES[artifact.type] || artifact.type;
         const idField = getIdFieldName(artifact.type);
-        const line = `- ${displayType}: "${artifact.title}" (${idField}=${artifact.id})`;
+        let line = `- ${displayType}: "${artifact.title}" (${idField}=${artifact.id})`;
+        
+        // Add extra context for flight search artifacts
+        if (artifact.type === 'flight_search' && artifact.data) {
+            const flightData = artifact.data;
+            line += `\n  Route: ${flightData.from} → ${flightData.to}`;
+            line += `\n  Date: ${flightData.date}${flightData.returnDate ? ' (Return: ' + flightData.returnDate + ')' : ''}`;
+            line += `\n  Travelers: ${flightData.travelers || 1}, Currency: ${flightData.currency || 'INR'}`;
+            
+            // List available flights for reference
+            if (flightData.flights && flightData.flights.length > 0) {
+                line += `\n  Available flights (${flightData.flightsCount} total):`;
+                flightData.flights.slice(0, 5).forEach((flight, i) => {
+                    const flightNum = flight.flightNumber || 'N/A';
+                    const airline = flight.airline || 'Unknown';
+                    const price = flight.price ? `₹${flight.price}` : 'Price N/A';
+                    const depTime = flight.departureTime || '';
+                    const arrTime = flight.arrivalTime || '';
+                    const stops = flight.stops === 0 ? 'Direct' : `${flight.stops} stop(s)`;
+                    line += `\n    ${i + 1}. ${airline} ${flightNum} - ${price} | ${depTime} → ${arrTime} | ${stops}`;
+                });
+            }
+        }
+        
         lines.push(line);
-        console.log(`[ArtifactMemory]   ${index + 1}. ${line}`);
+        console.log(`[ArtifactMemory]   ${index + 1}. ${displayType}: ${artifact.title}`);
     });
 
     lines.push('');
-    lines.push('When user refers to "it", "that", "the previous one", "the form/doc/sheet we created", etc., resolve to the appropriate artifact above.');
+    lines.push('When user refers to "it", "that", "the previous one", "the form/doc/sheet we created", "that flight", "the IndiGo flight", etc., resolve to the appropriate artifact above.');
+    lines.push('For flights: If user says "book flight X" or "I want the IndiGo flight", use the flight details from the stored flight search artifact above.');
     
     return lines.join('\n');
 };
@@ -605,7 +710,8 @@ const getIdFieldName = (type) => {
         issue: 'issueId',
         pull_request: 'prId',
         label: 'labelId',
-        filter: 'filterId'
+        filter: 'filterId',
+        flight_search: 'searchId'
     };
     return idFields[type] || 'id';
 };
@@ -643,7 +749,15 @@ const resolveArtifactReference = async (conversationId, reference) => {
         'repository': ARTIFACT_TYPES.REPO,
         'issue': ARTIFACT_TYPES.ISSUE,
         'pull request': ARTIFACT_TYPES.PR,
-        'pr': ARTIFACT_TYPES.PR
+        'pr': ARTIFACT_TYPES.PR,
+        'flight': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'flights': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'ticket': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'booking': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'indigo': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'air india': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'spicejet': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'vistara': ARTIFACT_TYPES.FLIGHT_SEARCH
     };
 
     // Check if reference contains a type hint

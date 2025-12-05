@@ -164,26 +164,45 @@ async function createForm(userIdentifier, title, description = '', questions = [
           question: {}
         };
         
+        // Normalize type - handle various LLM interpretations
+        const questionType = (q.type || 'text').toLowerCase();
+        
         // Determine question type and build appropriate structure
-        if (q.type === 'text' || !q.type) {
+        if (questionType === 'text' || questionType === 'short_answer' || questionType === 'short') {
           questionItem.question.textQuestion = {};
-        } else if (q.type === 'paragraph') {
+        } else if (questionType === 'paragraph' || questionType === 'long_answer' || questionType === 'long') {
           questionItem.question.textQuestion = { paragraph: true };
-        } else if (q.type === 'multiple_choice' && q.options) {
+        } else if (questionType === 'scale' || questionType === 'linear_scale' || questionType === 'rating') {
+          // Scale questions use scaleQuestion in Google Forms API
+          questionItem.question.scaleQuestion = {
+            low: 1,
+            high: 5,
+            lowLabel: 'Low',
+            highLabel: 'High'
+          };
+        } else if ((questionType === 'multiple_choice' || questionType === 'radio' || questionType === 'mcq') && q.options && q.options.length > 0) {
           questionItem.question.choiceQuestion = {
             type: 'RADIO',
             options: q.options.map(opt => ({ value: opt }))
           };
-        } else if (q.type === 'checkbox' && q.options) {
+        } else if ((questionType === 'checkbox' || questionType === 'checkboxes') && q.options && q.options.length > 0) {
           questionItem.question.choiceQuestion = {
             type: 'CHECKBOX',
             options: q.options.map(opt => ({ value: opt }))
           };
-        } else if (q.type === 'dropdown' && q.options) {
+        } else if ((questionType === 'dropdown' || questionType === 'select') && q.options && q.options.length > 0) {
           questionItem.question.choiceQuestion = {
             type: 'DROP_DOWN',
             options: q.options.map(opt => ({ value: opt }))
           };
+        } else if ((questionType === 'multiple_choice' || questionType === 'radio') && (!q.options || q.options.length === 0)) {
+          // Radio/multiple choice without options - default to text
+          console.warn(`[FormsService] Question "${q.title}" has type ${questionType} but no options, defaulting to text`);
+          questionItem.question.textQuestion = {};
+        } else {
+          // Default fallback to text question
+          console.warn(`[FormsService] Unknown question type "${questionType}", defaulting to text`);
+          questionItem.question.textQuestion = {};
         }
         
         // Set required field

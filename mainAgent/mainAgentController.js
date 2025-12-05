@@ -10,6 +10,7 @@
  * - Confirmation flow for sensitive actions
  * - Confirm/Cancel action endpoints
  * - Artifact memory management
+ * - Long-term memory integration
  */
 
 const express = require('express');
@@ -24,10 +25,85 @@ const {
     clearArtifacts 
 } = require('../utils/artifactMemory');
 
+// Long-term Memory imports
+const {
+    addMemory,
+    MEMORY_CONFIG,
+    SOURCE_APPS
+} = require('../memory/memoryService');
+
 const router = express.Router();
 
 // Initialize the Main Coordinator Agent
 const mainAgent = new MainAgent();
+
+/**
+ * Determine if an exchange should be automatically stored in long-term memory
+ * Based on heuristics about the exchange content and type
+ * 
+ * @param {string} query - User's query
+ * @param {string} response - Assistant's response
+ * @param {string[]} agentsUsed - List of agents used
+ * @returns {boolean} - Whether to auto-store
+ */
+function shouldAutoStoreMemory(query, response, agentsUsed) {
+  // Skip if auto-store is disabled in config
+  if (!MEMORY_CONFIG.AUTO_STORE_ENABLED) {
+    return false;
+  }
+  
+  // Skip if response is too short (likely an error or trivial response)
+  if (!response || response.length < MEMORY_CONFIG.MIN_CONTENT_LENGTH) {
+    return false;
+  }
+  
+  // Skip if query is too short (likely a follow-up or clarification)
+  if (!query || query.length < 10) {
+    return false;
+  }
+  
+  const lowerQuery = query.toLowerCase();
+  const lowerResponse = response.toLowerCase();
+  
+  // Auto-store if multiple agents were used (cross-app context)
+  if (agentsUsed && agentsUsed.length > 1) {
+    return true;
+  }
+  
+  // Auto-store if it contains user preference indicators
+  const preferenceIndicators = [
+    'i prefer', 'i like', 'i always', 'i usually', 'i never',
+    'my favorite', 'my default', 'i want to', 'remind me',
+    'i work', 'my job', 'my role', 'my team', 'my manager',
+    'my timezone', 'my calendar', 'my email'
+  ];
+  if (preferenceIndicators.some(ind => lowerQuery.includes(ind))) {
+    return true;
+  }
+  
+  // Auto-store if it's a task creation/completion
+  const taskIndicators = [
+    'created', 'scheduled', 'sent', 'added', 'updated',
+    'form', 'document', 'spreadsheet', 'event', 'meeting',
+    'email', 'repository', 'issue', 'pull request'
+  ];
+  if (taskIndicators.filter(ind => lowerResponse.includes(ind)).length >= 2) {
+    return true;
+  }
+  
+  // Auto-store if response contains important links or IDs
+  if (lowerResponse.includes('docs.google.com') || 
+      lowerResponse.includes('github.com') ||
+      lowerResponse.includes('meet.google.com') ||
+      lowerResponse.includes('formid') ||
+      lowerResponse.includes('documentid') ||
+      lowerResponse.includes('eventid')) {
+    return true;
+  }
+  
+  // Don't auto-store by default
+  return false;
+}
 
 /**
  * POST /agent/query/stream
@@ -38,13 +114,14 @@ const mainAgent = new MainAgent();
  *   "query": "schedule a meeting tomorrow and create a document for it",
  *   "conversationHistory": [], // optional
  *   "conversationId": "uuid" // optional - for artifact memory
+ *   "addToMemory": boolean // optional - whether to auto-store this exchange in long-term memory
  * }
  * 
  * Response: Server-Sent Events (SSE) stream
  */
 router.post('/query/stream', authenticateToken, async (req, res) => {
   try {
-    const { query, conversationHistory, conversationId } = req.body;
+    const { query, conversationHistory, conversationId, addToMemory, userLocation } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -59,6 +136,12 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     if (conversationId) {
       console.log(`[MainAgentController] Conversation ID: ${conversationId}`);
     }
+    if (addToMemory) {
+      console.log(`[MainAgentController] Auto-store to memory: enabled`);
+    }
+    if (userLocation) {
+      console.log(`[MainAgentController] User location provided: ${userLocation.lat}, ${userLocation.lng}`);
+    }
 
     // Set up SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
@@ -69,16 +152,79 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     // Send thinking indicator
     res.write(`data: ${JSON.stringify({ type: 'thinking', status: 'start' })}\n\n`);
 
+    // Track the complete response for memory storage
+    let completeResponse = '';
+    let agentsUsed = [];
+
     try {
       // Process the query through the main agent with streaming
-      // Now includes conversationId for artifact memory
+      // Now includes conversationId for artifact memory and userLocation for Maps
       await mainAgent.processQueryWithStreaming(query, userId, { 
         conversationHistory,
-        conversationId  // Pass conversationId for artifact memory
+        conversationId,  // Pass conversationId for artifact memory
+        userLocation  // Pass userLocation for Maps agent
       }, (chunk) => {
+        // Accumulate content chunks for memory storage
+        if (chunk.type === 'content' && chunk.text) {
+          completeResponse += chunk.text;
+        }
+        if (chunk.type === 'metadata' && chunk.agentsUsed) {
+          agentsUsed = chunk.agentsUsed;
+        }
+        
         // Send each chunk to the client
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       });
+
+      // Auto-store to memory if enabled or if auto-store conditions are met
+      if (addToMemory || shouldAutoStoreMemory(query, completeResponse, agentsUsed)) {
+        try {
+          console.log(`[MainAgentController] 🧠 Auto-storing exchange to long-term memory...`);
+          
+          // Determine source app based on agents used
+          let sourceApp = SOURCE_APPS.CHAT;
+          if (agentsUsed.length === 1) {
+            const agentToSource = {
+              'gmail': SOURCE_APPS.GMAIL,
+              'github': SOURCE_APPS.GITHUB,
+              'calendar': SOURCE_APPS.CALENDAR,
+              'docs': SOURCE_APPS.DOCS,
+              'sheets': SOURCE_APPS.SHEETS,
+              'forms': SOURCE_APPS.FORMS,
+              'meet': SOURCE_APPS.MEET,
+              'flights': SOURCE_APPS.FLIGHTS
+            };
+            sourceApp = agentToSource[agentsUsed[0]] || SOURCE_APPS.CHAT;
+          } else if (agentsUsed.length > 1) {
+            sourceApp = SOURCE_APPS.MULTI_AGENT;
+          }
+          
+          const memoryResult = await addMemory({
+            userId,
+            userMessage: query,
+            assistantMessage: completeResponse,
+            sourceApp,
+            metadata: {
+              conversationId,
+              agentsUsed,
+              autoStored: !addToMemory // Mark if auto-stored vs user-requested
+            }
+          });
+          
+          if (memoryResult.success) {
+            console.log(`[MainAgentController] ✅ Memory stored: ${memoryResult.memoryId} (${memoryResult.memoryType})`);
+            // Send memory stored event to client
+            res.write(`data: ${JSON.stringify({ 
+              type: 'memory_stored', 
+              memoryId: memoryResult.memoryId,
+              memoryType: memoryResult.memoryType
+            })}\n\n`);
+          }
+        } catch (memoryError) {
+          console.error('[MainAgentController] ⚠️ Error storing memory:', memoryError.message);
+          // Don't fail the request if memory storage fails
+        }
+      }
 
       // Send completion signal
       res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
@@ -232,6 +378,17 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
       await mainAgent.streamConfirmedActionResponse(executionResult, (chunk) => {
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       });
+
+      // Check if there's a next action in the chain that needs confirmation
+      if (executionResult.nextConfirmation) {
+        console.log(`[MainAgentController] Sending next confirmation in chain: ${executionResult.nextConfirmation.toolName}`);
+        
+        // Send the next confirmation request
+        res.write(`data: ${JSON.stringify({ 
+          type: 'confirmation_request',
+          ...executionResult.nextConfirmation
+        })}\n\n`);
+      }
 
       // Send completion signal
       res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);

@@ -22,6 +22,7 @@
  * - MeetAgent: Google Meet operations
  * - SheetsAgent: Google Sheets operations
  * - FlightsAgent: Flight search operations via SerpAPI
+ * - MapsAgent: Google Maps operations (places, directions, geocoding)
  * 
  * Usage:
  * const mainAgent = new MainAgent();
@@ -37,6 +38,7 @@ const GmailAgent = require('../gmail/gmailAgent');
 const MeetAgent = require('../meet/meetAgent');
 const SheetsAgent = require('../sheets/sheetsAgent');
 const FlightsAgent = require('../flights/flightsAgent');
+const MapsAgent = require('../maps/mapsAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 
@@ -53,6 +55,13 @@ const {
     generateArtifactPromptEnhancement,
     containsArtifactReference 
 } = require('../middleware/artifactContext');
+
+// Long-term Memory imports
+const {
+    getRelevantMemories,
+    formatMemoriesForPrompt,
+    MEMORY_CONFIG
+} = require('../memory/memoryService');
 
 class MainAgent {
   constructor() {
@@ -73,7 +82,8 @@ class MainAgent {
       gmail: new GmailAgent(),
       meet: new MeetAgent(),
       sheets: new SheetsAgent(),
-      flights: new FlightsAgent()
+      flights: new FlightsAgent(),
+      maps: new MapsAgent()
     };
 
     // System prompt for the main coordinator
@@ -125,10 +135,11 @@ class MainAgent {
   /**
    * Execute a confirmed action
    * This is called after user confirms the pending action
+   * Now supports action chains - returns next action if part of a chain
    * 
    * @param {string} requestId - The pending action request ID
    * @param {string} userId - User ID for validation
-   * @returns {object} - Result of the tool execution
+   * @returns {object} - Result of the tool execution, plus nextConfirmation if part of chain
    */
   async executeConfirmedAction(requestId, userId) {
     const pendingAction = confirmationStore.getPendingAction(requestId, userId);
@@ -141,10 +152,13 @@ class MainAgent {
     }
 
     try {
-      const { agentName, toolName, params, query, conversationHistory, conversationId } = pendingAction;
+      const { agentName, toolName, params, query, conversationHistory, conversationId, chainId, chainIndex, totalInChain } = pendingAction;
       
       console.log(`\n[MainAgent] 🚀 Executing confirmed action: ${toolName} on ${agentName}`);
       console.log(`[MainAgent]   ConversationId: ${conversationId || 'NOT SET'}`);
+      if (chainId) {
+        console.log(`[MainAgent]   Chain: ${chainId} (step ${chainIndex + 1}/${totalInChain})`);
+      }
       
       // Get the specialized agent
       const agent = this.agents[agentName];
@@ -188,6 +202,54 @@ class MainAgent {
       // Remove the pending action after successful execution
       confirmationStore.removePendingAction(requestId);
 
+      // Check if this is part of an action chain and get next action
+      let nextConfirmation = null;
+      if (chainId) {
+        console.log(`[MainAgent] 🔗 Checking for next action in chain: ${chainId}`);
+        
+        // Build a result object to pass to the next action
+        const completedResult = {
+          agentName,
+          toolName,
+          result: result,
+          artifact: storedArtifact
+        };
+        
+        const nextChainAction = confirmationStore.getNextChainAction(chainId, userId, completedResult);
+        
+        if (nextChainAction && !nextChainAction.chainComplete) {
+          console.log(`[MainAgent] 🔗 Next action in chain: ${nextChainAction.nextAction.toolName}`);
+          
+          // Enhance the next action's params with results from this action
+          // For example, if form was created, email can now include the form link
+          let enhancedNextAction = nextChainAction.nextAction;
+          
+          // If the next action is an email, try to enhance it with the form/doc link
+          if (enhancedNextAction.toolName === 'sendEmail' && storedArtifact) {
+            enhancedNextAction = await this.enhanceEmailWithPreviousResult(enhancedNextAction, completedResult, userId);
+          }
+          
+          nextConfirmation = {
+            requestId: enhancedNextAction.requestId,
+            toolName: enhancedNextAction.toolName,
+            agentName: enhancedNextAction.agentName,
+            actionType: confirmationUtils.getActionType(enhancedNextAction.agentName, enhancedNextAction.toolName),
+            description: confirmationUtils.getActionDescription(enhancedNextAction.agentName, enhancedNextAction.toolName),
+            params: enhancedNextAction.params,
+            previewContent: enhancedNextAction.previewContent,
+            originalQuery: query,
+            chainInfo: {
+              chainId: chainId,
+              currentStep: nextChainAction.currentIndex + 1,
+              totalSteps: nextChainAction.totalActions,
+              previousResults: nextChainAction.completedResults
+            }
+          };
+        } else if (nextChainAction && nextChainAction.chainComplete) {
+          console.log(`[MainAgent] ✅ Action chain complete: ${chainId}`);
+        }
+      }
+
       return {
         success: true,
         result: result,
@@ -195,7 +257,8 @@ class MainAgent {
         toolName: toolName,
         agentName: agentName,
         storedArtifact: storedArtifact,
-        conversationId: conversationId
+        conversationId: conversationId,
+        nextConfirmation: nextConfirmation  // Will be null if no more actions in chain
       };
 
     } catch (error) {
@@ -206,6 +269,114 @@ class MainAgent {
       return {
         success: false,
         error: error.message
+      };
+    }
+  }
+
+  /**
+   * Enhance email params with results from previous actions in the chain
+   * For example, include the form link in the email body
+   */
+  async enhanceEmailWithPreviousResult(emailAction, previousResult, userId) {
+    try {
+      const { artifact, result } = previousResult;
+      
+      console.log(`[MainAgent] 📧 Enhancing email with previous result:`, { artifact, hasResult: !!result });
+      
+      if (!artifact) {
+        console.log(`[MainAgent] ⚠️ No artifact found in previous result`);
+        return emailAction;
+      }
+
+      let linkToInclude = null;
+      let itemDescription = '';
+
+      // Extract link based on artifact type (lowercase - matching ARTIFACT_TYPES)
+      const artifactType = artifact.type?.toLowerCase();
+      console.log(`[MainAgent] 📧 Artifact type: ${artifactType}, ID: ${artifact.id}`);
+      
+      if ((artifactType === 'form') && artifact.id) {
+        linkToInclude = `https://docs.google.com/forms/d/${artifact.id}/viewform`;
+        itemDescription = `the form "${artifact.title}"`;
+      } else if ((artifactType === 'doc' || artifactType === 'document') && artifact.id) {
+        linkToInclude = `https://docs.google.com/document/d/${artifact.id}/edit`;
+        itemDescription = `the document "${artifact.title}"`;
+      } else if ((artifactType === 'sheet' || artifactType === 'spreadsheet') && artifact.id) {
+        linkToInclude = `https://docs.google.com/spreadsheets/d/${artifact.id}/edit`;
+        itemDescription = `the spreadsheet "${artifact.title}"`;
+      }
+
+      if (linkToInclude && emailAction.params) {
+        // Use AI to regenerate the email body with the actual link
+        console.log(`[MainAgent] 📧 Enhancing email with link: ${linkToInclude}`);
+        
+        const enhancedParams = await this.regenerateEmailWithLink(
+          emailAction.params,
+          linkToInclude,
+          itemDescription,
+          userId
+        );
+        
+        emailAction.params = enhancedParams;
+        emailAction.previewContent = confirmationUtils.generatePreview(
+          'gmail',
+          'sendEmail',
+          enhancedParams
+        );
+        
+        console.log(`[MainAgent] ✅ Email enhanced with actual link`);
+      } else {
+        console.log(`[MainAgent] ⚠️ Could not enhance email - linkToInclude: ${linkToInclude}, hasParams: ${!!emailAction.params}`);
+      }
+
+      return emailAction;
+    } catch (error) {
+      console.error('[MainAgent] Error enhancing email:', error);
+      return emailAction;
+    }
+  }
+
+  /**
+   * Regenerate email body to include the actual link from the previous action
+   */
+  async regenerateEmailWithLink(emailParams, link, itemDescription, userId) {
+    try {
+      const prompt = `The user wanted to send an email about ${itemDescription}.
+Here was the original email draft:
+To: ${emailParams.to}
+Subject: ${emailParams.subject}
+Body: ${emailParams.body}
+
+The ${itemDescription} has now been created. Update the email body to include this actual link: ${link}
+
+Return ONLY a JSON object with the updated email:
+{
+  "to": "${emailParams.to}",
+  "subject": "updated subject if needed",
+  "body": "updated body with the actual link included naturally"
+}`;
+
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You are an email assistant. Return only valid JSON, no markdown or extra text.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.3,
+        response_format: { type: "json_object" }
+      });
+
+      const updatedEmail = JSON.parse(response.choices[0].message.content);
+      return {
+        ...emailParams,
+        ...updatedEmail
+      };
+    } catch (error) {
+      console.error('[MainAgent] Error regenerating email with link:', error);
+      // If AI fails, just append the link to the original body
+      return {
+        ...emailParams,
+        body: `${emailParams.body}\n\nLink: ${link}`
       };
     }
   }
@@ -330,6 +501,14 @@ Available specialized agents and their capabilities:
 - Support for one-way and round-trip searches
 - Multi-currency support
 
+**MapsAgent**: Google Maps operations
+- Search for places (restaurants, hotels, cafes, etc.)
+- Find nearby places around a location
+- Get detailed place information (hours, reviews, contact)
+- Calculate distance and travel time between locations
+- Geocode addresses to coordinates and vice versa
+- Support for multiple travel modes (driving, walking, bicycling, transit)
+
 **FLIGHTS TOOLS INSTRUCTIONS**:
 You have access to two flights-related tools:
 - **getFlightsList**: Use this when the user wants to find or compare flights between cities/airports on specific dates. Returns available flights with prices, times, and airlines.
@@ -355,9 +534,17 @@ When user refers to:
 - "it", "that", "this", "the previous one" → Use the most recently created artifact
 - "the form", "the document", "the sheet" → Use the most recent artifact of that type
 - "update it", "modify that", "add to it" → Identify the target artifact from memory
+- "that flight", "the IndiGo flight", "book flight X" → Use the flight search artifact with stored flight details
+
+**FLIGHT ARTIFACT MEMORY**:
+When a user searches for flights, the search results are stored as an artifact. If they later say:
+- "I want to book IndiGo Flight 6E 6798" → Look up the flight from the stored search results
+- "book the first flight" → Use the first flight from the stored search results
+- "I'll take the cheapest one" → Find the cheapest flight from stored results
+You have ALL the flight details (airline, flight number, price, times, route, date) from the previous search. DO NOT ask for these details again. Use the stored artifact data.
 
 When you create or modify something:
-- Note the artifact ID (formId, documentId, spreadsheetId, eventId, etc.) in your response
+- Note the artifact ID (formId, documentId, spreadsheetId, eventId, searchId, etc.) in your response
 - Use the existing artifact ID for follow-up modifications
 - Always confirm successful operations with the artifact details
 
@@ -384,9 +571,9 @@ Remember: Artifacts are preserved within a conversation thread. Use this context
   /**
    * Analyze the query and determine which agents are needed
    * Uses OpenAI to intelligently route the request
-   * Now includes artifact context for better query understanding
+   * Now includes artifact context and long-term memory for better query understanding
    */
-  async analyzeQuery(query, conversationHistory = [], artifactContext = null) {
+  async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '') {
     try {
       // Build artifact context section for the prompt
       let artifactSection = '';
@@ -398,10 +585,43 @@ IMPORTANT: If the user refers to "it", "the form", "that document", etc., they a
 Include the specific artifact ID in the query you generate for the agent.`;
       }
 
+      // Build long-term memory section for the prompt
+      let memorySection = '';
+      if (memoryContext && memoryContext.length > 0) {
+        memorySection = `\n\nLONG-TERM USER MEMORIES (Relevant past interactions with this user):
+${memoryContext}
+
+IMPORTANT: Consider these memories when analyzing the query. They may provide context about:
+- User preferences and habits
+- Ongoing tasks they may be following up on
+- Past interactions with specific services
+Use this context to better understand the user's intent and route accordingly.`;
+      }
+
+      // Build conversation history section for context
+      let conversationSection = '';
+      if (conversationHistory && conversationHistory.length > 0) {
+        // Get last few messages for context (max 6 messages)
+        const recentHistory = conversationHistory.slice(-6);
+        const historyText = recentHistory.map(msg => 
+          `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, 500)}`
+        ).join('\n');
+        
+        conversationSection = `\n\nRECENT CONVERSATION HISTORY:
+${historyText}
+
+IMPORTANT: Consider the conversation context above when analyzing the current query. 
+- If the user provides a date/time after asking about flights, they are providing the date FOR THE FLIGHTS, not for a calendar event.
+- If the user says just a date like "14 dec" or "tomorrow" after asking about flights, route to flights agent with the full context.
+- Short follow-up messages like dates, times, or confirmations should be interpreted in the context of the previous messages.`;
+      }
+
       const analysisPrompt = `Analyze the following user query and determine which specialized agent(s) are needed to fulfill it.
 
 User Query: "${query}"
+${conversationSection}
 ${artifactSection}
+${memorySection}
 
 Available agents:
 - calendar: Google Calendar operations (events, meetings, schedules). IMPORTANT: Calendar agent can create events WITH Google Meet video conferencing attached. Use ONLY calendar for "create a google meet at [time]" or "schedule a meeting with video call".
@@ -412,6 +632,7 @@ Available agents:
 - meet: Google Meet operations (ONLY for standalone meeting spaces without calendar events, viewing meeting history, recordings, participants). Do NOT use meet agent if user wants a scheduled meeting with a time - use calendar instead.
 - sheets: Google Sheets operations (create/edit spreadsheets, data management)
 - flights: Flight search operations (search flights, compare prices, price insights, airlines, tickets)
+- maps: Google Maps operations (search places, directions, distance, geocoding, nearby search)
 
 CRITICAL RULES for Google Meet:
 1. "Create a google meet tomorrow at 11am" -> Use ONLY calendar agent with query "create a google meet event tomorrow at 11am with video call"
@@ -428,7 +649,7 @@ Respond with a JSON object containing:
     "agent1": "query for agent1",
     "agent2": "query for agent2"
   },
-  "requiresSequential": false,  // true if agents must run in sequence, false if parallel
+  "requiresSequential": true,  // true if one action depends on another (e.g., create form THEN send email about it)
   "dependencies": {}  // Optional: if sequential, specify dependencies like {"agent2": "agent1"}
 }
 
@@ -447,15 +668,34 @@ Examples:
 - "find flights from Mumbai to Delhi tomorrow" -> {"agents": ["flights"], ...}
 - "compare flight prices from BOM to BLR" -> {"agents": ["flights"], ...}
 - "what are the cheapest flights to Goa next week" -> {"agents": ["flights"], ...}
+- "find cafes near me" -> {"agents": ["maps"], ...}
+- "best hotels in Paris" -> {"agents": ["maps"], ...}
+- "how far is it from Mumbai to Pune" -> {"agents": ["maps"], ...}
+- "restaurants near Times Square" -> {"agents": ["maps"], ...}
+- "what are the coordinates of Taj Mahal" -> {"agents": ["maps"], ...}
+
+CRITICAL - Multi-Agent Sequential Examples (when one action depends on another):
+- "create a feedback form and send the link to john@example.com" -> {"agents": ["forms", "gmail"], "requiresSequential": true, "queries": {"forms": "create a feedback form", "gmail": "send email to john@example.com with the form link"}}
+- "create a student survey and email it to bhumika@gmail.com" -> {"agents": ["forms", "gmail"], "requiresSequential": true, ...}
+- "make a registration form and share it with the team via email" -> {"agents": ["forms", "gmail"], "requiresSequential": true, ...}
+- "create a document and send it to my manager" -> {"agents": ["docs", "gmail"], "requiresSequential": true, ...}
+
+CRITICAL - Conversation Context Examples:
+- User previously asked "show me flights from pune to indore", then says "14 dec" or "tomorrow" -> {"agents": ["flights"], "queries": {"flights": "show me flights from Pune to Indore on 14 December"}} (NOT calendar!)
+- User previously asked about flights, then says "the 15th" -> Route to flights with the date context
+- User previously asked about calendar, then says "tomorrow" -> Route to calendar
+- Short follow-up messages should ALWAYS be interpreted based on the previous conversation topic
 
 Important:
 - Only include agents that are actually needed
 - Break down complex multi-step requests appropriately
 - Be specific in the queries for each agent
-- Consider if operations need to be sequential (e.g., create then link) or can be parallel`;
+- Set requiresSequential to true when one action depends on another (create something, then share/email it)
+- Consider if operations need to be sequential (e.g., create then send) or can be parallel
+- ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar`;
 
       const messages = [
-        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.' },
+        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text. IMPORTANT: Always consider conversation history - if a user provides a date after asking about flights, they want flights for that date, NOT a calendar event.' },
         { role: 'user', content: analysisPrompt }
       ];
 
@@ -482,7 +722,7 @@ Important:
    * Execute queries on the specified agents
    * Now includes artifact storage after successful operations
    */
-  async executeAgentQueries(analysis, userId, conversationId = null) {
+  async executeAgentQueries(analysis, userId, conversationId = null, userLocation = null) {
     const results = {};
     const errors = {};
     const storedArtifacts = [];
@@ -500,7 +740,12 @@ Important:
               throw new Error(`Agent '${agentName}' not found`);
             }
 
-            const result = await agent.processQuery(agentQuery, userId);
+            // Pass userLocation if this is the maps agent
+            const agentOptions = agentName === 'maps' && userLocation 
+              ? { userLocation } 
+              : {};
+
+            const result = await agent.processQuery(agentQuery, userId, agentOptions);
             results[agentName] = result;
 
             // Store artifacts from successful tool executions
@@ -543,7 +788,12 @@ Important:
               throw new Error(`Agent '${agentName}' not found`);
             }
 
-            const result = await agent.processQuery(agentQuery, userId);
+            // Pass userLocation if this is the maps agent
+            const agentOptions = agentName === 'maps' && userLocation 
+              ? { userLocation } 
+              : {};
+
+            const result = await agent.processQuery(agentQuery, userId, agentOptions);
             return { agentName, result };
 
           } catch (error) {
@@ -679,7 +929,7 @@ Instead, present the information as if you're directly reporting the results.`;
   /**
    * Main method to process user queries with streaming support
    * This orchestrates the entire flow from analysis to final response with SSE streaming
-   * Now includes confirmation flow for sensitive operations and artifact memory
+   * Now includes confirmation flow for sensitive operations, artifact memory, and long-term memory
    */
   async processQueryWithStreaming(query, userId, options = {}, onChunk) {
     const startTime = Date.now();
@@ -694,6 +944,34 @@ Instead, present the information as if you're directly reporting the results.`;
 
       // Send initial status
       onChunk({ type: 'status', message: 'Analyzing your request...' });
+
+      // ========== LONG-TERM MEMORY RETRIEVAL ==========
+      // Retrieve relevant memories before processing to provide context
+      let relevantMemories = [];
+      let memoryContext = '';
+      
+      try {
+        console.log(`\n[LongTermMemory] 🧠 Retrieving relevant memories for user ${userId}...`);
+        relevantMemories = await getRelevantMemories({
+          userId,
+          query,
+          limit: MEMORY_CONFIG.TOP_K,
+          threshold: MEMORY_CONFIG.SIMILARITY_THRESHOLD
+        });
+        
+        if (relevantMemories.length > 0) {
+          memoryContext = formatMemoriesForPrompt(relevantMemories);
+          console.log(`[LongTermMemory] ✅ Found ${relevantMemories.length} relevant memories`);
+          relevantMemories.forEach((m, i) => {
+            console.log(`[LongTermMemory]   ${i + 1}. [${m.memoryType}] similarity=${m.similarity.toFixed(3)}`);
+          });
+        } else {
+          console.log(`[LongTermMemory] ℹ️ No relevant memories found`);
+        }
+      } catch (memoryError) {
+        console.error(`[LongTermMemory] ⚠️ Error retrieving memories:`, memoryError.message);
+        // Continue without memories - don't block the main flow
+      }
 
       // Build artifact context if conversationId is provided
       let artifactContext = null;
@@ -725,8 +1003,8 @@ Instead, present the information as if you're directly reporting the results.`;
       }
 
       // Step 1: Analyze the query to determine which agents are needed
-      // Pass artifact context to analysis for better routing
-      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext);
+      // Pass artifact context and memory context to analysis for better routing
+      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext, memoryContext);
       
       console.log(`\n[MainAgent] 🤖 Query Analysis Result:`);
       console.log(`[MainAgent]   Agents: ${analysis.agents.join(', ')}`);
@@ -755,7 +1033,8 @@ Instead, present the information as if you're directly reporting the results.`;
         userId, 
         enhancedQuery, 
         options.conversationHistory || [],
-        conversationId
+        conversationId,
+        options.userLocation  // Pass userLocation for Maps agent
       );
 
       // If a confirmation is required, send confirmation_request and stop
@@ -772,11 +1051,12 @@ Instead, present the information as if you're directly reporting the results.`;
       onChunk({ type: 'status', message: 'Generating response...' });
 
       // Step 3: Stream the final response generation
-      await this.streamCombinedResponse(enhancedQuery, analysis, results, errors, onChunk, conversationId);
+      // Pass memory context for inclusion in the response generation
+      await this.streamCombinedResponse(enhancedQuery, analysis, results, errors, onChunk, conversationId, memoryContext);
 
       const processingTime = Date.now() - startTime;
 
-      // Send metadata including any stored artifacts
+      // Send metadata including any stored artifacts and memory usage
       const metadata = {
         type: 'metadata',
         agentsUsed: analysis.agents,
@@ -790,6 +1070,10 @@ Instead, present the information as if you're directly reporting the results.`;
           type: a.type,
           title: a.title
         }));
+      }
+      
+      if (relevantMemories.length > 0) {
+        metadata.memoriesUsed = relevantMemories.length;
       }
       
       onChunk(metadata);
@@ -807,61 +1091,116 @@ Instead, present the information as if you're directly reporting the results.`;
   /**
    * Execute agent queries with confirmation checking
    * Checks if the analysis indicates a confirmation-required action
+   * Now supports multiple confirmation actions (action chains) for multi-agent queries
    * Now includes artifact storage via conversationId
    */
-  async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory, conversationId = null) {
-    // First, determine if any agent+query combination will require confirmation
-    // We analyze the queries to detect confirmation-required intents
+  async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory, conversationId = null, userLocation = null) {
+    // Collect ALL confirmation-required actions from all agents
+    const confirmationRequiredActions = [];
+    const nonConfirmationAgents = [];
+    
     for (const agentName of analysis.agents) {
       const agentQuery = analysis.queries[agentName];
       console.log(`[Confirmation] Checking agent: ${agentName}, query: ${agentQuery}`);
       const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery, userId);
       
       if (detectedAction) {
-        console.log(`[Confirmation] Detected action:`, JSON.stringify(detectedAction, null, 2));
+        console.log(`[Confirmation] Detected action for ${agentName}:`, JSON.stringify(detectedAction, null, 2));
         
-        // Generate a preview and return confirmation request
+        // Generate a preview for this action
         const previewContent = confirmationUtils.generatePreview(
           agentName, 
           detectedAction.toolName, 
           detectedAction.inferredParams
         );
         
-        console.log(`[Confirmation] Generated preview:`, previewContent);
-        
-        // IMPORTANT: Pass conversationId for artifact storage after confirmation
-        const requestId = confirmationStore.storePendingAction(
-          userId,
-          detectedAction.toolName,
+        confirmationRequiredActions.push({
           agentName,
-          detectedAction.inferredParams,
-          previewContent,
-          query,
-          conversationHistory,
-          conversationId  // Pass conversationId for artifact memory
-        );
+          agentQuery,
+          toolName: detectedAction.toolName,
+          params: detectedAction.inferredParams,
+          previewContent
+        });
+      } else {
+        // This agent doesn't require confirmation, can be executed directly
+        nonConfirmationAgents.push(agentName);
+      }
+    }
 
+    // If we have multiple confirmation-required actions, create an action chain
+    if (confirmationRequiredActions.length > 1) {
+      console.log(`[Confirmation] Creating action chain with ${confirmationRequiredActions.length} actions`);
+      
+      const chainResult = confirmationStore.storeActionChain(
+        userId,
+        confirmationRequiredActions,
+        query,
+        conversationHistory,
+        conversationId
+      );
+
+      if (chainResult) {
+        const firstAction = confirmationRequiredActions[0];
         return {
           results: {},
           errors: {},
           storedArtifacts: [],
           confirmationRequest: {
-            requestId: requestId,
-            toolName: detectedAction.toolName,
-            agentName: agentName,
-            actionType: confirmationUtils.getActionType(agentName, detectedAction.toolName),
-            description: confirmationUtils.getActionDescription(agentName, detectedAction.toolName),
-            params: detectedAction.inferredParams,
-            previewContent: previewContent,
-            originalQuery: query
+            requestId: chainResult.firstRequestId,
+            toolName: firstAction.toolName,
+            agentName: firstAction.agentName,
+            actionType: confirmationUtils.getActionType(firstAction.agentName, firstAction.toolName),
+            description: confirmationUtils.getActionDescription(firstAction.agentName, firstAction.toolName),
+            params: firstAction.params,
+            previewContent: firstAction.previewContent,
+            originalQuery: query,
+            // Chain info to show user there are more actions
+            chainInfo: {
+              chainId: chainResult.chainId,
+              currentStep: 1,
+              totalSteps: chainResult.totalActions
+            }
           }
         };
       }
     }
+    
+    // If we have exactly one confirmation-required action
+    if (confirmationRequiredActions.length === 1) {
+      const action = confirmationRequiredActions[0];
+      console.log(`[Confirmation] Single action requires confirmation:`, action.toolName);
+      
+      const requestId = confirmationStore.storePendingAction(
+        userId,
+        action.toolName,
+        action.agentName,
+        action.params,
+        action.previewContent,
+        query,
+        conversationHistory,
+        conversationId
+      );
+
+      return {
+        results: {},
+        errors: {},
+        storedArtifacts: [],
+        confirmationRequest: {
+          requestId: requestId,
+          toolName: action.toolName,
+          agentName: action.agentName,
+          actionType: confirmationUtils.getActionType(action.agentName, action.toolName),
+          description: confirmationUtils.getActionDescription(action.agentName, action.toolName),
+          params: action.params,
+          previewContent: action.previewContent,
+          originalQuery: query
+        }
+      };
+    }
 
     // No confirmation required, proceed with normal execution
-    // Pass conversationId for artifact storage
-    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId);
+    // Pass conversationId for artifact storage and userLocation for Maps agent
+    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId, userLocation);
     return { results, errors, storedArtifacts, confirmationRequest: null };
   }
 
@@ -1736,12 +2075,53 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
   /**
    * Stream response after a confirmed action is executed
    * This provides a smooth word-by-word streaming experience like ChatGPT
+   * Now includes context about next actions in chain
    */
   async streamConfirmedActionResponse(executionResult, onChunk) {
     try {
       onChunk({ type: 'status', message: 'Processing your confirmed action...' });
 
-      const { result, query, toolName, agentName } = executionResult;
+      const { result, query, toolName, agentName, nextConfirmation } = executionResult;
+
+      // Build context about chain status
+      let chainContext = '';
+      if (nextConfirmation) {
+        chainContext = `\n\nIMPORTANT: This is step ${nextConfirmation.chainInfo.currentStep - 1} of ${nextConfirmation.chainInfo.totalSteps} in the user's request.
+The next step is: ${nextConfirmation.toolName} (${nextConfirmation.agentName})
+After confirming this action was successful, mention that you'll now proceed with the next action (${nextConfirmation.description}).
+Do NOT say "let me know if you need anything else" - there's still more to do.`;
+      }
+
+      // Safely stringify result, handling circular references
+      let resultString;
+      try {
+        // Extract only the relevant parts to avoid circular references
+        const safeResult = {
+          success: result?.success,
+          response: result?.response,
+          message: result?.message,
+          // For forms
+          formId: result?.raw_results?.[0]?.formId || result?.formId,
+          formTitle: result?.raw_results?.[0]?.form?.info?.title || result?.form?.info?.title,
+          formUrl: result?.raw_results?.[0]?.formId ? 
+            `https://docs.google.com/forms/d/${result.raw_results[0].formId}/viewform` : null,
+          // For emails
+          emailSent: result?.raw_results?.[0]?.success && toolName === 'sendEmail',
+          messageId: result?.raw_results?.[0]?.messageId,
+          // For docs
+          documentId: result?.raw_results?.[0]?.documentId || result?.documentId,
+          documentUrl: result?.raw_results?.[0]?.documentId ? 
+            `https://docs.google.com/document/d/${result.raw_results[0].documentId}/edit` : null,
+          // For events
+          eventId: result?.raw_results?.[0]?.eventId || result?.eventId,
+          // Generic error
+          error: result?.error
+        };
+        resultString = JSON.stringify(safeResult, null, 2);
+      } catch (e) {
+        console.error('[MainAgent] Error stringifying result:', e.message);
+        resultString = `Action completed: ${result?.success ? 'Successfully' : 'With issues'}. ${result?.response || result?.message || ''}`;
+      }
 
       const responsePrompt = `The user confirmed and executed the following action:
 
@@ -1749,7 +2129,8 @@ Action: ${toolName} on ${agentName}
 Original Query: "${query}"
 
 Execution Result:
-${JSON.stringify(result, null, 2)}
+${resultString}
+${chainContext}
 
 Please provide a natural, conversational confirmation response that:
 1. Confirms the action was completed successfully
@@ -1757,9 +2138,12 @@ Please provide a natural, conversational confirmation response that:
 3. Includes any relevant links or references from the result
 4. Is friendly and helpful in tone
 5. If there were any issues, mention them helpfully
+${nextConfirmation ? '6. Briefly mention that you will now proceed with the next action' : ''}
 
 Format the response clearly. If an event was created, include the event details like title, date, time.
-If a document was created, include the title and link if available.`;
+If a document was created, include the title and link if available.
+If a form was created, include the form title and a link to view/edit it.
+If an email was sent, confirm it was sent successfully.`;
 
       const messages = [
         { role: 'system', content: this.systemPrompt },
@@ -1806,9 +2190,9 @@ If a document was created, include the title and link if available.`;
 
   /**
    * Stream the combined response using OpenAI's streaming API
-   * Now includes artifact context in the system prompt
+   * Now includes artifact context and long-term memory in the system prompt
    */
-  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null) {
+  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '') {
     try {
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
@@ -1837,12 +2221,15 @@ ${agentErrors ? `Errors encountered:\n${agentErrors}\n` : ''}
 
 ${artifactContext ? `\n--- Conversation Artifacts ---\n${artifactContext}\n---\n` : ''}
 
+${memoryContext ? `\n--- Long-Term Memories ---\n${memoryContext}\n(Use these memories only if directly relevant. Do not explicitly mention "from your memories" unless appropriate.)\n---\n` : ''}
+
 Please provide a natural, conversational response to the user that:
 1. Directly addresses their request
 2. Summarizes what was accomplished
 3. Includes relevant details from the agent results (include IDs like formId, documentId, eventId for reference)
 4. Mentions any errors or limitations encountered
 5. Is friendly and helpful in tone
+6. Uses any relevant context from long-term memories naturally (without explicitly referencing the memory system)
 
 Format the response in a clear, readable way. Use bullet points or numbered lists where appropriate.
 If events were created, include key details like title, date, time, and location.

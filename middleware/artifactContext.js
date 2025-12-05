@@ -36,7 +36,13 @@ const REFERENCE_PATTERNS = [
     // "Update/modify/change the X"
     /\b(update|modify|change|edit|add\s+to)\s+(the|that|this|my)?\s*(form|doc|document|sheet|spreadsheet|email|event|meeting)?\b/i,
     // "Send/publish/share it"
-    /\b(send|publish|share|forward)\s+(it|that|this|the\s+\w+)\b/i
+    /\b(send|publish|share|forward)\s+(it|that|this|the\s+\w+)\b/i,
+    // Flight booking references
+    /\b(book|select|choose|want|prefer)\s+(that|this|the)?\s*(flight|indigo|air\s*india|spicejet|vistara|akasa|go\s*air)?/i,
+    // Flight number references
+    /\b(flight\s*(number)?\s*)?[A-Z]{2}\s*\d{3,4}\b/i,
+    // "from the list", "from above", "you showed"
+    /\b(from\s+the\s+list|from\s+above|you\s+showed|you\s+found|in\s+the\s+results)\b/i
 ];
 
 // Type detection patterns - maps keywords to artifact types
@@ -79,7 +85,19 @@ const TYPE_DETECTION_MAP = {
     'repository': ARTIFACT_TYPES.REPO,
     'issue': ARTIFACT_TYPES.ISSUE,
     'pull request': ARTIFACT_TYPES.PR,
-    'pr': ARTIFACT_TYPES.PR
+    'pr': ARTIFACT_TYPES.PR,
+    
+    // Flights
+    'flight': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'flights': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'ticket': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'booking': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'indigo': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'air india': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'spicejet': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'vistara': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'akasa': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    'airline': ARTIFACT_TYPES.FLIGHT_SEARCH
 };
 
 // Action keywords that indicate intent to modify/use an artifact
@@ -88,7 +106,8 @@ const ACTION_KEYWORDS = {
     add: ['add', 'insert', 'append', 'include', 'put'],
     remove: ['remove', 'delete', 'drop', 'take out', 'clear'],
     send: ['send', 'submit', 'publish', 'share', 'forward', 'dispatch'],
-    view: ['view', 'show', 'display', 'open', 'see', 'check']
+    view: ['view', 'show', 'display', 'open', 'see', 'check'],
+    book: ['book', 'select', 'choose', 'reserve', 'confirm', 'want', 'prefer', 'take']
 };
 
 /**
@@ -241,7 +260,8 @@ const buildArtifactContext = async (conversationId, query) => {
             calendar: 'calendar',
             repo: 'repository',
             issue: 'issue',
-            pull_request: 'pull request'
+            pull_request: 'pull request',
+            flight_search: 'flight search'
         };
         
         const typeName = typeNames[resolved.artifact.type] || resolved.artifact.type;
@@ -276,7 +296,8 @@ const buildArtifactContext = async (conversationId, query) => {
                 calendar: 'calendar',
                 repo: 'repository',
                 issue: 'issue',
-                pull_request: 'pull request'
+                pull_request: 'pull request',
+                flight_search: 'flight search'
             };
             
             const typeName = typeNames[lastArtifact.type] || lastArtifact.type;
@@ -308,7 +329,8 @@ const getIdFieldName = (type) => {
         calendar: 'calendarId',
         repo: 'repoId',
         issue: 'issueId',
-        pull_request: 'prId'
+        pull_request: 'prId',
+        flight_search: 'searchId'
     };
     return idFields[type] || 'id';
 };
