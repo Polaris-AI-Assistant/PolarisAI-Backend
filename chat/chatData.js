@@ -55,6 +55,10 @@ async function getAllChatSessions(userId) {
             agentsUsed: msg.agents_used || [],
             processingTime: msg.processing_time,
             isError: msg.is_error || false,
+            isPendingConfirmation: msg.is_pending_confirmation || false,
+            isConfirmed: msg.is_confirmed || false,
+            isCanceled: msg.is_canceled || false,
+            confirmationData: msg.confirmation_data || undefined,
           })),
           messageCount: session.message_count || 0,
         };
@@ -109,6 +113,10 @@ async function getChatSession(chatId, userId) {
         agentsUsed: msg.agents_used || [],
         processingTime: msg.processing_time,
         isError: msg.is_error || false,
+        isPendingConfirmation: msg.is_pending_confirmation || false,
+        isConfirmed: msg.is_confirmed || false,
+        isCanceled: msg.is_canceled || false,
+        confirmationData: msg.confirmation_data || undefined,
       })),
       messageCount: session.message_count || 0,
     };
@@ -182,31 +190,63 @@ async function addMessagesToSession(chatId, userId, messages) {
 
     const existingMessageIds = new Set(existingMessages?.map((m) => m.id) || []);
 
-    // Find new messages that need to be inserted
-    // Filter out messages with empty content to avoid database constraint violations
+    // Separate messages into new (to insert) and existing (to update)
     const newMessages = messages
       .filter((msg) => !existingMessageIds.has(msg.id))
       .filter((msg) => msg.content && msg.content.trim() !== '');
+    
+    const existingMessagesToUpdate = messages
+      .filter((msg) => existingMessageIds.has(msg.id))
+      .filter((msg) => msg.content && msg.content.trim() !== '');
 
+    // Insert new messages
     if (newMessages.length > 0) {
-      // Insert new messages with frontend-generated IDs
       const { error: insertError } = await supabase
         .from('chat_messages')
         .insert(
           newMessages.map((msg) => ({
-            id: msg.id, // Use frontend-generated ID
+            id: msg.id,
             chat_session_id: chatId,
             role: msg.role,
             content: msg.content,
             agents_used: msg.agentsUsed || [],
             processing_time: msg.processingTime,
             is_error: msg.isError || false,
+            is_pending_confirmation: msg.isPendingConfirmation || false,
+            is_confirmed: msg.isConfirmed || false,
+            is_canceled: msg.isCanceled || false,
+            confirmation_data: msg.confirmationData || null,
             created_at: msg.timestamp,
           }))
         );
 
       if (insertError) {
         throw insertError;
+      }
+    }
+
+    // Update existing messages (important for confirmation state changes)
+    if (existingMessagesToUpdate.length > 0) {
+      for (const msg of existingMessagesToUpdate) {
+        const { error: updateError } = await supabase
+          .from('chat_messages')
+          .update({
+            content: msg.content,
+            agents_used: msg.agentsUsed || [],
+            processing_time: msg.processingTime,
+            is_error: msg.isError || false,
+            is_pending_confirmation: msg.isPendingConfirmation || false,
+            is_confirmed: msg.isConfirmed || false,
+            is_canceled: msg.isCanceled || false,
+            confirmation_data: msg.confirmationData || null,
+          })
+          .eq('id', msg.id)
+          .eq('chat_session_id', chatId);
+
+        if (updateError) {
+          console.error('Error updating message:', msg.id, updateError);
+          // Continue updating other messages even if one fails
+        }
       }
     }
 

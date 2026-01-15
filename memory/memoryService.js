@@ -154,13 +154,62 @@ Rules:
 }
 
 /**
+ * Generate a short summary of memory content using LLM
+ * 
+ * @param {string} content - Combined user message + assistant response
+ * @returns {Promise<string>} - Short summary (under 100 characters)
+ */
+async function generateSummary(content) {
+    try {
+        console.log(`[MemoryService] 📝 Generating summary for memory...`);
+
+        const summaryPrompt = `Summarize this memory in one short sentence for display inside a memory list. 
+Focus on the core meaning, not the details. 
+The summary must be under 100 characters.
+
+Memory:
+${content}`;
+
+        const response = await openai.chat.completions.create({
+            model: MODEL_CONFIG.CLASSIFIER_MODEL,
+            messages: [
+                {
+                    role: 'system',
+                    content: 'You are a concise summarization system. Create brief, informative summaries under 100 characters.'
+                },
+                {
+                    role: 'user',
+                    content: summaryPrompt
+                }
+            ],
+            temperature: 0.3,
+            max_tokens: 50
+        });
+
+        const summary = response.choices[0].message.content.trim();
+        
+        // Ensure summary is under 100 characters
+        const truncatedSummary = summary.length > 100 ? summary.substring(0, 97) + '...' : summary;
+        
+        console.log(`[MemoryService] ✅ Generated summary: "${truncatedSummary}"`);
+        
+        return truncatedSummary;
+    } catch (error) {
+        console.error('[MemoryService] ❌ Error generating summary:', error);
+        // Return a default summary if generation fails
+        return 'Memory summary unavailable';
+    }
+}
+
+/**
  * Add a new memory to the long-term memory store
  * 
  * Steps:
  * 1. Combine userMessage + assistantMessage into content
  * 2. Generate embedding vector using OpenAI
  * 3. Classify memory type using LLM
- * 4. Insert into Supabase memories table
+ * 4. Generate summary using LLM
+ * 5. Insert into Supabase memories table
  * 
  * @param {AddMemoryParams} params - Memory parameters
  * @returns {Promise<{success: boolean, memoryId?: string, error?: string}>}
@@ -191,8 +240,9 @@ async function addMemory(params) {
         // Validate source app
         const validSourceApp = isValidSourceApp(sourceApp) ? sourceApp : SOURCE_APPS.CHAT;
 
-        // Combine messages into content
-        const content = `User: ${userMessage.trim()}\n\nAssistant: ${assistantMessage.trim()}`;
+        // Combine messages into content with enhanced searchability
+        // Extract key facts for better semantic search
+        let content = `User: ${userMessage.trim()}\n\nAssistant: ${assistantMessage.trim()}`;
         
         // Check minimum content length
         if (content.length < MEMORY_CONFIG.MIN_CONTENT_LENGTH) {
@@ -208,6 +258,9 @@ async function addMemory(params) {
 
         // Classify memory
         const classification = await classifyMemory(content);
+
+        // Generate summary
+        const summary = await generateSummary(content);
 
         // Prepare metadata
         const fullMetadata = {
@@ -230,6 +283,7 @@ async function addMemory(params) {
             .insert({
                 user_id: userId,
                 content: content,
+                summary: summary,
                 memory_type: classification.memoryType,
                 source_app: validSourceApp,
                 embedding: embedding,
@@ -326,6 +380,7 @@ async function getRelevantMemories(params) {
         const memories = data.map(row => ({
             id: row.id,
             content: row.content,
+            summary: row.summary,
             memoryType: row.memory_type,
             sourceApp: row.source_app,
             metadata: row.metadata || {},
@@ -473,7 +528,7 @@ async function listMemories(userId, options = {}) {
     try {
         let query = supabase
             .from('memories')
-            .select('id, content, memory_type, source_app, metadata, created_at', { count: 'exact' })
+            .select('id, content, summary, memory_type, source_app, metadata, created_at', { count: 'exact' })
             .eq('user_id', userId)
             .order('created_at', { ascending: false })
             .range(offset, offset + limit - 1);
@@ -541,6 +596,7 @@ module.exports = {
     // Utilities (exported for testing)
     generateEmbedding,
     classifyMemory,
+    generateSummary,
     
     // Re-export config for convenience
     MEMORY_TYPES,

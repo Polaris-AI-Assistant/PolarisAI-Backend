@@ -32,6 +32,9 @@ const {
     SOURCE_APPS
 } = require('../memory/memoryService');
 
+// Chat History imports
+const chatData = require('../chat/chatData');
+
 const router = express.Router();
 
 // Initialize the Main Coordinator Agent
@@ -121,7 +124,7 @@ function shouldAutoStoreMemory(query, response, agentsUsed) {
  */
 router.post('/query/stream', authenticateToken, async (req, res) => {
   try {
-    const { query, conversationHistory, conversationId, addToMemory, userLocation } = req.body;
+    const { query, conversationHistory, conversationId, addToMemory, userLocation, chatId } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -136,11 +139,33 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     if (conversationId) {
       console.log(`[MainAgentController] Conversation ID: ${conversationId}`);
     }
+    if (chatId) {
+      console.log(`[MainAgentController] Chat ID (Session ID): ${chatId}`);
+    }
     if (addToMemory) {
       console.log(`[MainAgentController] Auto-store to memory: enabled`);
     }
     if (userLocation) {
       console.log(`[MainAgentController] User location provided: ${userLocation.lat}, ${userLocation.lng}`);
+    }
+
+    // Retrieve full chat history from database if chatId is provided
+    let fullChatHistory = conversationHistory || [];
+    if (chatId) {
+      try {
+        console.log(`[MainAgentController] 💬 Retrieving full chat history from database for chatId: ${chatId}`);
+        const chatSession = await chatData.getChatSession(chatId, userId);
+        if (chatSession && chatSession.messages) {
+          fullChatHistory = chatSession.messages;
+          console.log(`[MainAgentController] ✅ Retrieved ${fullChatHistory.length} messages from database`);
+        } else {
+          console.log(`[MainAgentController] ⚠️ No chat session found in database, using provided history`);
+        }
+      } catch (dbError) {
+        console.error(`[MainAgentController] ⚠️ Error retrieving chat history from database:`, dbError.message);
+        console.log(`[MainAgentController] ⚠️ Falling back to provided conversationHistory`);
+        // Continue with provided conversationHistory if database retrieval fails
+      }
     }
 
     // Set up SSE headers
@@ -159,10 +184,12 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     try {
       // Process the query through the main agent with streaming
       // Now includes conversationId for artifact memory and userLocation for Maps
+      // Uses fullChatHistory retrieved from database for complete conversation context
       await mainAgent.processQueryWithStreaming(query, userId, { 
-        conversationHistory,
+        conversationHistory: fullChatHistory,  // Pass full chat history from database
         conversationId,  // Pass conversationId for artifact memory
-        userLocation  // Pass userLocation for Maps agent
+        userLocation,  // Pass userLocation for Maps agent
+        chatId  // Pass chatId for reference
       }, (chunk) => {
         // Accumulate content chunks for memory storage
         if (chunk.type === 'content' && chunk.text) {
@@ -278,7 +305,7 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
  */
 router.post('/query', authenticateToken, async (req, res) => {
   try {
-    const { query, conversationHistory } = req.body;
+    const { query, conversationHistory, chatId } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -296,9 +323,31 @@ router.post('/query', authenticateToken, async (req, res) => {
     }
 
     console.log(`[MainAgentController] User ${userId} query: "${query}"`);
+    if (chatId) {
+      console.log(`[MainAgentController] Chat ID (Session ID): ${chatId}`);
+    }
+
+    // Retrieve full chat history from database if chatId is provided
+    let fullChatHistory = conversationHistory || [];
+    if (chatId) {
+      try {
+        console.log(`[MainAgentController] 💬 Retrieving full chat history from database for chatId: ${chatId}`);
+        const chatSession = await chatData.getChatSession(chatId, userId);
+        if (chatSession && chatSession.messages) {
+          fullChatHistory = chatSession.messages;
+          console.log(`[MainAgentController] ✅ Retrieved ${fullChatHistory.length} messages from database`);
+        } else {
+          console.log(`[MainAgentController] ⚠️ No chat session found in database, using provided history`);
+        }
+      } catch (dbError) {
+        console.error(`[MainAgentController] ⚠️ Error retrieving chat history from database:`, dbError.message);
+        console.log(`[MainAgentController] ⚠️ Falling back to provided conversationHistory`);
+        // Continue with provided conversationHistory if database retrieval fails
+      }
+    }
 
     // Process the query through the main agent
-    const result = await mainAgent.processQuery(query, userId, { conversationHistory });
+    const result = await mainAgent.processQuery(query, userId, { conversationHistory: fullChatHistory });
 
     // Return the result
     res.json(result);

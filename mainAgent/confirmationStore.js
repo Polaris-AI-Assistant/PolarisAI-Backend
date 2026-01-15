@@ -141,6 +141,114 @@ function removePendingAction(requestId) {
 }
 
 /**
+ * Get the most recent pending action for a user
+ * 
+ * @param {string} userId - User ID
+ * @returns {object|null} - Most recent pending action or null if none
+ */
+function getUserMostRecentPendingAction(userId) {
+  const userActions = [];
+  
+  for (const [requestId, action] of pendingActions.entries()) {
+    if (action.userId === userId && Date.now() <= action.expiresAt) {
+      userActions.push(action);
+    }
+  }
+  
+  // Sort by creation time, most recent first
+  userActions.sort((a, b) => b.createdAt - a.createdAt);
+  
+  return userActions.length > 0 ? userActions[0] : null;
+}
+
+/**
+ * Update a pending action with new parameters and regenerate preview
+ * 
+ * @param {string} requestId - Request ID to update
+ * @param {string} userId - User ID for security validation
+ * @param {object} newParams - New parameters for the action
+ * @param {string} newPreviewContent - New preview content
+ * @param {string} newQuery - New/modified query
+ * @returns {object|null} - Updated action or null if not found/unauthorized
+ */
+function updatePendingAction(requestId, userId, newParams, newPreviewContent, newQuery) {
+  const action = getPendingAction(requestId, userId);
+  
+  if (!action) {
+    console.log(`[ConfirmationStore] Cannot update action: ${requestId} - not found or unauthorized`);
+    return null;
+  }
+  
+  // Update the action
+  action.params = newParams;
+  action.previewContent = newPreviewContent;
+  action.query = newQuery;
+  action.modifiedAt = Date.now();
+  
+  // Store back
+  pendingActions.set(requestId, action);
+  
+  console.log(`[ConfirmationStore] Updated pending action: ${requestId}`);
+  console.log(`[ConfirmationStore] New params:`, newParams);
+  
+  return action;
+}
+
+/**
+ * Get the most recent pending action for a user
+ * 
+ * @param {string} userId - User ID
+ * @returns {object|null} - Most recent pending action or null if none
+ */
+function getUserMostRecentPendingAction(userId) {
+  const userActions = [];
+  
+  for (const [requestId, action] of pendingActions.entries()) {
+    if (action.userId === userId && Date.now() <= action.expiresAt) {
+      userActions.push(action);
+    }
+  }
+  
+  // Sort by creation time, most recent first
+  userActions.sort((a, b) => b.createdAt - a.createdAt);
+  
+  return userActions.length > 0 ? userActions[0] : null;
+}
+
+/**
+ * Update a pending action with new parameters and regenerate preview
+ * 
+ * @param {string} requestId - Request ID to update
+ * @param {string} userId - User ID for security validation
+ * @param {object} newParams - New parameters for the action
+ * @param {string} newPreviewContent - New preview content
+ * @param {string} newQuery - New/modified query
+ * @returns {object|null} - Updated action or null if not found/unauthorized
+ */
+function updatePendingAction(requestId, userId, newParams, newPreviewContent, newQuery) {
+  const action = getPendingAction(requestId, userId);
+  
+  if (!action) {
+    console.log(`[ConfirmationStore] Cannot update action: ${requestId} - not found or unauthorized`);
+    return null;
+  }
+  
+  // Update the action
+  action.params = newParams;
+  action.previewContent = newPreviewContent;
+  action.query = newQuery;
+  action.modifiedAt = Date.now();
+  
+  // Store back
+  pendingActions.set(requestId, action);
+  
+  console.log(`[ConfirmationStore] Updated pending action: ${requestId}`);
+  console.log(`[ConfirmationStore] New params:`, newParams);
+  
+  return action;
+}
+
+/**
  * Get all pending actions for a user
  * 
  * @param {string} userId - User ID
@@ -408,6 +516,8 @@ module.exports = {
   getPendingAction,
   removePendingAction,
   getUserPendingActions,
+  getUserMostRecentPendingAction,
+  updatePendingAction,
   clearUserPendingActions,
   getStoreStats,
   generateRequestId,

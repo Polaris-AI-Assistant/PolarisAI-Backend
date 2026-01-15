@@ -174,6 +174,15 @@ Your capabilities include:
    - Compare flight options
    - Search for specific dates
    - Check flight availability
+   
+   **IMPORTANT - Round-trip Flight Handling:**
+   - For ROUND-TRIP queries (user mentions return date), make TWO separate tool calls:
+     * First call: Search outbound flight (from A to B on departure date) - DO NOT include returnDate
+     * Second call: Search return flight (from B to A on return date) - DO NOT include returnDate
+   - NEVER use returnDate parameter when making individual flight searches
+   - Example: "flights from Pune to Mumbai on Dec 15, returning Dec 18"
+     * Call 1: getFlightsList(from: "PNQ", to: "BOM", date: "2025-12-15")
+     * Call 2: getFlightsList(from: "BOM", to: "PNQ", date: "2025-12-18")
 
 2. **getFlightsPriceInsights**: Get price trends and insights. Use when user wants to:
    - Know the cheapest days to fly

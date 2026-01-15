@@ -160,6 +160,7 @@ router.post('/search', authenticateToken, async (req, res) => {
             success: true,
             memories: memories.map(m => ({
                 ...m,
+                summary: m.summary,
                 memoryTypeDisplay: getMemoryTypeDisplay(m.memoryType),
                 memoryTypeIcon: getMemoryTypeIcon(m.memoryType)
             })),
@@ -216,12 +217,17 @@ router.get('/list', authenticateToken, async (req, res) => {
             memories: result.memories.map(m => ({
                 id: m.id,
                 content: m.content,
+                summary: m.summary,
+                memory_type: m.memory_type,
                 memoryType: m.memory_type,
                 memoryTypeDisplay: getMemoryTypeDisplay(m.memory_type),
                 memoryTypeIcon: getMemoryTypeIcon(m.memory_type),
+                source_app: m.source_app,
                 sourceApp: m.source_app,
                 metadata: m.metadata,
-                createdAt: m.created_at
+                created_at: m.created_at,
+                createdAt: m.created_at,
+                updated_at: m.created_at
             })),
             total: result.total,
             limit,

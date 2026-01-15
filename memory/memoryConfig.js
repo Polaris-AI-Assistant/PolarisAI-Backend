@@ -34,7 +34,8 @@ const MEMORY_CONFIG = {
     
     // Minimum similarity threshold for memory retrieval (0-1)
     // Higher = more strict matching
-    SIMILARITY_THRESHOLD: parseFloat(process.env.MEMORY_SIMILARITY_THRESHOLD || '0.5'),
+    // 0.3 is more lenient for better recall of user profile info
+    SIMILARITY_THRESHOLD: parseFloat(process.env.MEMORY_SIMILARITY_THRESHOLD || '0.3'),
     
     // Maximum length of memory content to include in prompt (in characters)
     MAX_MEMORY_PROMPT_LENGTH: parseInt(process.env.MEMORY_MAX_PROMPT_LENGTH || '4000', 10),

@@ -304,6 +304,17 @@ class MainAgent {
       } else if ((artifactType === 'sheet' || artifactType === 'spreadsheet') && artifact.id) {
         linkToInclude = `https://docs.google.com/spreadsheets/d/${artifact.id}/edit`;
         itemDescription = `the spreadsheet "${artifact.title}"`;
+      } else if ((artifactType === 'event' || artifactType === 'calendar_event') && artifact.data) {
+        // For calendar events, extract the Google Meet link or calendar link
+        if (artifact.data.hangoutLink) {
+          linkToInclude = artifact.data.hangoutLink;
+          itemDescription = `the Google Meet "${artifact.title}"`;
+          console.log(`[MainAgent] 📧 Found Google Meet link in artifact: ${linkToInclude}`);
+        } else if (artifact.data.htmlLink) {
+          linkToInclude = artifact.data.htmlLink;
+          itemDescription = `the calendar event "${artifact.title}"`;
+          console.log(`[MainAgent] 📧 Found calendar link in artifact: ${linkToInclude}`);
+        }
       }
 
       if (linkToInclude && emailAction.params) {
@@ -408,6 +419,161 @@ Return ONLY a JSON object with the updated email:
         agentName: pendingAction.agentName
       }
     };
+  }
+
+  /**
+   * Detect if user's query is a modification request for a pending confirmation
+   * and handle it by regenerating the preview with updated parameters
+   * 
+   * @param {string} query - User's new query
+   * @param {object} pendingAction - The current pending action
+   * @param {string} userId - User ID
+   * @param {function} onChunk - Streaming callback
+   * @returns {boolean} - True if this was a modification and was handled, false otherwise
+   */
+  async detectAndHandleModification(query, pendingAction, userId, onChunk) {
+    const lowerQuery = query.toLowerCase();
+    
+    // Modification indicators
+    const modificationPatterns = [
+      'instead', 'actually', 'change', 'modify', 'update', 'send to', 'make it',
+      'different', 'another', 'other', 'not that', 'wait', 'correction',
+      'i meant', 'should be', 'send it to', 'email it to', 'share with'
+    ];
+    
+    const hasModificationIndicator = modificationPatterns.some(pattern => 
+      lowerQuery.includes(pattern)
+    );
+    
+    if (!hasModificationIndicator) {
+      return false; // Not a modification
+    }
+    
+    console.log(`[PendingModification] 🔄 Detected modification request for ${pendingAction.agentName}.${pendingAction.toolName}`);
+    
+    try {
+      // Extract new parameters based on the agent and tool type
+      let newParams = { ...pendingAction.params };
+      
+      // Handle different agent types
+      if (pendingAction.agentName === 'gmail' && pendingAction.toolName === 'sendEmail') {
+        // Extract new email recipient if mentioned
+        const emailMatch = query.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+        if (emailMatch) {
+          newParams.to = emailMatch[1];
+          console.log(`[PendingModification] Updated email recipient to: ${newParams.to}`);
+        }
+        
+        // Check if subject needs updating
+        if (lowerQuery.includes('subject')) {
+          const quotedMatch = query.match(/["']([^"']+)["']/);
+          if (quotedMatch) {
+            newParams.subject = quotedMatch[1];
+            console.log(`[PendingModification] Updated subject to: ${newParams.subject}`);
+          }
+        }
+        
+        // If body content is mentioned, regenerate with AI
+        if (lowerQuery.includes('body') || lowerQuery.includes('message') || lowerQuery.includes('content')) {
+          const updatedParams = await this.extractEmailParamsWithAI(query, userId);
+          newParams.body = updatedParams.body;
+          if (updatedParams.subject && newParams.subject === pendingAction.params.subject) {
+            newParams.subject = updatedParams.subject;
+          }
+          console.log(`[PendingModification] Regenerated email body with AI`);
+        }
+      } else if (pendingAction.agentName === 'calendar' && pendingAction.toolName === 'createEvent') {
+        // Extract new calendar event parameters
+        const timeMatch = lowerQuery.match(/(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)/i);
+        if (timeMatch) {
+          // Update time
+          console.log(`[PendingModification] Time modification detected`);
+        }
+        
+        // Check for date changes
+        if (lowerQuery.includes('tomorrow') || lowerQuery.includes('today') || /\\d{1,2}/.test(query)) {
+          const updatedParams = this.extractCalendarEventParams(query);
+          newParams = { ...newParams, ...updatedParams };
+          console.log(`[PendingModification] Updated calendar event parameters`);
+        }
+      } else if (pendingAction.agentName === 'forms' && pendingAction.toolName === 'createForm') {
+        // Handle form modifications
+        if (lowerQuery.includes('title') || lowerQuery.includes('name')) {
+          const quotedMatch = query.match(/["']([^"']+)["']/);
+          if (quotedMatch) {
+            newParams.title = quotedMatch[1];
+            console.log(`[PendingModification] Updated form title to: ${newParams.title}`);
+          }
+        }
+      }
+      
+      // Generate new preview content
+      const newPreviewContent = confirmationUtils.generatePreview(
+        pendingAction.agentName,
+        pendingAction.toolName,
+        newParams
+      );
+      
+      // Update the pending action
+      const updatedAction = confirmationStore.updatePendingAction(
+        pendingAction.requestId,
+        userId,
+        newParams,
+        newPreviewContent,
+        query
+      );
+      
+      if (!updatedAction) {
+        console.error(`[PendingModification] ⚠️ Failed to update pending action`);
+        return false;
+      }
+      
+      // Send thinking stop signal
+      onChunk({ type: 'thinking', status: 'stop' });
+      
+      // Prepare confirmation request with chain info if it exists
+      const confirmationRequest = {
+        type: 'confirmation_request',
+        requestId: updatedAction.requestId,
+        toolName: updatedAction.toolName,
+        agentName: updatedAction.agentName,
+        actionType: confirmationUtils.getActionType(updatedAction.agentName, updatedAction.toolName),
+        description: confirmationUtils.getActionDescription(updatedAction.agentName, updatedAction.toolName),
+        params: updatedAction.params,
+        previewContent: updatedAction.previewContent,
+        originalQuery: updatedAction.query,
+        isModification: true // Flag to indicate this is a modification
+      };
+      
+      // Include chain info if this is part of a chain
+      if (updatedAction.chainId) {
+        const chainInfo = confirmationStore.getChainInfo(updatedAction.requestId);
+        if (chainInfo) {
+          confirmationRequest.chainInfo = {
+            chainId: chainInfo.chainId,
+            currentStep: chainInfo.chainIndex + 1,
+            totalSteps: chainInfo.totalInChain
+          };
+          console.log(`[PendingModification] Including chain info: Step ${chainInfo.chainIndex + 1}/${chainInfo.totalInChain}`);
+        }
+      }
+      
+      // Send the updated confirmation request
+      onChunk(confirmationRequest);
+      
+      console.log(`[PendingModification] 📤 Sent confirmation_request:`, JSON.stringify(confirmationRequest, null, 2));
+      
+      // Send done signal to complete the stream
+      onChunk({ type: 'done' });
+      
+      console.log(`[PendingModification] 📤 Sent done signal`);
+      console.log(`[PendingModification] ✅ Successfully regenerated preview with updated parameters`);
+      return true;
+      
+    } catch (error) {
+      console.error(`[PendingModification] ⚠️ Error handling modification:`, error);
+      return false;
+    }
   }
 
   /**
@@ -575,6 +741,29 @@ Remember: Artifacts are preserved within a conversation thread. Use this context
    */
   async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '') {
     try {
+      // Pre-check: Detect common conversational queries BEFORE calling LLM
+      const lowerQuery = query.toLowerCase().trim();
+      const conversationalPatterns = [
+        /^what\s+(is|was)\s+my\s+name/i,
+        /^who\s+am\s+i/i,
+        /^what\s+did\s+(i|we)\s+(say|tell|discuss|talk)/i,
+        /^what\s+(flights|forms|documents|emails|meetings)\s+did\s+i/i,
+        /^remind\s+me/i,
+        /^what\s+was\s+that/i,
+        /^tell\s+me\s+about\s+(our|the)\s+conversation/i
+      ];
+
+      // Check if query matches any conversational pattern
+      const isConversational = conversationalPatterns.some(pattern => pattern.test(query));
+      
+      if (isConversational) {
+        console.log('[MainAgent] 🎯 Detected conversational query - skipping agents:', query);
+        return {
+          agents: [],
+          reasoning: "User is asking about past conversation or information - no agents needed"
+        };
+      }
+
       // Build artifact context section for the prompt
       let artifactSection = '';
       if (artifactContext && artifactContext.allArtifacts && artifactContext.allArtifacts.length > 0) {
@@ -616,10 +805,23 @@ IMPORTANT: Consider the conversation context above when analyzing the current qu
 - Short follow-up messages like dates, times, or confirmations should be interpreted in the context of the previous messages.`;
       }
 
-      const analysisPrompt = `Analyze the following user query and determine which specialized agent(s) are needed to fulfill it.
+      const analysisPrompt = `STEP 1: First, answer this question:
+Is the user asking about PAST information (what they already told you, what happened before, what they searched/created)?
 
 User Query: "${query}"
 ${conversationSection}
+
+If YES → You MUST return: {"agents": [], "reasoning": "User is asking about past conversation/information"}
+If NO → Continue to STEP 2
+
+Common PAST queries (return empty agents):
+- "what is my name" / "who am I" 
+- "what did I tell you" / "what did we discuss"
+- "what flights did I search" / "what forms did I create"
+- "remind me" / "tell me about"
+- Questions using "was", "were", "did" about past actions
+
+STEP 2: Only if query is NOT about past, determine which agents are needed.
 ${artifactSection}
 ${memorySection}
 
@@ -641,6 +843,20 @@ CRITICAL RULES for Google Meet:
 4. "Show my meeting recordings" -> Use meet agent
 5. When user wants a SCHEDULED meeting with a specific time, ALWAYS use calendar agent which will automatically add Google Meet conferencing
 
+CRITICAL RULES:
+1. If query asks about PAST (what/who/when/where user already told you) → {"agents": []}
+2. Only use agents for NEW actions: CREATE, SEARCH, SEND, SCHEDULE, FIND
+
+Examples showing when to return EMPTY agents array:
+- "what is my name" → {"agents": [], "reasoning": "Asking about past information from conversation"}
+- "who am I" → {"agents": []}
+- "what flights did I search" → {"agents": []}
+- "what forms did I create" → {"agents": []}
+
+Examples showing when to use agents:
+- "find flights to Mumbai tomorrow" → {"agents": ["flights"], ...}
+- "create a form" → {"agents": ["forms"], ...}
+
 Respond with a JSON object containing:
 {
   "agents": ["agent1", "agent2"],  // Array of agent names needed (can be one or multiple)
@@ -654,6 +870,11 @@ Respond with a JSON object containing:
 }
 
 Examples:
+- "what is my name" -> {"agents": [], "reasoning": "User is asking about information from conversation history, no agents needed"}
+- "who am I" -> {"agents": [], "reasoning": "Conversational query about past information"}
+- "what did we talk about" -> {"agents": [], "reasoning": "Asking about conversation history"}
+- "what flights did I search for" -> {"agents": [], "reasoning": "Asking about past search, answer from conversation history"}
+- "remind me what forms I created" -> {"agents": [], "reasoning": "Query about artifact memory, no new action needed"}
 - "create a google meet tomorrow at 3pm" -> {"agents": ["calendar"], "queries": {"calendar": "create a google meet event tomorrow at 3pm with video call"}}
 - "schedule a video call for monday at 10am" -> {"agents": ["calendar"], "queries": {"calendar": "schedule a video call meeting for monday at 10am with google meet"}}
 - "create a meeting room" (no time) -> {"agents": ["meet"], ...}
@@ -695,7 +916,7 @@ Important:
 - ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar`;
 
       const messages = [
-        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text. IMPORTANT: Always consider conversation history - if a user provides a date after asking about flights, they want flights for that date, NOT a calendar event.' },
+        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.\n\nCRITICAL RULE: If the user is asking about PAST conversation or information already discussed, return {"agents": [], "reasoning": "..."}. ONLY route to agents for NEW actions like creating, searching, or performing operations. Questions about "what is my name", "what did we discuss", "what flights did I search" should have EMPTY agents array.' },
         { role: 'user', content: analysisPrompt }
       ];
 
@@ -942,6 +1163,22 @@ Instead, present the information as if you're directly reporting the results.`;
       console.log(`[MainAgent] Conversation ID: ${conversationId || 'NOT PROVIDED'}`);
       console.log(`${'='.repeat(60)}`);
 
+      // ========== CHECK FOR PENDING CONFIRMATION MODIFICATION ==========
+      // Before processing the query normally, check if user is trying to modify a pending confirmation
+      const pendingAction = confirmationStore.getUserMostRecentPendingAction(userId);
+      if (pendingAction) {
+        console.log(`\n[PendingModification] 🔍 Found pending action: ${pendingAction.toolName} (${pendingAction.agentName})`);
+        const modificationResult = await this.detectAndHandleModification(query, pendingAction, userId, onChunk);
+        
+        if (modificationResult) {
+          // User is modifying the pending action - we've handled it
+          console.log(`[PendingModification] ✅ Modification detected and handled`);
+          return;
+        } else {
+          console.log(`[PendingModification] ℹ️ Query is not a modification - proceeding normally`);
+        }
+      }
+
       // Send initial status
       onChunk({ type: 'status', message: 'Analyzing your request...' });
 
@@ -1051,8 +1288,17 @@ Instead, present the information as if you're directly reporting the results.`;
       onChunk({ type: 'status', message: 'Generating response...' });
 
       // Step 3: Stream the final response generation
-      // Pass memory context for inclusion in the response generation
-      await this.streamCombinedResponse(enhancedQuery, analysis, results, errors, onChunk, conversationId, memoryContext);
+      // Pass memory context and conversation history for inclusion in the response generation
+      await this.streamCombinedResponse(
+        enhancedQuery, 
+        analysis, 
+        results, 
+        errors, 
+        onChunk, 
+        conversationId, 
+        memoryContext,
+        options.conversationHistory || []
+      );
 
       const processingTime = Date.now() - startTime;
 
@@ -2190,9 +2436,9 @@ If an email was sent, confirm it was sent successfully.`;
 
   /**
    * Stream the combined response using OpenAI's streaming API
-   * Now includes artifact context and long-term memory in the system prompt
+   * Now includes artifact context, long-term memory, and full conversation history
    */
-  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '') {
+  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = []) {
     try {
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
@@ -2204,8 +2450,10 @@ If an email was sent, confirm it was sent successfully.`;
       }).join('\n');
 
       // Build artifact context for the prompt
+      // ONLY include artifacts if agents were actually used (not for conversational queries)
       let artifactContext = '';
-      if (conversationId) {
+      const isConversationalQuery = !analysis.agents || analysis.agents.length === 0;
+      if (conversationId && !isConversationalQuery) {
         artifactContext = await formatArtifactsForPrompt(conversationId);
       }
 
@@ -2223,28 +2471,54 @@ ${artifactContext ? `\n--- Conversation Artifacts ---\n${artifactContext}\n---\n
 
 ${memoryContext ? `\n--- Long-Term Memories ---\n${memoryContext}\n(Use these memories only if directly relevant. Do not explicitly mention "from your memories" unless appropriate.)\n---\n` : ''}
 
-Please provide a natural, conversational response to the user that:
+CRITICAL INSTRUCTION - Response Style:
+${analysis.agents && analysis.agents.length === 0 ? `
+⚠️ This is a CONVERSATIONAL query (no agents were used).
+- Answer the question DIRECTLY and CONCISELY
+- DO NOT recap or summarize previous actions
+- DO NOT mention past events, forms, or other items unless specifically asked about them
+- Keep response SHORT (1-2 sentences max)
+- Example: If asked "what is my name", just say "Your name is [name]!" - nothing else.
+` : `
+This query required agent actions. Please provide a response that:
 1. Directly addresses their request
 2. Summarizes what was accomplished
-3. Includes relevant details from the agent results (include IDs like formId, documentId, eventId for reference)
+3. Includes relevant details from the agent results (IDs, links, etc.)
 4. Mentions any errors or limitations encountered
 5. Is friendly and helpful in tone
-6. Uses any relevant context from long-term memories naturally (without explicitly referencing the memory system)
+`}
 
-Format the response in a clear, readable way. Use bullet points or numbered lists where appropriate.
-If events were created, include key details like title, date, time, and location.
-If forms/docs/sheets were created, include the ID and a link if available.
-Do not include raw JSON or technical details unless specifically relevant.`;
+Format the response in a clear, readable way.
+Do not include raw JSON or technical details unless specifically relevant.
+${analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the question directly without extra context or recaps!' : ''}`;
 
       // Get dynamic system prompt with artifact context
       const systemPrompt = conversationId 
         ? await this.createDynamicSystemPrompt(conversationId)
         : this.systemPrompt;
 
+      // Build messages array with conversation history for context
       const messages = [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: responsePrompt }
       ];
+
+      // Add conversation history (limit to last 10 messages to avoid token limits)
+      if (conversationHistory && conversationHistory.length > 0) {
+        console.log(`[MainAgent] 💬 Adding ${conversationHistory.length} messages from conversation history to LLM context`);
+        const recentHistory = conversationHistory.slice(-10);
+        console.log(`[MainAgent] 📋 Using last ${recentHistory.length} messages (trimmed from ${conversationHistory.length})`);
+        recentHistory.forEach(msg => {
+          messages.push({
+            role: msg.role,
+            content: msg.content
+          });
+        });
+      } else {
+        console.log(`[MainAgent] ⚠️ No conversation history provided to response generation`);
+      }
+
+      // Add the current response prompt
+      messages.push({ role: 'user', content: responsePrompt });
 
       // Use OpenAI streaming
       const stream = await this.openai.chat.completions.create({
