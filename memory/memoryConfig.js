@@ -24,7 +24,13 @@ const SOURCE_APPS = {
     FORMS: 'forms',
     MEET: 'meet',
     FLIGHTS: 'flights',
-    MULTI_AGENT: 'multi-agent'
+    MULTI_AGENT: 'multi-agent',
+    // Microsoft 365 source apps
+    MICROSOFT: 'microsoft',
+    OUTLOOK: 'outlook',
+    MS_CALENDAR: 'ms_calendar',
+    ONEDRIVE: 'onedrive',
+    EXCEL: 'excel'
 };
 
 // Memory retrieval configuration

@@ -53,6 +53,10 @@ const chatRoutes = require('./chat/chatController');
 const memoryRoutes = require('./memory/memoryController');
 const memorySettingsRoutes = require('./memory/memorySettingsController');
 
+// Microsoft routes
+const microsoftAuthRoutes = require('./microsoft/microsoftAuth');
+const microsoftAgentRoutes = require('./microsoft/microsoftAgentController');
+
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -149,6 +153,10 @@ app.use('/api/memory', memoryRoutes);
 
 // Use Memory Settings routes
 app.use('/api/settings', memorySettingsRoutes);
+
+// Use Microsoft routes
+app.use('/api', microsoftAuthRoutes.router);
+app.use('/api/microsoft', microsoftAgentRoutes);
 
 // Health check route
 app.get('/health', async (req, res) => {

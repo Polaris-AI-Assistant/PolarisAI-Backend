@@ -706,6 +706,38 @@ Your capabilities include:
 - **Filter Management**: Create, list, and delete email filters/rules
 - **Email Actions**: Mark as read/unread, star, trash, archive emails
 
+**PROFESSIONAL EMAIL WRITING GUIDELINES (CRITICAL):**
+When composing ANY email, you MUST follow this professional format:
+
+1. **Subject Line**: NEVER use just a filename or single word. Create descriptive, professional subjects:
+   - BAD: "students" or "Document" or "File"
+   - GOOD: "Sharing Excel Workbook: Student Records" or "Document Shared: [Filename]" or "Action Required: Review Attached Document"
+   - Include context: what it is + why you're sending it
+
+2. **Email Body Structure** - Use this EXACT format:
+   """
+   Hi [Recipient First Name],
+
+   I hope this message finds you well.
+
+   [Main purpose paragraph - 2-3 sentences explaining why you're writing]
+
+   [Details paragraph - key information, links, or action items]
+   📎 Document Link: [URL]
+
+   [Call to action - what you want them to do next]
+
+   Please feel free to reach out if you have any questions.
+
+   Best regards,
+   [SENDER'S ACTUAL NAME FROM ACCOUNT]
+   """
+
+3. **NEVER use placeholders** like "[Your Name]" - always use the actual sender's name
+4. **Professional tone**: Warm but business-appropriate
+5. **Clear formatting**: Use line breaks between paragraphs
+6. **Meaningful content**: Explain the purpose, don't just dump a link
+
 **RESPONSE FORMATTING GUIDELINES:**
 1. Always respond in a professional, conversational, and friendly tone
 2. Use proper formatting with emojis for better readability:
@@ -810,59 +842,76 @@ Remember: You have full access to Gmail operations. Help users manage their emai
             delete params.userName;
           } else {
             // Only regenerate if not already AI-generated (legacy path or fallback)
-            console.log(`[GmailAgent] Generating email content with AI (no pre-generated content)...`);
+            console.log(`[GmailAgent] Generating professional email content with AI...`);
+            
+            // Extract recipient's first name for personalized greeting
+            const recipientEmail = params.to;
+            const recipientName = recipientEmail.split('@')[0].split('.')[0];
+            const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
             
             const generationResponse = await this.openai.chat.completions.create({
               model: "gpt-4o-mini",
               messages: [
                 {
                   role: "system",
-                  content: `You are an email writing assistant. Generate a complete, well-formatted email with:
-1. A warm, appropriate greeting
-2. The main message body (friendly, professional tone as appropriate)
-3. A proper sign-off
+                  content: `You are a professional email writing assistant. Generate polished, well-structured emails.
 
-Only output the email body text. Do not include "Subject:" line.
-Make the email feel natural and personal, not robotic.`
+REQUIRED FORMAT:
+1. Personalized greeting: "Hi [First Name]," (use the recipient's first name provided)
+2. Opening line: "I hope this message finds you well." or similar
+3. Main purpose paragraph (2-3 sentences explaining why you're writing)
+4. Details or action items (if applicable)
+5. Closing line: "Please feel free to reach out if you have any questions."
+6. Professional sign-off: "Best regards," followed by sender name
+
+CRITICAL RULES:
+- NEVER use placeholders like "[Your Name]"
+- Use proper line breaks between paragraphs
+- Be warm but professional
+- Keep it concise but complete
+
+Only output the email body text. Do not include "Subject:" line.`
                 },
                 {
                   role: "user",
-                  content: `Write an email for:
+                  content: `Write a professional email:
 To: ${params.to}
+Recipient Name: ${capitalizedRecipient}
 Subject: ${params.subject}
-Context/Intent: ${params.body || query}
+Purpose/Context: ${params.body || query}
+Sender's Name: ${params.userName || 'Best regards'}
 
-Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`
+Write a complete, professional email that looks like it was written by a real person.`
                 }
               ],
-              max_tokens: 500,
+              max_tokens: 600,
               temperature: 0.7
             });
             
             params.body = generationResponse.choices[0].message.content;
             
             // Also generate a better subject if it's generic
-            if (params.subject === 'New Message' || params.subject === 'Meeting' || !params.subject) {
+            if (params.subject === 'New Message' || params.subject === 'Meeting' || !params.subject || params.subject.length < 5) {
               const subjectResponse = await this.openai.chat.completions.create({
                 model: "gpt-4o-mini",
                 messages: [
                   {
                     role: "system",
-                    content: "Generate a short, catchy email subject line (max 50 chars). Only output the subject text, nothing else."
+                    content: "Generate a professional, descriptive email subject line (max 60 chars). NEVER use just a filename or single word. Include context about the purpose. Only output the subject text, nothing else."
                   },
                   {
                     role: "user",
-                    content: `Generate subject for: ${params.body || query}`
+                    content: `Generate a professional subject line for this email context: ${params.body || query}`
                   }
                 ],
-                max_tokens: 50,
+                max_tokens: 60,
                 temperature: 0.7
               });
               params.subject = subjectResponse.choices[0].message.content.replace(/^["']|["']$/g, '').trim();
             }
             
             console.log(`[GmailAgent] Generated subject: ${params.subject}`);
-            console.log(`[GmailAgent] Generated body: ${params.body.substring(0, 100)}...`);
+            console.log(`[GmailAgent] Generated body preview: ${params.body.substring(0, 100)}...`);
           }
         }
         

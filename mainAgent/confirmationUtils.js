@@ -440,6 +440,163 @@ const confirmationConfig = {
         return lines.join('\n');
       }
     }
+  },
+
+  // Microsoft 365 - Outlook, Calendar, OneDrive, Excel operations
+  microsoft: {
+    microsoft_sendEmail: {
+      confirmationRequired: true,
+      actionType: 'send_email',
+      description: 'Send an email via Microsoft Outlook',
+      generatePreview: (params) => {
+        const lines = ['📧 **Send Email via Outlook**\n'];
+        lines.push(`**To:** ${params.to}`);
+        if (params.cc) lines.push(`**CC:** ${params.cc}`);
+        if (params.bcc) lines.push(`**BCC:** ${params.bcc}`);
+        lines.push(`**Subject:** ${params.subject}`);
+        lines.push('\n**Email Content:**');
+        if (params.body) {
+          const preview = params.body.substring(0, 800);
+          lines.push(preview + (params.body.length > 800 ? '...' : ''));
+        }
+        return lines.join('\n');
+      }
+    },
+    microsoft_replyToEmail: {
+      confirmationRequired: true,
+      actionType: 'reply_email',
+      description: 'Reply to an email via Microsoft Outlook',
+      generatePreview: (params) => {
+        const lines = ['↩️ **Reply to Email (Outlook)**\n'];
+        lines.push(`**Original Message ID:** ${params.messageId}`);
+        lines.push('\n**Reply Content:**');
+        if (params.body) {
+          const preview = params.body.substring(0, 500);
+          lines.push(preview + (params.body.length > 500 ? '...' : ''));
+        }
+        return lines.join('\n');
+      }
+    },
+    microsoft_forwardEmail: {
+      confirmationRequired: true,
+      actionType: 'forward_email',
+      description: 'Forward an email via Microsoft Outlook',
+      generatePreview: (params) => {
+        const lines = ['➡️ **Forward Email (Outlook)**\n'];
+        lines.push(`**Original Message ID:** ${params.messageId}`);
+        lines.push(`**Forward To:** ${params.to}`);
+        if (params.comment) {
+          lines.push('\n**Additional Comment:**');
+          lines.push(params.comment);
+        }
+        return lines.join('\n');
+      }
+    },
+    microsoft_createCalendarEvent: {
+      confirmationRequired: true,
+      actionType: 'create_event',
+      description: 'Create a Microsoft Calendar event',
+      generatePreview: (params) => {
+        const lines = ['📅 **Create Microsoft Calendar Event**\n'];
+        lines.push(`**Title:** ${params.subject || 'Untitled Event'}`);
+        if (params.start) {
+          const start = new Date(params.start);
+          lines.push(`**Start:** ${start.toLocaleString()}`);
+        }
+        if (params.end) {
+          const end = new Date(params.end);
+          lines.push(`**End:** ${end.toLocaleString()}`);
+        }
+        if (params.location) lines.push(`**Location:** ${params.location}`);
+        if (params.body) lines.push(`**Description:** ${params.body}`);
+        if (params.attendees) {
+          const attendeeList = params.attendees.split(',').map(e => e.trim()).join(', ');
+          lines.push(`**Attendees:** ${attendeeList}`);
+        }
+        if (params.isOnlineMeeting) lines.push('**Teams Meeting:** A Teams video call link will be added');
+        return lines.join('\n');
+      }
+    },
+    microsoft_updateCalendarEvent: {
+      confirmationRequired: true,
+      actionType: 'update_event',
+      description: 'Update a Microsoft Calendar event',
+      generatePreview: (params) => {
+        const lines = ['📅 **Update Microsoft Calendar Event**\n'];
+        lines.push(`**Event ID:** ${params.eventId}`);
+        if (params.subject) lines.push(`**New Title:** ${params.subject}`);
+        if (params.start) lines.push(`**New Start:** ${new Date(params.start).toLocaleString()}`);
+        if (params.end) lines.push(`**New End:** ${new Date(params.end).toLocaleString()}`);
+        if (params.location) lines.push(`**New Location:** ${params.location}`);
+        if (params.body) lines.push(`**New Description:** ${params.body}`);
+        return lines.join('\n');
+      }
+    },
+    microsoft_deleteCalendarEvent: {
+      confirmationRequired: true,
+      actionType: 'delete_event',
+      description: 'Delete a Microsoft Calendar event',
+      generatePreview: (params) => {
+        const lines = ['🗑️ **Delete Microsoft Calendar Event**\n'];
+        lines.push(`**Event ID:** ${params.eventId}`);
+        lines.push('\n⚠️ This event will be permanently deleted.');
+        return lines.join('\n');
+      }
+    },
+    microsoft_uploadFile: {
+      confirmationRequired: true,
+      actionType: 'upload_file',
+      description: 'Upload a file to OneDrive',
+      generatePreview: (params) => {
+        const lines = ['📤 **Upload to OneDrive**\n'];
+        lines.push(`**File Name:** ${params.fileName}`);
+        if (params.folderPath) lines.push(`**Folder:** ${params.folderPath}`);
+        lines.push(`**Content Size:** ${params.content ? params.content.length : 0} characters`);
+        return lines.join('\n');
+      }
+    },
+    microsoft_updateExcelRange: {
+      confirmationRequired: true,
+      actionType: 'update_excel',
+      description: 'Update Excel spreadsheet data',
+      generatePreview: (params) => {
+        const lines = ['📊 **Update Excel Data**\n'];
+        lines.push(`**File ID:** ${params.fileId}`);
+        lines.push(`**Worksheet:** ${params.worksheetName || 'Sheet1'}`);
+        lines.push(`**Range:** ${params.range}`);
+        if (params.values) {
+          lines.push(`**Values:** ${JSON.stringify(params.values).substring(0, 200)}...`);
+        }
+        return lines.join('\n');
+      }
+    },
+    microsoft_createWordDocument: {
+      confirmationRequired: true,
+      actionType: 'create_document',
+      description: 'Create a Microsoft Word document',
+      generatePreview: (params) => {
+        const lines = ['📝 **Create Microsoft Word Document**\n'];
+        lines.push(`**Title:** ${params.fileName || 'Untitled Document'}`);
+        if (params.content) {
+          lines.push(`**Content:** Will add content based on the title`);
+        }
+        return lines.join('\n');
+      }
+    },
+    microsoft_addContentToWordDocument: {
+      confirmationRequired: true,
+      actionType: 'update_document',
+      description: 'Add content to a Microsoft Word document',
+      generatePreview: (params) => {
+        const lines = ['📝 **Add Content to Word Document**\n'];
+        lines.push(`**Document ID:** ${params.documentId}`);
+        if (params.content) {
+          const preview = params.content.substring(0, 500);
+          lines.push(`**Content Preview:** ${preview}${params.content.length > 500 ? '...' : ''}`);
+        }
+        return lines.join('\n');
+      }
+    }
   }
 };
 

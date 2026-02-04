@@ -39,6 +39,7 @@ const MeetAgent = require('../meet/meetAgent');
 const SheetsAgent = require('../sheets/sheetsAgent');
 const FlightsAgent = require('../flights/flightsAgent');
 const MapsAgent = require('../maps/mapsAgent');
+const MicrosoftAgent = require('../microsoft/microsoftAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 
@@ -83,7 +84,8 @@ class MainAgent {
       meet: new MeetAgent(),
       sheets: new SheetsAgent(),
       flights: new FlightsAgent(),
-      maps: new MapsAgent()
+      maps: new MapsAgent(),
+      microsoft: new MicrosoftAgent()
     };
 
     // System prompt for the main coordinator
@@ -225,7 +227,8 @@ class MainAgent {
           let enhancedNextAction = nextChainAction.nextAction;
           
           // If the next action is an email, try to enhance it with the form/doc link
-          if (enhancedNextAction.toolName === 'sendEmail' && storedArtifact) {
+          // Try to enhance even if artifact is null - we can extract link from raw result
+          if (enhancedNextAction.toolName === 'sendEmail' || enhancedNextAction.toolName === 'microsoft_sendEmail') {
             enhancedNextAction = await this.enhanceEmailWithPreviousResult(enhancedNextAction, completedResult, userId);
           }
           
@@ -276,6 +279,7 @@ class MainAgent {
   /**
    * Enhance email params with results from previous actions in the chain
    * For example, include the form link in the email body
+   * Supports both Gmail and Microsoft Outlook emails
    */
   async enhanceEmailWithPreviousResult(emailAction, previousResult, userId) {
     try {
@@ -283,37 +287,94 @@ class MainAgent {
       
       console.log(`[MainAgent] 📧 Enhancing email with previous result:`, { artifact, hasResult: !!result });
       
-      if (!artifact) {
-        console.log(`[MainAgent] ⚠️ No artifact found in previous result`);
-        return emailAction;
-      }
-
       let linkToInclude = null;
       let itemDescription = '';
+      let senderName = null;
 
-      // Extract link based on artifact type (lowercase - matching ARTIFACT_TYPES)
-      const artifactType = artifact.type?.toLowerCase();
-      console.log(`[MainAgent] 📧 Artifact type: ${artifactType}, ID: ${artifact.id}`);
-      
-      if ((artifactType === 'form') && artifact.id) {
-        linkToInclude = `https://docs.google.com/forms/d/${artifact.id}/viewform`;
-        itemDescription = `the form "${artifact.title}"`;
-      } else if ((artifactType === 'doc' || artifactType === 'document') && artifact.id) {
-        linkToInclude = `https://docs.google.com/document/d/${artifact.id}/edit`;
-        itemDescription = `the document "${artifact.title}"`;
-      } else if ((artifactType === 'sheet' || artifactType === 'spreadsheet') && artifact.id) {
-        linkToInclude = `https://docs.google.com/spreadsheets/d/${artifact.id}/edit`;
-        itemDescription = `the spreadsheet "${artifact.title}"`;
-      } else if ((artifactType === 'event' || artifactType === 'calendar_event') && artifact.data) {
-        // For calendar events, extract the Google Meet link or calendar link
-        if (artifact.data.hangoutLink) {
-          linkToInclude = artifact.data.hangoutLink;
-          itemDescription = `the Google Meet "${artifact.title}"`;
-          console.log(`[MainAgent] 📧 Found Google Meet link in artifact: ${linkToInclude}`);
-        } else if (artifact.data.htmlLink) {
-          linkToInclude = artifact.data.htmlLink;
-          itemDescription = `the calendar event "${artifact.title}"`;
+      // Try to get the sender's name based on which service is being used
+      try {
+        if (emailAction.agentName === 'microsoft') {
+          const microsoftService = require('../microsoft/microsoftService');
+          const userProfile = await microsoftService.getUserProfile(userId);
+          if (userProfile && userProfile.displayName) {
+            senderName = userProfile.displayName;
+            console.log(`[MainAgent] 📧 Got Microsoft sender name: ${senderName}`);
+          }
+        } else {
+          // For Gmail, try to get from stored user data or use a default
+          // Gmail API doesn't have a simple profile endpoint, so we'll use what's available
+          senderName = null; // Will be handled by the agent
+        }
+      } catch (profileError) {
+        console.log(`[MainAgent] ⚠️ Could not fetch sender profile:`, profileError.message);
+      }
+
+      // First try to extract from artifact if available
+      if (artifact) {
+        // Extract link based on artifact type (lowercase - matching ARTIFACT_TYPES)
+        const artifactType = artifact.type?.toLowerCase();
+        console.log(`[MainAgent] 📧 Artifact type: ${artifactType}, ID: ${artifact.id}`);
+        
+        // Google types
+        if ((artifactType === 'form') && artifact.id) {
+          linkToInclude = `https://docs.google.com/forms/d/${artifact.id}/viewform`;
+          itemDescription = `the form "${artifact.title}"`;
+        } else if ((artifactType === 'doc' || artifactType === 'document') && artifact.id) {
+          linkToInclude = `https://docs.google.com/document/d/${artifact.id}/edit`;
+          itemDescription = `the document "${artifact.title}"`;
+        } else if ((artifactType === 'sheet' || artifactType === 'spreadsheet') && artifact.id) {
+          linkToInclude = `https://docs.google.com/spreadsheets/d/${artifact.id}/edit`;
+          itemDescription = `the spreadsheet "${artifact.title}"`;
+        } else if ((artifactType === 'event' || artifactType === 'calendar_event') && artifact.data) {
+          // For calendar events, extract the Google Meet link or calendar link
+          if (artifact.data.hangoutLink) {
+            linkToInclude = artifact.data.hangoutLink;
+            itemDescription = `the Google Meet "${artifact.title}"`;
+            console.log(`[MainAgent] 📧 Found Google Meet link in artifact: ${linkToInclude}`);
+          } else if (artifact.data.htmlLink) {
+            linkToInclude = artifact.data.htmlLink;
+            itemDescription = `the calendar event "${artifact.title}"`;
           console.log(`[MainAgent] 📧 Found calendar link in artifact: ${linkToInclude}`);
+        }
+      }
+      // Microsoft types
+      else if ((artifactType === 'word_document' || artifactType === 'word' || artifactType === 'microsoft_doc') && artifact.data?.webUrl) {
+        linkToInclude = artifact.data.webUrl;
+        itemDescription = `the Microsoft Word document "${artifact.title}"`;
+        console.log(`[MainAgent] 📧 Found Word document link: ${linkToInclude}`);
+      } else if ((artifactType === 'excel' || artifactType === 'excel_workbook') && artifact.data?.webUrl) {
+        linkToInclude = artifact.data.webUrl;
+        itemDescription = `the Excel spreadsheet "${artifact.title}"`;
+        console.log(`[MainAgent] 📧 Found Excel workbook link: ${linkToInclude}`);
+      }
+      }
+      
+      // If no link found from artifact, try to extract from raw result
+      if (!linkToInclude && result) {
+        console.log(`[MainAgent] 📧 Trying to extract link from raw result...`);
+        
+        // Check raw_results array (common format from agents)
+        if (result.raw_results && Array.isArray(result.raw_results)) {
+          for (const rawResult of result.raw_results) {
+            if (rawResult.webUrl) {
+              linkToInclude = rawResult.webUrl;
+              itemDescription = `the document "${rawResult.name || 'Document'}"`;
+              console.log(`[MainAgent] 📧 Found webUrl in raw_results: ${linkToInclude}`);
+              break;
+            }
+          }
+        }
+        
+        // Also check result.response for embedded links
+        if (!linkToInclude && result.response && typeof result.response === 'string') {
+          const urlMatch = result.response.match(/https:\/\/[^\s\)]+/);
+          if (urlMatch) {
+            linkToInclude = urlMatch[0];
+            // Try to extract document name from response
+            const nameMatch = result.response.match(/\*\*Name:\*\*\s*([^\n]+)/);
+            itemDescription = `the document "${nameMatch ? nameMatch[1].trim() : 'Document'}"`;
+            console.log(`[MainAgent] 📧 Extracted link from response: ${linkToInclude}`);
+          }
         }
       }
 
@@ -325,13 +386,18 @@ class MainAgent {
           emailAction.params,
           linkToInclude,
           itemDescription,
-          userId
+          userId,
+          senderName
         );
         
         emailAction.params = enhancedParams;
+        
+        // Use correct preview generator based on agent
+        const agentForPreview = emailAction.agentName || 'gmail';
+        const toolForPreview = emailAction.toolName || 'sendEmail';
         emailAction.previewContent = confirmationUtils.generatePreview(
-          'gmail',
-          'sendEmail',
+          agentForPreview,
+          toolForPreview,
           enhancedParams
         );
         
@@ -350,27 +416,50 @@ class MainAgent {
   /**
    * Regenerate email body to include the actual link from the previous action
    */
-  async regenerateEmailWithLink(emailParams, link, itemDescription, userId) {
+  async regenerateEmailWithLink(emailParams, link, itemDescription, userId, senderName = null) {
     try {
-      const prompt = `The user wanted to send an email about ${itemDescription}.
-Here was the original email draft:
-To: ${emailParams.to}
-Subject: ${emailParams.subject}
-Body: ${emailParams.body}
+      // Extract recipient's first name for personalized greeting
+      const recipientEmail = emailParams.to;
+      const recipientName = recipientEmail.split('@')[0].split('.')[0];
+      const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
+      
+      const prompt = `Write a PROFESSIONAL business email to share ${itemDescription}.
 
-The ${itemDescription} has now been created. Update the email body to include this actual link: ${link}
+Recipient Email: ${emailParams.to}
+Recipient Name: ${capitalizedRecipient}
+Item Being Shared: ${itemDescription}
+Link to Include: ${link}
+Original Context/Purpose: ${emailParams.subject || emailParams.body}
+Sender's Name: ${senderName || 'the sender'}
 
-Return ONLY a JSON object with the updated email:
+CRITICAL REQUIREMENTS:
+1. Subject MUST be professional and descriptive (NOT just a filename):
+   - BAD: "students" or "document"
+   - GOOD: "Sharing Excel Workbook: Students Data" or "Document Shared: Project Notes"
+
+2. Email body MUST have this structure:
+   - Personalized greeting: "Hi ${capitalizedRecipient},"
+   - Opening: "I hope this message finds you well."
+   - Purpose paragraph (2-3 sentences explaining what and why)
+   - The link clearly displayed
+   - Call to action
+   - Professional closing
+   - Sign-off with ACTUAL sender name (not [Your Name])
+
+3. Use proper line breaks between paragraphs
+4. NEVER use placeholders like "[Your Name]" - use the actual sender name
+
+Return ONLY a JSON object:
 {
   "to": "${emailParams.to}",
-  "subject": "updated subject if needed",
-  "body": "updated body with the actual link included naturally"
+  "subject": "Professional descriptive subject",
+  "body": "Complete professional email body with proper formatting"
 }`;
 
       const response = await this.openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: 'You are an email assistant. Return only valid JSON, no markdown or extra text.' },
+          { role: 'system', content: 'You are a professional business email writer. Write polished, well-structured emails. Return only valid JSON. NEVER use placeholders like [Your Name] - use the actual sender name provided.' },
           { role: 'user', content: prompt }
         ],
         temperature: 0.3,
@@ -384,10 +473,15 @@ Return ONLY a JSON object with the updated email:
       };
     } catch (error) {
       console.error('[MainAgent] Error regenerating email with link:', error);
-      // If AI fails, just append the link to the original body
+      // If AI fails, create a professional fallback
+      const recipientEmail = emailParams.to;
+      const recipientName = recipientEmail.split('@')[0].split('.')[0];
+      const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
+      
       return {
         ...emailParams,
-        body: `${emailParams.body}\n\nLink: ${link}`
+        subject: `Sharing: ${itemDescription}`,
+        body: `Hi ${capitalizedRecipient},\n\nI hope this message finds you well.\n\nI'm sharing ${itemDescription} with you for your review.\n\n📎 Link: ${link}\n\nPlease feel free to reach out if you have any questions.\n\nBest regards,\n${senderName || 'Regards'}`
       };
     }
   }
@@ -675,6 +769,16 @@ Available specialized agents and their capabilities:
 - Geocode addresses to coordinates and vice versa
 - Support for multiple travel modes (driving, walking, bicycling, transit)
 
+**MicrosoftAgent**: Microsoft 365 operations (Outlook, Calendar, OneDrive, Excel)
+- Outlook: Send, read, reply to, and forward emails via Microsoft/Outlook
+- Microsoft Calendar: Create, list, update, and delete calendar events with Teams meeting support
+- OneDrive: List, search, upload, and download files
+- Excel: Read and write to Excel workbooks stored in OneDrive
+- User profile: Get Microsoft 365 account information
+
+Use MicrosoftAgent when user specifically mentions Microsoft, Outlook, OneDrive, Excel, Teams, or Microsoft Calendar.
+Distinguish between Google services (Gmail, Google Calendar, Google Sheets) and Microsoft services (Outlook, Microsoft Calendar, OneDrive, Excel).
+
 **FLIGHTS TOOLS INSTRUCTIONS**:
 You have access to two flights-related tools:
 - **getFlightsList**: Use this when the user wants to find or compare flights between cities/airports on specific dates. Returns available flights with prices, times, and airlines.
@@ -821,6 +925,15 @@ Common PAST queries (return empty agents):
 - "remind me" / "tell me about"
 - Questions using "was", "were", "did" about past actions
 
+IMPORTANT - These are NOT past queries (require agents to FETCH data):
+- "show my emails" / "show my outlook mails" → REQUIRES microsoft agent to FETCH emails
+- "list my emails" / "check my inbox" → REQUIRES agent to FETCH data
+- "show my recent outlook emails" → REQUIRES microsoft agent (fetching current data, not past conversation)
+- "read my gmail" → REQUIRES gmail agent
+- "show my calendar events" → REQUIRES agent to FETCH events
+- "show my onedrive files" → REQUIRES microsoft agent
+- Any "show", "list", "check", "read", "get" with email/calendar/files → REQUIRES an agent
+
 STEP 2: Only if query is NOT about past, determine which agents are needed.
 ${artifactSection}
 ${memorySection}
@@ -830,11 +943,22 @@ Available agents:
 - docs: Google Docs operations (create/edit documents, text formatting)
 - forms: Google Forms operations (create forms, manage questions, view responses)
 - github: GitHub operations (repos, commits, issues, PRs, profile)
-- gmail: Gmail operations (send/read/search emails, drafts, labels, filters)
+- gmail: Gmail operations (send/read/search emails, drafts, labels, filters) - Use ONLY when user explicitly mentions "Gmail" or wants to use Google email services
 - meet: Google Meet operations (ONLY for standalone meeting spaces without calendar events, viewing meeting history, recordings, participants). Do NOT use meet agent if user wants a scheduled meeting with a time - use calendar instead.
 - sheets: Google Sheets operations (create/edit spreadsheets, data management)
 - flights: Flight search operations (search flights, compare prices, price insights, airlines, tickets)
 - maps: Google Maps operations (search places, directions, distance, geocoding, nearby search)
+- microsoft: Microsoft 365 operations (Outlook Mail, Microsoft Calendar, OneDrive, Excel, Microsoft Teams chats/channels, Microsoft Word documents). Use this agent when user mentions "Outlook", "Microsoft", "OneDrive", "Excel", "Teams", "Microsoft Teams", "Word", "Microsoft Word", "Microsoft Calendar", or wants to send email "through Outlook" or "via Outlook". ALSO use for "show my outlook emails", "list my outlook mails", "check my outlook inbox", "list my teams", "show my teams chats", "list word documents".
+
+CRITICAL RULES for Email Routing:
+1. "send email through outlook" or "send email via outlook" or "outlook email" → Use ONLY microsoft agent
+2. "send email through gmail" or "send email via gmail" or "gmail email" → Use ONLY gmail agent
+3. "send email to user@outlook.com" (no mention of which service) → Ask user which service OR use gmail as default
+4. User mentions "outlook", "microsoft mail", "hotmail" → Use microsoft agent
+5. User mentions "gmail", "google mail" → Use gmail agent
+6. Generic "send email" without specifying service → Use gmail agent (default)
+7. "show my outlook emails" / "list my outlook mails" / "check outlook inbox" → Use microsoft agent (FETCHING data)
+8. "show my gmail" / "check my gmail inbox" → Use gmail agent (FETCHING data)
 
 CRITICAL RULES for Google Meet:
 1. "Create a google meet tomorrow at 11am" -> Use ONLY calendar agent with query "create a google meet event tomorrow at 11am with video call"
@@ -895,11 +1019,36 @@ Examples:
 - "restaurants near Times Square" -> {"agents": ["maps"], ...}
 - "what are the coordinates of Taj Mahal" -> {"agents": ["maps"], ...}
 
+CRITICAL - Microsoft 365 / Outlook Examples (use microsoft agent, NOT gmail):
+- "send email through outlook" -> {"agents": ["microsoft"], "queries": {"microsoft": "send email through outlook"}}
+- "send email via outlook to john@example.com" -> {"agents": ["microsoft"], "queries": {"microsoft": "send email to john@example.com via outlook"}}
+- "send mail through my outlook" -> {"agents": ["microsoft"], ...}
+- "check my outlook emails" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my outlook emails"}}
+- "show my outlook emails" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my outlook emails"}}
+- "show my most recent outlook mails" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my most recent outlook emails"}}
+- "list my outlook inbox" -> {"agents": ["microsoft"], "queries": {"microsoft": "list emails from outlook inbox"}}
+- "read my outlook mail" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my outlook emails"}}
+- "show my microsoft calendar events" -> {"agents": ["microsoft"], ...}
+- "list files in my onedrive" -> {"agents": ["microsoft"], ...}
+- "show my onedrive files" -> {"agents": ["microsoft"], "queries": {"microsoft": "list files in onedrive"}}
+- "read my excel file" -> {"agents": ["microsoft"], ...}
+- "create event in microsoft calendar" -> {"agents": ["microsoft"], ...}
+- "create an excel spreadsheet" -> {"agents": ["microsoft"], "queries": {"microsoft": "create a new excel workbook"}}
+- "create excel sheet titled expenses" -> {"agents": ["microsoft"], "queries": {"microsoft": "create an excel workbook named expenses"}}
+- "list my teams" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my Microsoft Teams"}}
+- "show my teams chats" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my Teams chats"}}
+- "show channels in my team" -> {"agents": ["microsoft"], "queries": {"microsoft": "list channels in my team"}}
+- "send a message in teams chat" -> {"agents": ["microsoft"], "queries": {"microsoft": "send a message in Teams chat"}}
+- "list my word documents" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my Word documents"}}
+- "show my word files" -> {"agents": ["microsoft"], "queries": {"microsoft": "list Word documents in OneDrive"}}
+- "create a word document" -> {"agents": ["microsoft"], "queries": {"microsoft": "create a new Word document"}}
+
 CRITICAL - Multi-Agent Sequential Examples (when one action depends on another):
 - "create a feedback form and send the link to john@example.com" -> {"agents": ["forms", "gmail"], "requiresSequential": true, "queries": {"forms": "create a feedback form", "gmail": "send email to john@example.com with the form link"}}
 - "create a student survey and email it to bhumika@gmail.com" -> {"agents": ["forms", "gmail"], "requiresSequential": true, ...}
 - "make a registration form and share it with the team via email" -> {"agents": ["forms", "gmail"], "requiresSequential": true, ...}
 - "create a document and send it to my manager" -> {"agents": ["docs", "gmail"], "requiresSequential": true, ...}
+- "create a form and send the link through outlook" -> {"agents": ["forms", "microsoft"], "requiresSequential": true, "queries": {"forms": "create a form", "microsoft": "send form link via outlook email"}}
 
 CRITICAL - Conversation Context Examples:
 - User previously asked "show me flights from pune to indore", then says "14 dec" or "tomorrow" -> {"agents": ["flights"], "queries": {"flights": "show me flights from Pune to Indore on 14 December"}} (NOT calendar!)
@@ -916,7 +1065,7 @@ Important:
 - ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar`;
 
       const messages = [
-        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.\n\nCRITICAL RULE: If the user is asking about PAST conversation or information already discussed, return {"agents": [], "reasoning": "..."}. ONLY route to agents for NEW actions like creating, searching, or performing operations. Questions about "what is my name", "what did we discuss", "what flights did I search" should have EMPTY agents array.' },
+        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.\n\nCRITICAL RULE: If the user is asking about PAST conversation or information already discussed (e.g., "what is my name", "what did we discuss", "what flights did I search"), return {"agents": [], "reasoning": "..."}.\n\nBUT: "show my emails", "list my outlook mails", "check my inbox", "show my calendar events", "show my files" are NOT past queries - they require agents to FETCH current data from external services. These MUST route to the appropriate agent (gmail, microsoft, calendar, etc.).\n\nROUTE TO AGENTS for: show, list, check, read, get, fetch + emails/calendar/files/etc.' },
         { role: 'user', content: analysisPrompt }
       ];
 
@@ -1277,6 +1426,38 @@ Instead, present the information as if you're directly reporting the results.`;
       // If a confirmation is required, send confirmation_request and stop
       if (confirmationRequest) {
         onChunk({ type: 'thinking', status: 'stop' });
+        
+        // If there are completed operations (e.g., document created before email confirmation),
+        // send their results first so the user sees them
+        if (confirmationRequest.completedOperations && confirmationRequest.completedOperations.length > 0) {
+          // Generate a summary of completed operations
+          let completedMessage = '✅ **Completed Operations:**\n\n';
+          for (const op of confirmationRequest.completedOperations) {
+            if (op.type === 'document_created_with_content' || op.type === 'document_created') {
+              if (op.contentAdded) {
+                completedMessage += `📝 Created document with content: **${op.name}**\n`;
+              } else {
+                completedMessage += `📝 Created document: **${op.name}**\n`;
+              }
+              if (op.link) {
+                completedMessage += `🔗 [Open Document](${op.link})\n\n`;
+              }
+            }
+          }
+          
+          // Also include the microsoft agent response if available
+          if (results.microsoft && results.microsoft.response) {
+            completedMessage += results.microsoft.response + '\n\n';
+          }
+          
+          completedMessage += '---\n\n**Now confirming email to share the document:**\n';
+          
+          onChunk({
+            type: 'content',
+            content: completedMessage
+          });
+        }
+        
         onChunk({ 
           type: 'confirmation_request',
           ...confirmationRequest
@@ -1339,9 +1520,226 @@ Instead, present the information as if you're directly reporting the results.`;
    * Checks if the analysis indicates a confirmation-required action
    * Now supports multiple confirmation actions (action chains) for multi-agent queries
    * Now includes artifact storage via conversationId
+   * Now handles multi-step operations (create document + send email) properly using action chains
    */
   async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory, conversationId = null, userLocation = null) {
-    // Collect ALL confirmation-required actions from all agents
+    const lowerQuery = query.toLowerCase();
+    
+    // Check for multi-step operations that need special handling:
+    // Pattern: Create document/file + send email with link (Microsoft)
+    const isMicrosoftCreateAndSendPattern = (
+      analysis.agents.includes('microsoft') &&
+      (lowerQuery.includes('create') || lowerQuery.includes('new') || lowerQuery.includes('make')) &&
+      (lowerQuery.includes('document') || lowerQuery.includes('doc') || lowerQuery.includes('word') || 
+       lowerQuery.includes('sheet') || lowerQuery.includes('excel') || lowerQuery.includes('file') ||
+       lowerQuery.includes('workbook') || lowerQuery.includes('spreadsheet')) &&
+      (lowerQuery.includes('send') || lowerQuery.includes('email') || lowerQuery.includes('mail')) &&
+      (lowerQuery.includes('outlook') || lowerQuery.includes('microsoft') || 
+       lowerQuery.includes('@outlook') || lowerQuery.includes('@hotmail') || lowerQuery.includes('@live'))
+    );
+    
+    // Determine if this is Excel or Word
+    const isExcelRequest = lowerQuery.includes('excel') || lowerQuery.includes('spreadsheet') || 
+                           lowerQuery.includes('workbook') || lowerQuery.includes('sheet');
+    
+    // If this is Microsoft "create document/file + send email" pattern, use action chain like Google
+    if (isMicrosoftCreateAndSendPattern) {
+      const fileType = isExcelRequest ? 'Excel workbook' : 'Word document';
+      console.log(`[Confirmation] Detected Microsoft multi-step pattern: create ${fileType} + send email`);
+      console.log(`[Confirmation] Creating action chain like Google flow`);
+      
+      // Extract file/document title - improved pattern matching
+      // Patterns to try in order:
+      // 1. "named as employees" or "named employees"
+      // 2. "titled 'something'" or "title 'something'"
+      // 3. "file/document/workbook 'name'"
+      // 4. "create excel named something and send"
+      let title = null;
+      
+      // Pattern 1: "named as X" or "named X" (before "and", "send", ",", "add", "then")
+      const namedAsMatch = query.match(/named?\s*(?:as\s+)?['"]?([a-zA-Z0-9_\-]+)['"]?\s*(?:,|\s+and\s+|\s+send|\s+then|\s+add|$)/i);
+      if (namedAsMatch) {
+        title = namedAsMatch[1].trim();
+        console.log(`[Confirmation] Extracted title from 'named as' pattern: ${title}`);
+      }
+      
+      // Pattern 2: "titled 'X'" or "title: X"
+      if (!title) {
+        const titledMatch = query.match(/titled?\s*[:\s]?\s*['"]([^'"]+)['"]/i);
+        if (titledMatch) {
+          title = titledMatch[1].trim();
+          console.log(`[Confirmation] Extracted title from 'titled' pattern: ${title}`);
+        }
+      }
+      
+      // Pattern 3: "file/document/workbook 'X'"
+      if (!title) {
+        const fileMatch = query.match(/(?:file|document|workbook|spreadsheet)\s+['"]([^'"]+)['"]/i);
+        if (fileMatch) {
+          title = fileMatch[1].trim();
+          console.log(`[Confirmation] Extracted title from quoted pattern: ${title}`);
+        }
+      }
+      
+      // Pattern 4: "called X"
+      if (!title) {
+        const calledMatch = query.match(/called\s+['"]?([a-zA-Z0-9_\-]+)['"]?/i);
+        if (calledMatch) {
+          title = calledMatch[1].trim();
+          console.log(`[Confirmation] Extracted title from 'called' pattern: ${title}`);
+        }
+      }
+      
+      // Default fallback
+      if (!title) {
+        title = isExcelRequest ? 'New Workbook' : 'New Document';
+        console.log(`[Confirmation] Using default title: ${title}`);
+      }
+      
+      // Extract email recipient
+      const emailMatch = query.match(/(?:to|email|mail)\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i);
+      const emailTo = emailMatch ? emailMatch[1] : null;
+      
+      // Check if we should add content/data
+      const shouldAddContent = lowerQuery.includes('add') && (lowerQuery.includes('content') || lowerQuery.includes('data') || lowerQuery.includes('sample'));
+      const shouldAddSampleData = lowerQuery.includes('sample') || (lowerQuery.includes('add') && lowerQuery.includes('data'));
+      
+      console.log(`[Confirmation] Title: ${title}, Email: ${emailTo}, AddContent: ${shouldAddContent}, SampleData: ${shouldAddSampleData}`);
+      
+      // Build action chain based on file type
+      const confirmationActions = [];
+      
+      if (isExcelRequest) {
+        // Action 1: Create Excel workbook (with sample data flag)
+        const createExcelParams = {
+          fileName: title,
+          addSampleData: shouldAddSampleData || shouldAddContent,
+          sampleDataContext: shouldAddSampleData ? `Generate sample employee data for a spreadsheet named "${title}"` : null
+        };
+        
+        const createExcelPreview = `📊 **Create Microsoft Excel Workbook**\n\n**Title:** ${title}${shouldAddSampleData ? '\n**Data:** Will add sample data based on the file name' : ''}`;
+        
+        confirmationActions.push({
+          agentName: 'microsoft',
+          agentQuery: shouldAddSampleData 
+            ? `create a Microsoft Excel workbook named '${title}' and add sample data to it`
+            : `create a Microsoft Excel workbook named '${title}'`,
+          toolName: 'microsoft_createExcelWorkbook',
+          params: createExcelParams,
+          previewContent: createExcelPreview,
+          captureOutput: true,
+          outputKey: 'documentLink'
+        });
+      } else {
+        // Action 1: Create Word document
+        const createDocParams = {
+          fileName: title,
+          content: shouldAddContent ? `Generate content about ${title}` : ''
+        };
+        
+        const createDocPreview = `📝 **Create Microsoft Word Document**\n\n**Title:** ${title}${shouldAddContent ? '\n**Content:** Will add content based on the title' : ''}`;
+        
+        confirmationActions.push({
+          agentName: 'microsoft',
+          agentQuery: shouldAddContent 
+            ? `create a Microsoft Word document titled '${title}' and add content to it based on the title`
+            : `create a Microsoft Word document titled '${title}'`,
+          toolName: 'microsoft_createWordDocument',
+          params: createDocParams,
+          previewContent: createDocPreview,
+          captureOutput: true,
+          outputKey: 'documentLink'
+        });
+      }
+      
+      // Action 2: Send email (will use document link from action 1)
+      if (emailTo) {
+        const emailPreview = `📧 **Send Email via Outlook**\n\n**To:** ${emailTo}\n**Subject:** ${title}\n**Content:** Will include the ${isExcelRequest ? 'workbook' : 'document'} link after it is created`;
+        
+        confirmationActions.push({
+          agentName: 'microsoft',
+          agentQuery: `send email to ${emailTo} with the ${isExcelRequest ? 'workbook' : 'document'} link`,
+          toolName: 'microsoft_sendEmail',
+          params: {
+            to: emailTo,
+            subject: title,
+            body: `[Will be generated after ${isExcelRequest ? 'workbook' : 'document'} is created]`,
+            pendingDocumentLink: true
+          },
+          previewContent: emailPreview,
+          requiresInput: true,
+          inputKey: 'documentLink'
+        });
+      }
+      
+      // Store as action chain
+      if (confirmationActions.length > 1) {
+        console.log(`[Confirmation] Creating action chain with ${confirmationActions.length} actions`);
+        
+        const chainResult = confirmationStore.storeActionChain(
+          userId,
+          confirmationActions,
+          query,
+          conversationHistory,
+          conversationId
+        );
+        
+        if (chainResult) {
+          const firstAction = confirmationActions[0];
+          return {
+            results: {},
+            errors: {},
+            storedArtifacts: [],
+            confirmationRequest: {
+              requestId: chainResult.firstRequestId,
+              toolName: firstAction.toolName,
+              agentName: firstAction.agentName,
+              actionType: isExcelRequest ? 'create_spreadsheet' : 'create_document',
+              description: isExcelRequest ? 'Create a Microsoft Excel workbook' : 'Create a Microsoft Word document',
+              params: firstAction.params,
+              previewContent: firstAction.previewContent,
+              originalQuery: query,
+              chainInfo: {
+                chainId: chainResult.chainId,
+                currentStep: 1,
+                totalSteps: chainResult.totalActions
+              }
+            }
+          };
+        }
+      } else if (confirmationActions.length === 1) {
+        // Single action - just document/workbook creation without email
+        const action = confirmationActions[0];
+        const requestId = confirmationStore.storePendingAction(
+          userId,
+          action.toolName,
+          action.agentName,
+          action.params,
+          action.previewContent,
+          query,
+          conversationHistory,
+          conversationId
+        );
+        
+        return {
+          results: {},
+          errors: {},
+          storedArtifacts: [],
+          confirmationRequest: {
+            requestId: requestId,
+            toolName: action.toolName,
+            agentName: action.agentName,
+            actionType: isExcelRequest ? 'create_spreadsheet' : 'create_document',
+            description: isExcelRequest ? 'Create a Microsoft Excel workbook' : 'Create a Microsoft Word document',
+            params: action.params,
+            previewContent: action.previewContent,
+            originalQuery: query
+          }
+        };
+      }
+    }
+    
+    // Standard flow: Collect ALL confirmation-required actions from all agents
     const confirmationRequiredActions = [];
     const nonConfirmationAgents = [];
     
@@ -1626,6 +2024,59 @@ Instead, present the information as if you're directly reporting the results.`;
           extractParams: () => ({ criteria: 'pending', action: 'pending' }),
           isAsync: false
         }
+      ],
+      microsoft: [
+        {
+          // Match Outlook/Microsoft email sending
+          patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
+          keywords: ['outlook', 'microsoft', 'hotmail', 'email', 'mail', 'message'],
+          toolName: 'microsoft_sendEmail',
+          extractParams: (q, userId) => this.extractMicrosoftEmailParamsWithAI(q, userId),
+          isAsync: true,
+          excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox']
+        },
+        {
+          patterns: ['reply', 'respond'],
+          keywords: ['outlook', 'microsoft', 'email', 'mail'],
+          toolName: 'microsoft_replyToEmail',
+          extractParams: () => ({ messageId: 'pending', body: 'pending' }),
+          isAsync: false
+        },
+        {
+          patterns: ['forward'],
+          keywords: ['outlook', 'microsoft', 'email', 'mail'],
+          toolName: 'microsoft_forwardEmail',
+          extractParams: () => ({ messageId: 'pending', to: 'pending' }),
+          isAsync: false
+        },
+        {
+          patterns: ['create', 'schedule', 'add', 'book', 'set up'],
+          keywords: ['microsoft calendar', 'outlook calendar', 'teams meeting', 'event'],
+          toolName: 'microsoft_createCalendarEvent',
+          extractParams: (q) => this.extractMicrosoftCalendarEventParams(q),
+          isAsync: false
+        },
+        {
+          patterns: ['list', 'show', 'get', 'check'],
+          keywords: ['onedrive', 'files', 'documents'],
+          toolName: 'microsoft_listFiles',
+          extractParams: () => ({}),
+          isAsync: false
+        },
+        {
+          patterns: ['upload'],
+          keywords: ['onedrive', 'file'],
+          toolName: 'microsoft_uploadFile',
+          extractParams: () => ({ fileName: 'pending', content: 'pending' }),
+          isAsync: false
+        },
+        {
+          patterns: ['create', 'make', 'new'],
+          keywords: ['word', 'document', 'doc'],
+          toolName: 'microsoft_createWordDocument',
+          extractParams: (q) => this.extractWordDocumentParams(q),
+          isAsync: false
+        }
       ]
     };
 
@@ -1842,6 +2293,25 @@ Instead, present the information as if you're directly reporting the results.`;
                        query.match(/document\s+(?:about|for|on)\s+([^,\.\n]+)/i);
     if (titleMatch) {
       params.title = titleMatch[1].trim();
+    }
+    return params;
+  }
+
+  /**
+   * Extract Microsoft Word document parameters from query
+   */
+  extractWordDocumentParams(query) {
+    const params = { fileName: 'Untitled Document' };
+    const titleMatch = query.match(/["']([^"']+)["']/) ||
+                       query.match(/called\s+([^,\.\n]+)/) ||
+                       query.match(/titled\s+([^,\.\n]+)/) ||
+                       query.match(/document\s+(?:about|for|on)\s+([^,\.\n]+)/i);
+    if (titleMatch) {
+      params.fileName = titleMatch[1].trim();
+    }
+    // Check if content should be added
+    if (query.toLowerCase().includes('add') && query.toLowerCase().includes('content')) {
+      params.content = `Generate content about ${params.fileName}`;
     }
     return params;
   }
@@ -2319,6 +2789,178 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
   }
 
   /**
+   * Extract Microsoft Outlook email parameters with AI-generated content
+   * Similar to extractEmailParamsWithAI but uses Microsoft profile data
+   */
+  async extractMicrosoftEmailParamsWithAI(query, userId) {
+    // First extract basic params using the existing method
+    const basicParams = this.extractEmailParams(query);
+    
+    try {
+      console.log(`[MainAgent] Generating AI email content for Microsoft Outlook...`);
+      
+      // Try to get user's display name from Microsoft tokens
+      let userName = '';
+      try {
+        const supabase = require('../supabase/supabaseConnect');
+        
+        // First try: Get from microsoft_tokens (has name from Microsoft profile)
+        const { data: microsoftData, error: microsoftError } = await supabase
+          .from('microsoft_tokens')
+          .select('name, email')
+          .eq('user_id', userId)
+          .single();
+        
+        if (!microsoftError && microsoftData?.name) {
+          userName = microsoftData.name;
+          console.log(`[MainAgent] Got user display name from microsoft_tokens: "${userName}"`);
+        }
+        
+        // Second try: Get from Supabase Auth profile
+        if (!userName) {
+          const { data: userData, error: userError } = await supabase.auth.admin.getUserById(userId);
+          
+          if (!userError && userData?.user) {
+            userName = userData.user.user_metadata?.full_name || 
+                       userData.user.user_metadata?.name ||
+                       userData.user.user_metadata?.display_name || '';
+            if (userName) {
+              console.log(`[MainAgent] Got user display name from auth: "${userName}"`);
+            }
+          }
+        }
+        
+        if (!userName) {
+          console.log(`[MainAgent] No display name found for Microsoft user`);
+        }
+      } catch (dbError) {
+        console.log(`[MainAgent] Could not get Microsoft user name: ${dbError.message}`);
+      }
+      
+      // Generate the AI email body
+      const generationResponse = await this.openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `You are an email writing assistant. Generate a complete, well-formatted email with:
+1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
+2. The main message body (friendly, professional tone as appropriate)
+3. A proper sign-off with the sender's name
+
+Only output the email body text. Do not include "Subject:" line.
+Make the email feel natural and personal, not robotic.
+${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
+          },
+          {
+            role: "user",
+            content: `Write an email for:
+To: ${basicParams.to}
+Subject: ${basicParams.subject}
+Context/Intent from user: "${query}"
+
+Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') || query.toLowerCase().includes('party') || query.toLowerCase().includes('birthday') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`
+          }
+        ],
+        max_tokens: 600,
+        temperature: 0.7
+      });
+      
+      const aiGeneratedBody = generationResponse.choices[0].message.content;
+      
+      // Generate a better subject if it's too generic
+      let finalSubject = basicParams.subject;
+      if (basicParams.subject === 'New Message' || basicParams.subject === 'Meeting') {
+        const subjectResponse = await this.openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: "Generate a short, catchy email subject line (max 60 chars). Only output the subject text, nothing else. Do not use quotes."
+            },
+            {
+              role: "user",
+              content: `Generate a subject line for this email context: "${query}"`
+            }
+          ],
+          max_tokens: 50,
+          temperature: 0.7
+        });
+        finalSubject = subjectResponse.choices[0].message.content.replace(/^["']|["']$/g, '').trim();
+      }
+      
+      console.log(`[MainAgent] AI generated Microsoft email subject: ${finalSubject}`);
+      console.log(`[MainAgent] AI generated Microsoft email body preview: ${aiGeneratedBody.substring(0, 100)}...`);
+      
+      return {
+        to: basicParams.to,
+        subject: finalSubject,
+        body: aiGeneratedBody,
+        isAIGenerated: true,  // Flag to prevent re-generation in microsoftAgent
+        userName: userName || null
+      };
+      
+    } catch (error) {
+      console.error(`[MainAgent] Error generating AI Microsoft email content:`, error);
+      // Fall back to basic params if AI generation fails
+      return basicParams;
+    }
+  }
+
+  /**
+   * Extract Microsoft Calendar event parameters from query
+   */
+  extractMicrosoftCalendarEventParams(query) {
+    const now = new Date();
+    let startDate = new Date();
+    let endDate = new Date();
+    
+    const lowerQuery = query.toLowerCase();
+    
+    // Parse date
+    if (lowerQuery.includes('tomorrow')) {
+      startDate.setDate(startDate.getDate() + 1);
+    } else if (lowerQuery.includes('today')) {
+      // Keep current date
+    }
+    
+    // Parse time
+    const timeMatch = query.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+    if (timeMatch) {
+      let hours = parseInt(timeMatch[1]);
+      const minutes = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+      const ampm = timeMatch[3]?.toLowerCase();
+      
+      if (ampm === 'pm' && hours < 12) hours += 12;
+      if (ampm === 'am' && hours === 12) hours = 0;
+      
+      startDate.setHours(hours, minutes, 0, 0);
+      endDate = new Date(startDate);
+      endDate.setHours(endDate.getHours() + 1);
+    } else {
+      startDate.setHours(10, 0, 0, 0);
+      endDate.setHours(11, 0, 0, 0);
+    }
+    
+    // Extract title
+    let subject = 'Meeting';
+    const titleMatch = query.match(/(?:titled?|called?|named?|about|for)\s+["']?([^"']+)["']?/i);
+    if (titleMatch) {
+      subject = titleMatch[1].trim();
+    }
+    
+    // Check for Teams meeting
+    const isOnlineMeeting = lowerQuery.includes('teams') || lowerQuery.includes('video') || lowerQuery.includes('online');
+    
+    return {
+      subject: subject,
+      start: startDate.toISOString(),
+      end: endDate.toISOString(),
+      isOnlineMeeting: isOnlineMeeting
+    };
+  }
+
+  /**
    * Stream response after a confirmed action is executed
    * This provides a smooth word-by-word streaming experience like ChatGPT
    * Now includes context about next actions in chain
@@ -2342,27 +2984,43 @@ Do NOT say "let me know if you need anything else" - there's still more to do.`;
       let resultString;
       try {
         // Extract only the relevant parts to avoid circular references
+        const rawResult = result?.raw_results?.[0] || {};
         const safeResult = {
           success: result?.success,
           response: result?.response,
           message: result?.message,
           // For forms
-          formId: result?.raw_results?.[0]?.formId || result?.formId,
-          formTitle: result?.raw_results?.[0]?.form?.info?.title || result?.form?.info?.title,
-          formUrl: result?.raw_results?.[0]?.formId ? 
-            `https://docs.google.com/forms/d/${result.raw_results[0].formId}/viewform` : null,
-          // For emails
-          emailSent: result?.raw_results?.[0]?.success && toolName === 'sendEmail',
-          messageId: result?.raw_results?.[0]?.messageId,
-          // For docs
-          documentId: result?.raw_results?.[0]?.documentId || result?.documentId,
-          documentUrl: result?.raw_results?.[0]?.documentId ? 
-            `https://docs.google.com/document/d/${result.raw_results[0].documentId}/edit` : null,
+          formId: rawResult.formId || result?.formId,
+          formTitle: rawResult.form?.info?.title || result?.form?.info?.title,
+          formUrl: rawResult.formId ? 
+            `https://docs.google.com/forms/d/${rawResult.formId}/viewform` : null,
+          // For emails (Google)
+          emailSent: rawResult.success && (toolName === 'sendEmail' || toolName === 'microsoft_sendEmail'),
+          messageId: rawResult.messageId,
+          // For Google docs
+          documentId: rawResult.documentId || result?.documentId,
+          documentUrl: rawResult.documentId && agentName !== 'microsoft' ? 
+            `https://docs.google.com/document/d/${rawResult.documentId}/edit` : null,
           // For events
-          eventId: result?.raw_results?.[0]?.eventId || result?.eventId,
+          eventId: rawResult.eventId || result?.eventId,
+          // Microsoft-specific fields
+          msDocumentId: rawResult.documentId || rawResult.id || rawResult.itemId,
+          msDocumentName: rawResult.name,
+          msWebUrl: rawResult.webUrl,
+          msWorkbookId: rawResult.workbookId,
+          // Excel sample data
+          sampleDataAdded: rawResult.sampleDataAdded || result?.sampleDataAdded,
+          sampleDataRows: rawResult.sampleDataRows || result?.sampleDataRows,
           // Generic error
           error: result?.error
         };
+        
+        // Build a more informative result string for Microsoft
+        if (agentName === 'microsoft' && rawResult.webUrl) {
+          safeResult.microsoftLink = rawResult.webUrl;
+          safeResult.microsoftFileName = rawResult.name;
+        }
+        
         resultString = JSON.stringify(safeResult, null, 2);
       } catch (e) {
         console.error('[MainAgent] Error stringifying result:', e.message);
@@ -2379,17 +3037,21 @@ ${resultString}
 ${chainContext}
 
 Please provide a natural, conversational confirmation response that:
-1. Confirms the action was completed successfully
+1. Confirms the action was completed SUCCESSFULLY (if success=true, it definitely worked - do NOT express uncertainty)
 2. Summarizes what was accomplished with specific details
-3. Includes any relevant links or references from the result
+3. Includes any relevant links or references from the result (use msWebUrl or microsoftLink for Microsoft files)
 4. Is friendly and helpful in tone
 5. If there were any issues, mention them helpfully
 ${nextConfirmation ? '6. Briefly mention that you will now proceed with the next action' : ''}
 
+IMPORTANT: If the result shows success=true, the action DID complete successfully. Do not say things like "it seems like" or "wasn't included" - be confident about what was accomplished.
+If emailSent=true, the email WAS sent successfully with all the content that was specified.
+If msWebUrl or microsoftLink is present, that link WAS included in any emails that referenced it.
+
 Format the response clearly. If an event was created, include the event details like title, date, time.
 If a document was created, include the title and link if available.
 If a form was created, include the form title and a link to view/edit it.
-If an email was sent, confirm it was sent successfully.`;
+If an email was sent, confirm it was sent successfully with the content that was specified.`;
 
       const messages = [
         { role: 'system', content: this.systemPrompt },

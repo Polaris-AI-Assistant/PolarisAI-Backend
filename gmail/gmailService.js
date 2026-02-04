@@ -204,6 +204,15 @@ async function sendEmail(auth, to, subject, body, options = {}) {
       replyTo
     } = options;
 
+    // Convert newlines to HTML line breaks if sending as HTML
+    let emailBody = body;
+    if (isHtml && body) {
+      // Convert \n to <br> for HTML emails, but preserve existing HTML
+      if (!body.includes('<br>') && !body.includes('<p>') && !body.includes('<div>')) {
+        emailBody = body.replace(/\n/g, '<br>');
+      }
+    }
+
     // Get the authenticated user's email if 'from' is not provided
     let fromAddress = from;
     if (!fromAddress) {
@@ -246,8 +255,8 @@ async function sendEmail(auth, to, subject, body, options = {}) {
     // Add empty line to separate headers from body (RFC 2822)
     messageParts.push('');
     
-    // Add body
-    messageParts.push(body);
+    // Add body (use emailBody which has HTML formatting if needed)
+    messageParts.push(emailBody);
     
     // Join all parts with CRLF (as per RFC 2822)
     const rawMessage = messageParts.join('\r\n');

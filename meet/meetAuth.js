@@ -216,12 +216,13 @@ router.get('/auth/meet/callback', async (req, res) => {
       console.log("Meet tokens inserted successfully");
     }
 
-    // Redirect to success page
-    res.redirect(`${frontendUrl}/meet?connected=true`);
+    // Redirect to success callback page
+    const encodedEmail = encodeURIComponent(userEmail);
+    res.redirect(`${frontendUrl}/auth/meet/callback?success=true&email=${encodedEmail}`);
 
   } catch (err) {
     console.error("Error in Meet OAuth callback:", err);
-    res.redirect(`${frontendUrl}/meet?error=auth_failed`);
+    res.redirect(`${frontendUrl}/auth/meet/callback?error=auth_failed&error_description=${encodeURIComponent(err.message)}`);
   }
 });
 

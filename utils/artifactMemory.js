@@ -44,7 +44,14 @@ const ARTIFACT_TYPES = {
     PR: 'pull_request',
     LABEL: 'label',
     FILTER: 'filter',
-    FLIGHT_SEARCH: 'flight_search'
+    FLIGHT_SEARCH: 'flight_search',
+    // Microsoft-specific types
+    OUTLOOK_EMAIL: 'outlook_email',
+    OUTLOOK_DRAFT: 'outlook_draft',
+    MS_CALENDAR_EVENT: 'ms_calendar_event',
+    ONEDRIVE_FILE: 'onedrive_file',
+    ONEDRIVE_FOLDER: 'onedrive_folder',
+    EXCEL_WORKBOOK: 'excel_workbook'
 };
 
 // Type display names for human-readable output
@@ -62,7 +69,14 @@ const TYPE_DISPLAY_NAMES = {
     pull_request: 'Pull Request',
     label: 'Label',
     filter: 'Filter',
-    flight_search: 'Flight Search'
+    flight_search: 'Flight Search',
+    // Microsoft-specific display names
+    outlook_email: 'Outlook Email',
+    outlook_draft: 'Outlook Draft',
+    ms_calendar_event: 'Microsoft Calendar Event',
+    onedrive_file: 'OneDrive File',
+    onedrive_folder: 'OneDrive Folder',
+    excel_workbook: 'Excel Workbook'
 };
 
 /**
@@ -156,6 +170,9 @@ const extractAndStoreArtifact = async (conversationId, agentType, toolName, resu
             break;
         case 'flights':
             artifact = extractFlightsArtifact(toolName, result);
+            break;
+        case 'microsoft':
+            artifact = extractMicrosoftArtifact(toolName, result);
             break;
         default:
             console.log(`[ArtifactMemory]   ⚠️ Unknown agent type: ${agentType}`);
@@ -636,6 +653,232 @@ const extractFlightsArtifact = (toolName, result) => {
 };
 
 /**
+ * Extract artifact from Microsoft tool result
+ * Handles Outlook email, Calendar, OneDrive, and Excel operations
+ */
+const extractMicrosoftArtifact = (toolName, result) => {
+    console.log(`[ArtifactMemory] 🔍 extractMicrosoftArtifact called for tool: ${toolName}`);
+    console.log(`[ArtifactMemory]   Result success: ${result?.success}`);
+    
+    if (!result || !result.success) {
+        console.log(`[ArtifactMemory]   ❌ Result is null or not successful`);
+        return null;
+    }
+
+    // For Microsoft, try to get data directly from raw_results first
+    // raw_results contains the actual tool output with documentId, webUrl, etc.
+    let toolResult = null;
+    
+    if (result.raw_results && Array.isArray(result.raw_results) && result.raw_results.length > 0) {
+        // Find the first successful result
+        for (const rawResult of result.raw_results) {
+            if (rawResult.success) {
+                toolResult = rawResult;
+                console.log(`[ArtifactMemory]   📦 Using raw_results data: ${Object.keys(rawResult).join(', ')}`);
+                break;
+            }
+        }
+    }
+    
+    // Fallback to unwrap if no raw_results
+    if (!toolResult) {
+        toolResult = unwrapAgentResult(result, 'messageId', 'id', 'eventId', 'itemId', 'workbookId', 'documentId');
+    }
+    
+    // Handle OpenAI tool result format where content is a JSON string
+    if (toolResult.content && typeof toolResult.content === 'string') {
+        try {
+            const parsed = JSON.parse(toolResult.content);
+            toolResult = parsed;
+            console.log(`[ArtifactMemory]   📦 Parsed content from OpenAI tool result format`);
+        } catch (e) {
+            // Not JSON, use as-is
+        }
+    }
+    
+    console.log(`[ArtifactMemory]   After unwrap, toolResult keys: ${Object.keys(toolResult).join(', ')}`);
+
+    switch (toolName) {
+        // ========== OUTLOOK EMAIL ==========
+        case 'microsoft_sendEmail':
+            // Microsoft sendEmail returns { success: true, message: 'Email sent successfully' }
+            // but we can store details from params that were passed
+            if (toolResult.success) {
+                return {
+                    id: toolResult.messageId || `ms_email_${Date.now()}`,
+                    type: ARTIFACT_TYPES.OUTLOOK_EMAIL,
+                    title: toolResult.subject || 'Sent via Outlook',
+                    data: {
+                        to: toolResult.to,
+                        subject: toolResult.subject,
+                        sentAt: new Date().toISOString()
+                    }
+                };
+            }
+            break;
+
+        case 'microsoft_replyToEmail':
+            if (toolResult.success) {
+                return {
+                    id: toolResult.messageId || `ms_reply_${Date.now()}`,
+                    type: ARTIFACT_TYPES.OUTLOOK_EMAIL,
+                    title: 'Reply via Outlook',
+                    data: {
+                        originalMessageId: toolResult.messageId,
+                        repliedAt: new Date().toISOString()
+                    }
+                };
+            }
+            break;
+
+        case 'microsoft_forwardEmail':
+            if (toolResult.success) {
+                return {
+                    id: toolResult.messageId || `ms_forward_${Date.now()}`,
+                    type: ARTIFACT_TYPES.OUTLOOK_EMAIL,
+                    title: 'Forwarded via Outlook',
+                    data: {
+                        originalMessageId: toolResult.messageId,
+                        forwardedAt: new Date().toISOString()
+                    }
+                };
+            }
+            break;
+
+        // ========== MICROSOFT CALENDAR ==========
+        case 'microsoft_createCalendarEvent':
+            if (toolResult.id || toolResult.eventId) {
+                return {
+                    id: toolResult.id || toolResult.eventId,
+                    type: ARTIFACT_TYPES.MS_CALENDAR_EVENT,
+                    title: toolResult.subject || 'Microsoft Calendar Event',
+                    data: {
+                        webLink: toolResult.webLink,
+                        start: toolResult.start?.dateTime,
+                        end: toolResult.end?.dateTime,
+                        location: toolResult.location?.displayName,
+                        onlineMeetingUrl: toolResult.onlineMeetingUrl,
+                        isOnlineMeeting: toolResult.isOnlineMeeting
+                    }
+                };
+            }
+            break;
+
+        case 'microsoft_updateCalendarEvent':
+            if (toolResult.id || toolResult.eventId) {
+                return {
+                    id: toolResult.id || toolResult.eventId,
+                    type: ARTIFACT_TYPES.MS_CALENDAR_EVENT,
+                    title: toolResult.subject || 'Updated Microsoft Calendar Event',
+                    data: {
+                        webLink: toolResult.webLink,
+                        modified: true
+                    }
+                };
+            }
+            break;
+
+        // ========== ONEDRIVE ==========
+        case 'microsoft_uploadFile':
+            if (toolResult.id || toolResult.itemId) {
+                return {
+                    id: toolResult.id || toolResult.itemId,
+                    type: ARTIFACT_TYPES.ONEDRIVE_FILE,
+                    title: toolResult.name || 'OneDrive File',
+                    data: {
+                        webUrl: toolResult.webUrl,
+                        size: toolResult.size,
+                        mimeType: toolResult.file?.mimeType
+                    }
+                };
+            }
+            break;
+
+        case 'microsoft_createFolder':
+            if (toolResult.id || toolResult.itemId) {
+                return {
+                    id: toolResult.id || toolResult.itemId,
+                    type: ARTIFACT_TYPES.ONEDRIVE_FOLDER,
+                    title: toolResult.name || 'OneDrive Folder',
+                    data: {
+                        webUrl: toolResult.webUrl
+                    }
+                };
+            }
+            break;
+
+        // ========== WORD DOCUMENTS ==========
+        case 'microsoft_createWordDocument':
+            // Handle Word document creation
+            // raw_results uses 'documentId', direct results might use 'id' or 'itemId'
+            if (toolResult.documentId || toolResult.id || toolResult.itemId) {
+                return {
+                    id: toolResult.documentId || toolResult.id || toolResult.itemId,
+                    type: 'word_document',
+                    title: toolResult.name || 'Word Document',
+                    data: {
+                        webUrl: toolResult.webUrl,
+                        createdAt: toolResult.createdDateTime || new Date().toISOString(),
+                        size: toolResult.size
+                    }
+                };
+            }
+            break;
+
+        case 'microsoft_addContentToWordDocument':
+            // Handle content addition - use the document info returned
+            if (toolResult.documentId || toolResult.id || toolResult.itemId) {
+                return {
+                    id: toolResult.documentId || toolResult.id || toolResult.itemId,
+                    type: 'word_document',
+                    title: toolResult.name || 'Word Document',
+                    data: {
+                        webUrl: toolResult.webUrl,
+                        contentAdded: true,
+                        modifiedAt: toolResult.lastModifiedDateTime || new Date().toISOString()
+                    }
+                };
+            }
+            break;
+
+        // ========== EXCEL ==========
+        case 'microsoft_createExcelWorkbook':
+            // Handle Excel workbook creation
+            if (toolResult.documentId || toolResult.workbookId || toolResult.id || toolResult.itemId) {
+                return {
+                    id: toolResult.documentId || toolResult.workbookId || toolResult.id || toolResult.itemId,
+                    type: ARTIFACT_TYPES.EXCEL_WORKBOOK,
+                    title: toolResult.name || 'Excel Workbook',
+                    data: {
+                        webUrl: toolResult.webUrl,
+                        createdAt: toolResult.createdDateTime || new Date().toISOString(),
+                        size: toolResult.size
+                    }
+                };
+            }
+            break;
+
+        case 'microsoft_updateExcel':
+            if (toolResult.workbookId) {
+                return {
+                    id: toolResult.workbookId,
+                    type: ARTIFACT_TYPES.EXCEL_WORKBOOK,
+                    title: toolResult.worksheetName || 'Excel Workbook',
+                    data: {
+                        worksheetName: toolResult.worksheetName,
+                        range: toolResult.range,
+                        modified: true
+                    }
+                };
+            }
+            break;
+    }
+
+    console.log(`[ArtifactMemory]   ❌ No artifact could be extracted for Microsoft tool: ${toolName}`);
+    return null;
+};
+
+/**
  * Format artifacts for inclusion in AI system prompt
  * 
  * @param {string} conversationId - Unique conversation/chat ID
@@ -682,13 +925,30 @@ const formatArtifactsForPrompt = async (conversationId) => {
             }
         }
         
+        // Add extra context for Microsoft artifacts
+        if (artifact.type === 'outlook_email' && artifact.data) {
+            if (artifact.data.to) line += `\n  To: ${artifact.data.to}`;
+            if (artifact.data.subject) line += `\n  Subject: ${artifact.data.subject}`;
+        }
+        
+        if (artifact.type === 'ms_calendar_event' && artifact.data) {
+            if (artifact.data.start) line += `\n  Start: ${artifact.data.start}`;
+            if (artifact.data.location) line += `\n  Location: ${artifact.data.location}`;
+            if (artifact.data.onlineMeetingUrl) line += `\n  Teams Meeting: ${artifact.data.onlineMeetingUrl}`;
+        }
+        
+        if ((artifact.type === 'onedrive_file' || artifact.type === 'onedrive_folder') && artifact.data) {
+            if (artifact.data.webUrl) line += `\n  URL: ${artifact.data.webUrl}`;
+        }
+        
         lines.push(line);
         console.log(`[ArtifactMemory]   ${index + 1}. ${displayType}: ${artifact.title}`);
     });
 
     lines.push('');
-    lines.push('When user refers to "it", "that", "the previous one", "the form/doc/sheet we created", "that flight", "the IndiGo flight", etc., resolve to the appropriate artifact above.');
+    lines.push('When user refers to "it", "that", "the previous one", "the form/doc/sheet we created", "that flight", "the IndiGo flight", "the outlook email", "the onedrive file", etc., resolve to the appropriate artifact above.');
     lines.push('For flights: If user says "book flight X" or "I want the IndiGo flight", use the flight details from the stored flight search artifact above.');
+    lines.push('For Microsoft: Resolve references to "the email I sent via outlook", "the teams meeting", "the file on onedrive" to the appropriate Microsoft artifact.');
     
     return lines.join('\n');
 };
@@ -711,7 +971,14 @@ const getIdFieldName = (type) => {
         pull_request: 'prId',
         label: 'labelId',
         filter: 'filterId',
-        flight_search: 'searchId'
+        flight_search: 'searchId',
+        // Microsoft-specific ID fields
+        outlook_email: 'messageId',
+        outlook_draft: 'draftId',
+        ms_calendar_event: 'eventId',
+        onedrive_file: 'itemId',
+        onedrive_folder: 'folderId',
+        excel_workbook: 'workbookId'
     };
     return idFields[type] || 'id';
 };
@@ -735,16 +1002,26 @@ const resolveArtifactReference = async (conversationId, reference) => {
         'document': ARTIFACT_TYPES.DOC,
         'sheet': ARTIFACT_TYPES.SHEET,
         'spreadsheet': ARTIFACT_TYPES.SHEET,
-        'excel': ARTIFACT_TYPES.SHEET,
+        'excel': ARTIFACT_TYPES.EXCEL_WORKBOOK,
+        'workbook': ARTIFACT_TYPES.EXCEL_WORKBOOK,
         'email': ARTIFACT_TYPES.EMAIL,
         'mail': ARTIFACT_TYPES.EMAIL,
         'message': ARTIFACT_TYPES.EMAIL,
+        'outlook email': ARTIFACT_TYPES.OUTLOOK_EMAIL,
+        'outlook mail': ARTIFACT_TYPES.OUTLOOK_EMAIL,
+        'microsoft email': ARTIFACT_TYPES.OUTLOOK_EMAIL,
         'draft': ARTIFACT_TYPES.DRAFT,
         'event': ARTIFACT_TYPES.EVENT,
         'meeting': ARTIFACT_TYPES.EVENT,
         'appointment': ARTIFACT_TYPES.EVENT,
+        'outlook event': ARTIFACT_TYPES.MS_CALENDAR_EVENT,
+        'microsoft calendar': ARTIFACT_TYPES.MS_CALENDAR_EVENT,
+        'teams meeting': ARTIFACT_TYPES.MS_CALENDAR_EVENT,
         'meet': ARTIFACT_TYPES.MEET,
         'video call': ARTIFACT_TYPES.MEET,
+        'onedrive': ARTIFACT_TYPES.ONEDRIVE_FILE,
+        'onedrive file': ARTIFACT_TYPES.ONEDRIVE_FILE,
+        'onedrive folder': ARTIFACT_TYPES.ONEDRIVE_FOLDER,
         'repo': ARTIFACT_TYPES.REPO,
         'repository': ARTIFACT_TYPES.REPO,
         'issue': ARTIFACT_TYPES.ISSUE,
