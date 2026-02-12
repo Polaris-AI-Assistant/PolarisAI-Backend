@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const chatData = require('./chatData');
+const { emitChatTitleUpdate } = require('../socket/socketManager');
 
 // Middleware to verify user authentication
 const verifyAuth = (req, res, next) => {
@@ -171,6 +172,9 @@ router.put('/sessions/:chatId/rename', verifyAuth, async (req, res) => {
     }
     
     await chatData.renameChatSession(chatId, req.userId, title);
+
+    // Emit chat title update via Socket.io for real-time sidebar sync
+    emitChatTitleUpdate(chatId, title);
     
     res.json({
       success: true,
@@ -203,6 +207,93 @@ router.delete('/sessions', verifyAuth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to clear chat sessions',
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/chat/sessions/:chatId/messages/:messageId/timeline
+ * Save timeline events for a message
+ */
+router.post('/sessions/:chatId/messages/:messageId/timeline', verifyAuth, async (req, res) => {
+  try {
+    const { chatId, messageId } = req.params;
+    const { events } = req.body;
+    
+    if (!events || !Array.isArray(events)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Events array is required',
+      });
+    }
+    
+    await chatData.saveTimelineEvents(messageId, chatId, req.userId, events);
+    
+    res.json({
+      success: true,
+      message: 'Timeline events saved successfully',
+    });
+  } catch (error) {
+    console.error('Error in POST /sessions/:chatId/messages/:messageId/timeline:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to save timeline events',
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/chat/sessions/:chatId/messages/:messageId/timeline
+ * Get timeline events for a message
+ */
+router.get('/sessions/:chatId/messages/:messageId/timeline', verifyAuth, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    
+    const events = await chatData.getTimelineEventsForMessage(messageId);
+    
+    res.json({
+      success: true,
+      events,
+    });
+  } catch (error) {
+    console.error('Error in GET /sessions/:chatId/messages/:messageId/timeline:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch timeline events',
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/chat/timeline/batch
+ * Get timeline events for multiple messages at once
+ */
+router.post('/timeline/batch', verifyAuth, async (req, res) => {
+  try {
+    const { messageIds } = req.body;
+    
+    if (!messageIds || !Array.isArray(messageIds)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Message IDs array is required',
+      });
+    }
+    
+    const eventsByMessage = await chatData.getTimelineEventsForMessages(messageIds);
+    
+    res.json({
+      success: true,
+      eventsByMessage,
+    });
+  } catch (error) {
+    console.error('Error in POST /timeline/batch:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch timeline events',
       error: error.message,
     });
   }

@@ -77,6 +77,27 @@ function defineTools() {
     {
       type: 'function',
       function: {
+        name: 'appendFormattedText',
+        description: 'Append formatted content to a document with proper headings, bullet points, and styling. Use markdown syntax: # for H1, ## for H2, ### for H3, - for bullets, 1. for numbered lists, **text** for bold. This is the PREFERRED method for adding content.',
+        parameters: {
+          type: 'object',
+          properties: {
+            documentId: {
+              type: 'string',
+              description: 'The ID of the document'
+            },
+            content: {
+              type: 'string',
+              description: 'Markdown-formatted content. Use # for headings, - for bullets, **text** for bold'
+            }
+          },
+          required: ['documentId', 'content']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'insertParagraphBreak',
         description: 'Insert a paragraph break (new line) at a specific position',
         parameters: {
@@ -295,6 +316,9 @@ function createFunctionMap(userId) {
     appendText: async (args) => {
       return await docsService.appendText(userId, args.documentId, args.text);
     },
+    appendFormattedText: async (args) => {
+      return await docsService.appendFormattedText(userId, args.documentId, args.content);
+    },
     insertParagraphBreak: async (args) => {
       return await docsService.insertParagraphBreak(userId, args.documentId, args.index);
     },
@@ -369,59 +393,77 @@ async function processQuery(query, userId, options = {}) {
 **Your Capabilities:**
 1. **Create Documents** - Make new docs with specific titles
 2. **Write & Edit** - Insert, append, or replace text in documents
-3. **Format Text** - Apply bold, italic, underline, and colors
+3. **Format Text** - Apply professional formatting with headings, bullets, bold
 4. **Read Content** - Extract and summarize document content
 5. **Search** - Find specific text within documents
 6. **Organize** - List, share, and manage documents
-7. **Memory Storage** - Create memory logs for cross-app context
+
+**CRITICAL - USE appendFormattedText FOR ALL CONTENT:**
+When adding content to documents, ALWAYS use \`appendFormattedText\` (NOT appendText).
+This tool automatically converts markdown to proper Google Docs formatting.
+
+**MARKDOWN FORMATTING RULES:**
+Use these markdown patterns in the \`content\` parameter of appendFormattedText:
+
+1. **Headings:**
+   - \`# HEADING\` → Heading 1 (main sections)
+   - \`## Heading\` → Heading 2 (subsections)
+   - \`### Heading\` → Heading 3 (sub-subsections)
+
+2. **Bullet Points:**
+   - \`- Point one\` → Bullet point
+   - \`- Point two\` → Bullet point
+
+3. **Numbered Lists:**
+   - \`1. First item\` → Numbered list
+   - \`2. Second item\` → Numbered list
+
+4. **Bold Text:**
+   - \`**important text**\` → Bold formatting
+
+5. **Paragraphs:**
+   - Use blank lines between paragraphs
+
+**CONTENT GENERATION WORKFLOW:**
+When user says "create a document about X" or "add content about X":
+
+1. Call createDocument with appropriate title
+2. Generate comprehensive, well-structured content using YOUR KNOWLEDGE
+3. Call appendFormattedText with markdown-formatted content
+
+**EXAMPLE - Creating a document about Indian Government:**
+
+Step 1: createDocument({ title: "Indian Government Structure" })
+
+Step 2: appendFormattedText({ 
+  documentId: "<id from step 1>",
+  content: "# INTRODUCTION\\n\\nThe Indian government operates as a federal parliamentary democratic republic, which means it is based on a system of elected representatives and an elected head of state.\\n\\n## KEY COMPONENTS\\n\\nThe structure of the Indian government is defined by the Constitution of India.\\n\\n### Three Branches:\\n\\n- **Executive Branch** - Led by the President of India\\n- **Legislative Branch** - Parliament of India (Lok Sabha and Rajya Sabha)\\n- **Judicial Branch** - Supreme Court and High Courts\\n\\n## EXECUTIVE BRANCH\\n\\nThe President of India serves as the ceremonial head of state.\\n\\n### Roles and Responsibilities:\\n\\n1. Appoints the Prime Minister\\n2. Commander-in-chief of Armed Forces\\n3. Grants pardons and reprieves\\n\\n## LEGISLATIVE BRANCH\\n\\nParliament is responsible for making laws.\\n\\n### Structure:\\n\\n- **Lok Sabha** - Lower house, directly elected\\n- **Rajya Sabha** - Upper house, elected by state legislatures\\n\\n## CONCLUSION\\n\\nIndia's democratic system ensures representation and separation of powers."
+})
+
+**UPDATING EXISTING DOCUMENTS:**
+When user says "update first document" or "add to the document":
+- Use appendFormattedText on the specified document
+- NEVER create a new document when updating!
+
+Example: User listed 2 docs, then says "update first with fundamental rights"
+→ Call appendFormattedText(documentId1, "# FUNDAMENTAL RIGHTS\\n\\n...")
 
 **Best Practices:**
-- When creating memory documents, use clear naming like "Memory Log - [Date]"
-- For important information, use bold formatting
-- Structure content with proper paragraphs
-- Always confirm actions before deleting documents
-- When searching, provide context around matches
-- Use appendText for adding to existing documents
-- Read documents first before making edits
-
-**Response Format:**
-- Be conversational and helpful
-- Explain what you're doing and why
-- Provide document IDs and URLs when creating/modifying docs
-- Summarize long content concisely
-- Ask for clarification when needed
-
-**IMPORTANT: When listing documents, format them EXACTLY like this:**
-1. **Document Title**
-   - Created by: Owner Name
-   - Created on: Date
-   - Modified on: Date
-   - [Open Document](URL)
-
-**Example document list response:**
-"Here are your 5 most recent documents:
-
-1. **Project Plan**
-   - Created by: You (User Name)
-   - Created on: October 29, 2025
-   - Modified on: October 29, 2025
-   - [Open Document](https://docs.google.com/document/d/...)
-
-2. **Meeting Notes**
-   - Created by: You (User Name)
-   - Created on: October 28, 2025
-   - Modified on: October 28, 2025
-   - [Open Document](https://docs.google.com/document/d/...)"
+- ALWAYS use appendFormattedText for content (never plain appendText)
+- Use # for main headings, ## for subsections, ### for sub-subsections
+- Use - for bullet points
+- Use **text** for bold emphasis
+- Add blank lines between sections
+- Generate comprehensive, educational content
 
 **Examples:**
-- "Create a document called 'Meeting Notes'" → Use createDocument
-- "Add this to my doc: [text]" → Use appendText
-- "Find 'project deadline' in document X" → Use searchInDocument
-- "Make lines 10-20 bold" → Use updateTextStyle
-- "What's in document Y?" → Use readDocument
+- "Create a document called 'Notes'" → createDocument only
+- "Create a document about X" → createDocument + appendFormattedText
+- "Update first document with Y" → appendFormattedText to first doc
+- "Add this to my doc: [text]" → appendFormattedText
 
 Current date: ${new Date().toLocaleDateString()}
-Be proactive, accurate, and user-friendly!`
+When content is requested, ALWAYS generate PROFESSIONALLY FORMATTED content using appendFormattedText with proper markdown.`
       },
       {
         role: 'user',
@@ -495,6 +537,7 @@ Be proactive, accurate, and user-friendly!`
       success: true,
       response: assistantMessage.content,
       toolCalls: toolCalls,
+      tools_used: toolCalls.map(tc => tc.function),  // Include tool names for artifact extraction
       raw_results: toolCalls.map(tc => tc.result),  // Include raw results for artifact extraction
       conversationHistory: messages
     };

@@ -1,7 +1,10 @@
 const express = require('express');
+const http = require('http');
+const cors = require('cors');
 const dotenv = require('dotenv');
 dotenv.config();
 const supabase = require('./supabase/supabaseConnect');
+const { initializeSocket } = require('./socket/socketManager');
 const agentRoutes = require('./gmail/agentConnect');
 const authRoutes = require('./auth/auth');
 const gmailRoutes = require('./gmail/gmailData');
@@ -57,25 +60,29 @@ const memorySettingsRoutes = require('./memory/memorySettingsController');
 const microsoftAuthRoutes = require('./microsoft/microsoftAuth');
 const microsoftAgentRoutes = require('./microsoft/microsoftAgentController');
 
+// File upload routes
+const filesRoutes = require('./files/filesRoutes');
+
 const app = express();
+const server = http.createServer(app);
 const port = process.env.PORT || 3000;
+
+// Initialize Socket.io on the HTTP server
+const io = initializeSocket(server, {
+  corsOrigin: process.env.FRONTEND_URL || '*',
+});
 
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// CORS middleware (add this for frontend integration)
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, x-user-id');
-  
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
+// CORS middleware
+app.use(cors({
+  origin: process.env.FRONTEND_URL || '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'x-user-id'],
+  credentials: true,
+}));
 
 // Use authentication routes
 app.use('/api/auth', authRoutes);
@@ -157,6 +164,9 @@ app.use('/api/settings', memorySettingsRoutes);
 // Use Microsoft routes
 app.use('/api', microsoftAuthRoutes.router);
 app.use('/api/microsoft', microsoftAgentRoutes);
+
+// Use File upload routes
+app.use('/api', filesRoutes);
 
 // Health check route
 app.get('/health', async (req, res) => {
@@ -299,8 +309,9 @@ app.use('*', (req, res) => {
   });
 });
 
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`🚀 Server running on http://localhost:${port}`);
   console.log(`📚 API documentation available at http://localhost:${port}/api`);
   console.log(`❤️  Health check available at http://localhost:${port}/health`);
+  console.log(`🔌 Socket.io ready for WebSocket connections`);
 });

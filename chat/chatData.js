@@ -1,5 +1,6 @@
 // Chat History Data Layer - Supabase operations
 const supabase = require('../supabase/supabaseConnect');
+const supabaseAdmin = require('../supabase/supabaseAdmin');
 
 /**
  * Get all chat sessions for a user
@@ -21,14 +22,16 @@ async function getAllChatSessions(userId) {
       return [];
     }
 
-    // Fetch messages for each session
+    // Fetch messages for each session (limit to last 20 for performance)
     const sessionsWithMessages = await Promise.all(
       sessions.map(async (session) => {
         const { data: messages, error: msgError } = await supabase
           .from('chat_messages')
           .select('*')
           .eq('chat_session_id', session.id)
-          .order('created_at', { ascending: true });
+          .order('sequence_order', { ascending: false, nullsFirst: false })
+          .order('created_at', { ascending: false })
+          .limit(20);
 
         if (msgError) {
           console.error('Error fetching messages:', msgError);
@@ -42,18 +45,22 @@ async function getAllChatSessions(userId) {
           };
         }
 
+        // Reverse messages so they're in ascending order (oldest first) for display
+        const orderedMessages = (messages || []).reverse();
+        
         return {
           id: session.id,
           title: session.title,
           createdAt: session.created_at,
           updatedAt: session.updated_at,
-          messages: (messages || []).map((msg) => ({
+          messages: orderedMessages.map((msg) => ({
             id: msg.id,
             role: msg.role,
             content: msg.content,
             timestamp: msg.created_at,
             agentsUsed: msg.agents_used || [],
             processingTime: msg.processing_time,
+            sequenceOrder: msg.sequence_order,
             isError: msg.is_error || false,
             isPendingConfirmation: msg.is_pending_confirmation || false,
             isConfirmed: msg.is_confirmed || false,
@@ -89,15 +96,56 @@ async function getChatSession(chatId, userId) {
       throw sessionError || new Error('Chat session not found');
     }
 
-    // Fetch messages for this session
+    // Fetch messages for this session (limit to last 20 for performance, rely on realtime for new ones)
     const { data: messages, error: msgError } = await supabase
       .from('chat_messages')
       .select('*')
       .eq('chat_session_id', chatId)
-      .order('created_at', { ascending: true });
+      .order('sequence_order', { ascending: false, nullsFirst: false })
+      .order('created_at', { ascending: false })
+      .limit(20);
 
     if (msgError) {
       throw msgError;
+    }
+
+    // Reverse messages so they're in ascending order (oldest first) for display
+    const orderedMessages = (messages || []).reverse();
+
+    // Fetch attached files for all messages in this chat session
+    let filesByMessageId = {};
+    try {
+      const messageIds = orderedMessages.map(m => m.id);
+      if (messageIds.length > 0) {
+        // Use supabaseAdmin to bypass RLS (backend uses custom JWT auth, not Supabase Auth)
+        const { data: chatFiles, error: filesError } = await supabaseAdmin
+          .from('files')
+          .select('id, message_id, original_filename, filename, mime_type, size, public_url, file_type, storage_path, storage_bucket')
+          .eq('chat_id', chatId)
+          .eq('status', 'ready')
+          .in('message_id', messageIds);
+
+        if (!filesError && chatFiles && chatFiles.length > 0) {
+          // Group files by message_id
+          for (const file of chatFiles) {
+            if (!filesByMessageId[file.message_id]) {
+              filesByMessageId[file.message_id] = [];
+            }
+            filesByMessageId[file.message_id].push({
+              id: file.id,
+              filename: file.filename,
+              originalFilename: file.original_filename,
+              mimeType: file.mime_type,
+              size: file.size,
+              url: file.public_url,
+              fileType: file.file_type,
+            });
+          }
+        }
+      }
+    } catch (fileErr) {
+      console.error('[chatData] Error fetching files for session:', fileErr);
+      // Continue without files - non-critical
     }
 
     return {
@@ -105,18 +153,22 @@ async function getChatSession(chatId, userId) {
       title: session.title,
       createdAt: session.created_at,
       updatedAt: session.updated_at,
-      messages: (messages || []).map((msg) => ({
+      messages: orderedMessages.map((msg) => ({
         id: msg.id,
         role: msg.role,
         content: msg.content,
         timestamp: msg.created_at,
         agentsUsed: msg.agents_used || [],
         processingTime: msg.processing_time,
+        sequenceOrder: msg.sequence_order,
         isError: msg.is_error || false,
         isPendingConfirmation: msg.is_pending_confirmation || false,
         isConfirmed: msg.is_confirmed || false,
         isCanceled: msg.is_canceled || false,
         confirmationData: msg.confirmation_data || undefined,
+        // Include attached files: prefer files stored directly on the message row,
+        // fall back to cross-table lookup from the files table
+        ...(msg.files ? { files: msg.files } : (filesByMessageId[msg.id] && { files: filesByMessageId[msg.id] })),
       })),
       messageCount: session.message_count || 0,
     };
@@ -201,10 +253,20 @@ async function addMessagesToSession(chatId, userId, messages) {
 
     // Insert new messages
     if (newMessages.length > 0) {
+      // Get the current max sequence_order for this chat session
+      const { data: maxSeqData } = await supabase
+        .from('chat_messages')
+        .select('sequence_order')
+        .eq('chat_session_id', chatId)
+        .order('sequence_order', { ascending: false })
+        .limit(1);
+      
+      let currentSeq = maxSeqData && maxSeqData.length > 0 ? (maxSeqData[0].sequence_order || 0) : 0;
+      
       const { error: insertError } = await supabase
         .from('chat_messages')
-        .insert(
-          newMessages.map((msg) => ({
+        .upsert(
+          newMessages.map((msg, index) => ({
             id: msg.id,
             chat_session_id: chatId,
             role: msg.role,
@@ -216,13 +278,25 @@ async function addMessagesToSession(chatId, userId, messages) {
             is_confirmed: msg.isConfirmed || false,
             is_canceled: msg.isCanceled || false,
             confirmation_data: msg.confirmationData || null,
+            files: msg.files || null,
             created_at: msg.timestamp,
-          }))
+            sequence_order: currentSeq + index + 1,
+          })),
+          { onConflict: 'id', ignoreDuplicates: false }
         );
 
       if (insertError) {
         throw insertError;
       }
+
+      // Update message_count for realtime session updates
+      await supabase
+        .from('chat_sessions')
+        .update({ 
+          message_count: (existingMessages?.length || 0) + newMessages.length,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', chatId);
     }
 
     // Update existing messages (important for confirmation state changes)
@@ -239,6 +313,7 @@ async function addMessagesToSession(chatId, userId, messages) {
             is_confirmed: msg.isConfirmed || false,
             is_canceled: msg.isCanceled || false,
             confirmation_data: msg.confirmationData || null,
+            ...(msg.files && { files: msg.files }),
           })
           .eq('id', msg.id)
           .eq('chat_session_id', chatId);
@@ -338,6 +413,169 @@ async function clearAllChatSessions(userId) {
   }
 }
 
+/**
+ * Save timeline events for a message (stores all events as single JSON row)
+ * @param {string} messageId - The message ID
+ * @param {string} chatSessionId - The chat session ID
+ * @param {string} userId - The user ID
+ * @param {Array} events - Array of timeline events
+ */
+async function saveTimelineEvents(messageId, chatSessionId, userId, events) {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000; // 1 second
+  
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[chatData] saveTimelineEvents called (attempt ${attempt}) - messageId: ${messageId}, chatSessionId: ${chatSessionId}, userId: ${userId}, events: ${events?.length || 0}`);
+      
+      if (!events || events.length === 0) {
+        console.log(`[chatData] No events to save, returning`);
+        return true;
+      }
+
+    // Format events for storage (keep all event data)
+    const formattedEvents = events.map((event, index) => ({
+      type: event.type,
+      eventId: event.eventId || null,
+      agentName: event.agentName || null,
+      agentDisplayName: event.agentDisplayName || null,
+      agentIcon: event.agentIcon || null,
+      toolName: event.toolName || null,
+      toolDisplayName: event.toolDisplayName || null,
+      status: event.status || 'completed',
+      message: event.message || null,
+      description: event.description || null,
+      icon: event.icon || null,
+      data: event.data || null,
+      result: event.result || null,
+      timestamp: event.timestamp || new Date().toISOString(),
+      sequenceOrder: index,
+    }));
+
+    console.log(`[chatData] Saving ${formattedEvents.length} timeline events as single row`);
+
+    // Upsert: insert or update if message_id exists
+    const { data, error } = await supabase
+      .from('timeline_events')
+      .upsert({
+        message_id: messageId,
+        chat_session_id: chatSessionId,
+        user_id: userId,
+        events: formattedEvents,
+        updated_at: new Date().toISOString(),
+      }, {
+        onConflict: 'message_id'
+      });
+
+    if (error) {
+      console.error(`[chatData] Supabase upsert error:`, error);
+      throw error;
+    }
+
+    console.log(`[chatData] Timeline events saved successfully as single row`);
+    return true;
+    } catch (error) {
+      console.error(`Error in saveTimelineEvents (attempt ${attempt}/${MAX_RETRIES}):`, error.message || error);
+      
+      // Check if it's a retryable network error
+      const isRetryable = error.message?.includes('fetch failed') || 
+                          error.message?.includes('ECONNRESET') ||
+                          error.message?.includes('ETIMEDOUT') ||
+                          error.code === 'ECONNRESET';
+      
+      if (isRetryable && attempt < MAX_RETRIES) {
+        console.log(`[chatData] Retrying in ${RETRY_DELAY}ms...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * attempt));
+        continue;
+      }
+      
+      // On final attempt or non-retryable error, throw
+      throw error;
+    }
+  }
+}
+
+/**
+ * Get timeline events for a message
+ * @param {string} messageId - The message ID
+ */
+async function getTimelineEventsForMessage(messageId) {
+  try {
+    const { data, error } = await supabase
+      .from('timeline_events')
+      .select('events')
+      .eq('message_id', messageId)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // No row found - return empty array
+        return [];
+      }
+      throw error;
+    }
+
+    return data?.events || [];
+  } catch (error) {
+    console.error('Error in getTimelineEventsForMessage:', error);
+    return [];
+  }
+}
+
+/**
+ * Get timeline events for multiple messages
+ * @param {Array<string>} messageIds - Array of message IDs
+ */
+async function getTimelineEventsForMessages(messageIds) {
+  try {
+    if (!messageIds || messageIds.length === 0) {
+      return {};
+    }
+
+    const { data, error } = await supabase
+      .from('timeline_events')
+      .select('message_id, events')
+      .in('message_id', messageIds);
+
+    if (error) {
+      throw error;
+    }
+
+    // Build map of message_id -> events array
+    const eventsByMessage = {};
+    (data || []).forEach((row) => {
+      eventsByMessage[row.message_id] = row.events || [];
+    });
+
+    return eventsByMessage;
+  } catch (error) {
+    console.error('Error in getTimelineEventsForMessages:', error);
+    return {};
+  }
+}
+
+/**
+ * Delete timeline events for a message
+ * @param {string} messageId - The message ID
+ */
+async function deleteTimelineEventsForMessage(messageId) {
+  try {
+    const { error } = await supabase
+      .from('timeline_events')
+      .delete()
+      .eq('message_id', messageId);
+
+    if (error) {
+      throw error;
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Error in deleteTimelineEventsForMessage:', error);
+    throw error;
+  }
+}
+
 module.exports = {
   getAllChatSessions,
   getChatSession,
@@ -346,4 +584,8 @@ module.exports = {
   deleteChatSession,
   renameChatSession,
   clearAllChatSessions,
+  saveTimelineEvents,
+  getTimelineEventsForMessage,
+  getTimelineEventsForMessages,
+  deleteTimelineEventsForMessage,
 };

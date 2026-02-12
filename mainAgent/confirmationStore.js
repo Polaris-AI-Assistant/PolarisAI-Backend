@@ -65,9 +65,10 @@ function generateRequestId() {
  * @param {array} conversationHistory - Conversation context
  * @param {string} conversationId - Conversation ID for artifact memory
  * @param {number} ttlMs - Time to live in milliseconds (optional)
+ * @param {array} timelineEvents - Timeline events from initial query (optional)
  * @returns {string} - Request ID for this pending action
  */
-function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS) {
+function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = []) {
   const requestId = generateRequestId();
   const now = Date.now();
   
@@ -81,13 +82,14 @@ function storePendingAction(userId, toolName, agentName, params, previewContent,
     query,
     conversationHistory,
     conversationId,  // Store conversationId for artifact memory
+    timelineEvents,  // Store timeline events from initial query
     createdAt: now,
     expiresAt: now + ttlMs
   };
   
   pendingActions.set(requestId, pendingAction);
   
-  console.log(`[ConfirmationStore] Stored pending action: ${requestId} for tool: ${toolName} (conversation: ${conversationId || 'none'})`);
+  console.log(`[ConfirmationStore] Stored pending action: ${requestId} for tool: ${toolName} (conversation: ${conversationId || 'none'}, timeline events: ${timelineEvents.length})`);
   
   return requestId;
 }
@@ -330,9 +332,10 @@ function getStoreStats() {
  * @param {array} conversationHistory - Conversation context
  * @param {string} conversationId - Conversation ID for artifact memory
  * @param {number} ttlMs - Time to live in milliseconds
+ * @param {array} timelineEvents - Timeline events from initial query
  * @returns {object} - { chainId, firstAction } containing chain ID and first action to confirm
  */
-function storeActionChain(userId, actions, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS) {
+function storeActionChain(userId, actions, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = []) {
   if (!actions || actions.length === 0) {
     return null;
   }
@@ -347,6 +350,7 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
     query,
     conversationHistory,
     conversationId,
+    timelineEvents,  // Store timeline events from initial query
     currentIndex: 0,
     completedResults: [],
     createdAt: now,
@@ -367,6 +371,7 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
     query,
     conversationHistory,
     conversationId,
+    timelineEvents,  // Store timeline events in pending action too
     chainId,
     chainIndex: 0,
     totalInChain: actions.length,
@@ -376,7 +381,7 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
 
   pendingActions.set(requestId, pendingAction);
 
-  console.log(`[ConfirmationStore] Stored action chain: ${chainId} with ${actions.length} actions`);
+  console.log(`[ConfirmationStore] Stored action chain: ${chainId} with ${actions.length} actions (timeline events: ${timelineEvents.length})`);
   console.log(`[ConfirmationStore] First action: ${firstAction.toolName} (requestId: ${requestId})`);
 
   return {
@@ -393,9 +398,10 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
  * @param {string} chainId - The chain ID
  * @param {string} userId - User ID for validation
  * @param {object} completedResult - Result from the just-completed action
+ * @param {array} completedTimelineEvents - Timeline events from the just-completed step
  * @returns {object|null} - Next pending action or null if chain is complete
  */
-function getNextChainAction(chainId, userId, completedResult = null) {
+function getNextChainAction(chainId, userId, completedResult = null, completedTimelineEvents = []) {
   const chain = actionChains.get(chainId);
   
   if (!chain) {
@@ -418,15 +424,22 @@ function getNextChainAction(chainId, userId, completedResult = null) {
   if (completedResult) {
     chain.completedResults.push(completedResult);
   }
+  
+  // Accumulate timeline events from the completed step
+  if (completedTimelineEvents && completedTimelineEvents.length > 0) {
+    chain.timelineEvents = [...(chain.timelineEvents || []), ...completedTimelineEvents];
+    console.log(`[ConfirmationStore] Accumulated ${completedTimelineEvents.length} timeline events, total now: ${chain.timelineEvents.length}`);
+  }
 
   // Move to next action
   chain.currentIndex++;
   
   if (chain.currentIndex >= chain.actions.length) {
-    console.log(`[ConfirmationStore] Chain complete: ${chainId}`);
+    console.log(`[ConfirmationStore] Chain complete: ${chainId}, accumulated ${(chain.timelineEvents || []).length} timeline events`);
     return { 
       chainComplete: true, 
       completedResults: chain.completedResults,
+      accumulatedTimelineEvents: chain.timelineEvents || [],  // Return all accumulated timeline events
       chainId
     };
   }
@@ -453,6 +466,7 @@ function getNextChainAction(chainId, userId, completedResult = null) {
     query: chain.query,
     conversationHistory: chain.conversationHistory,
     conversationId: chain.conversationId,
+    timelineEvents: chain.timelineEvents || [],  // Preserve accumulated timeline events
     chainId,
     chainIndex: chain.currentIndex,
     totalInChain: chain.actions.length,
@@ -463,6 +477,7 @@ function getNextChainAction(chainId, userId, completedResult = null) {
   pendingActions.set(requestId, pendingAction);
 
   console.log(`[ConfirmationStore] Created next action in chain: ${nextAction.toolName} (${chain.currentIndex + 1}/${chain.actions.length})`);
+  console.log(`[ConfirmationStore] 📊 Next action has ${pendingAction.timelineEvents.length} accumulated timeline events`);
 
   return {
     chainComplete: false,

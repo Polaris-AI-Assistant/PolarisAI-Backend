@@ -542,10 +542,289 @@ async function replaceText(userId, documentId, searchText, replaceText) {
   }
 }
 
+/**
+ * Tool 13: Append formatted text with proper Google Docs formatting
+ * Converts markdown-style content to NATIVE Google Docs formatting
+ * NEVER inserts markdown characters as plain text - uses proper APIs
+ * @param {string} userId - User ID
+ * @param {string} documentId - Document ID
+ * @param {string} content - Markdown-formatted content
+ * @returns {Object} - { success, message }
+ */
+async function appendFormattedText(userId, documentId, content) {
+  try {
+    const docs = await getDocsClient(userId);
+
+    // Get the document to find the end index
+    const doc = await docs.documents.get({ documentId });
+    let insertIndex = doc.data.body.content[doc.data.body.content.length - 1].endIndex - 1;
+
+    // Parse content into structured blocks
+    const blocks = parseMarkdownToBlocks(content);
+    
+    // Phase 1: Build text without any markdown characters
+    // Track where each block will be positioned for formatting
+    let plainText = '';
+    const blockPositions = [];
+    
+    for (const block of blocks) {
+      const blockStart = plainText.length;
+      
+      if (block.type === 'heading') {
+        // Parse inline formatting from heading text too
+        const { text: cleanText, boldRanges } = parseInlineFormatting(block.text);
+        plainText += cleanText + '\n';
+        blockPositions.push({
+          type: 'heading',
+          level: block.level,
+          start: blockStart,
+          end: blockStart + cleanText.length,
+          boldRanges: boldRanges.map(r => ({ start: blockStart + r.start, end: blockStart + r.end }))
+        });
+      } else if (block.type === 'bullet') {
+        // NO bullet character - just the text, we'll apply bullet formatting via API
+        const { text: cleanText, boldRanges } = parseInlineFormatting(block.text);
+        plainText += cleanText + '\n';
+        blockPositions.push({
+          type: 'bullet',
+          start: blockStart,
+          end: blockStart + cleanText.length + 1, // Include newline for paragraph
+          boldRanges: boldRanges.map(r => ({ start: blockStart + r.start, end: blockStart + r.end }))
+        });
+      } else if (block.type === 'numbered') {
+        // NO number - just the text, we'll apply numbered list formatting via API
+        const { text: cleanText, boldRanges } = parseInlineFormatting(block.text);
+        plainText += cleanText + '\n';
+        blockPositions.push({
+          type: 'numbered',
+          start: blockStart,
+          end: blockStart + cleanText.length + 1, // Include newline for paragraph
+          boldRanges: boldRanges.map(r => ({ start: blockStart + r.start, end: blockStart + r.end }))
+        });
+      } else if (block.type === 'paragraph') {
+        const { text: cleanText, boldRanges } = parseInlineFormatting(block.text);
+        plainText += cleanText + '\n';
+        blockPositions.push({
+          type: 'paragraph',
+          start: blockStart,
+          end: blockStart + cleanText.length,
+          boldRanges: boldRanges.map(r => ({ start: blockStart + r.start, end: blockStart + r.end }))
+        });
+      } else if (block.type === 'empty') {
+        plainText += '\n';
+        blockPositions.push({ type: 'empty', start: blockStart, end: blockStart + 1 });
+      }
+    }
+
+    // Phase 2: Insert all plain text at once
+    const requests = [];
+    
+    if (plainText) {
+      requests.push({
+        insertText: {
+          text: plainText,
+          location: { index: insertIndex }
+        }
+      });
+    }
+
+    // Phase 3: Apply formatting using native Google Docs APIs
+    // Process in reverse order to maintain correct indices
+    for (let i = blockPositions.length - 1; i >= 0; i--) {
+      const block = blockPositions[i];
+      const absStart = insertIndex + block.start;
+      const absEnd = insertIndex + block.end;
+      
+      if (block.type === 'heading') {
+        // Apply heading style using namedStyleType
+        const namedStyle = block.level === 1 ? 'HEADING_1' : 
+                          block.level === 2 ? 'HEADING_2' : 
+                          block.level === 3 ? 'HEADING_3' : 'HEADING_4';
+        requests.push({
+          updateParagraphStyle: {
+            paragraphStyle: { namedStyleType: namedStyle },
+            fields: 'namedStyleType',
+            range: { startIndex: absStart, endIndex: absEnd + 1 }
+          }
+        });
+      } else if (block.type === 'bullet') {
+        // Use createParagraphBullets API for proper bullet lists
+        requests.push({
+          createParagraphBullets: {
+            range: { startIndex: absStart, endIndex: absEnd },
+            bulletPreset: 'BULLET_DISC_CIRCLE_SQUARE'
+          }
+        });
+      } else if (block.type === 'numbered') {
+        // Use createParagraphBullets API with numbered preset
+        requests.push({
+          createParagraphBullets: {
+            range: { startIndex: absStart, endIndex: absEnd },
+            bulletPreset: 'NUMBERED_DECIMAL_NESTED'
+          }
+        });
+      }
+      
+      // Apply bold formatting for inline **text**
+      if (block.boldRanges && block.boldRanges.length > 0) {
+        for (const boldRange of block.boldRanges) {
+          requests.push({
+            updateTextStyle: {
+              textStyle: { bold: true },
+              fields: 'bold',
+              range: { 
+                startIndex: insertIndex + boldRange.start, 
+                endIndex: insertIndex + boldRange.end 
+              }
+            }
+          });
+        }
+      }
+    }
+
+    // Execute all requests
+    if (requests.length > 0) {
+      await docs.documents.batchUpdate({
+        documentId,
+        requestBody: { requests }
+      });
+    }
+
+    return {
+      success: true,
+      message: 'Formatted text appended successfully with native Google Docs formatting'
+    };
+  } catch (error) {
+    console.error('Error appending formatted text:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Parse markdown content into structured blocks
+ */
+function parseMarkdownToBlocks(content) {
+  const lines = content.split('\n');
+  const blocks = [];
+
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    
+    if (!trimmedLine) {
+      blocks.push({ type: 'empty' });
+      continue;
+    }
+
+    // Check for headings (# ## ###)
+    const headingMatch = trimmedLine.match(/^(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      blocks.push({
+        type: 'heading',
+        level: headingMatch[1].length,
+        text: headingMatch[2]
+      });
+      continue;
+    }
+
+    // Check for ALL CAPS headings (legacy format)
+    if (trimmedLine === trimmedLine.toUpperCase() && 
+        trimmedLine.length > 3 && 
+        /^[A-Z\s]+$/.test(trimmedLine)) {
+      blocks.push({
+        type: 'heading',
+        level: 1,
+        text: trimmedLine
+      });
+      continue;
+    }
+
+    // Check for bullet points (- or • or *)
+    const bulletMatch = trimmedLine.match(/^[-•*]\s+(.+)$/);
+    if (bulletMatch) {
+      blocks.push({
+        type: 'bullet',
+        text: bulletMatch[1]
+      });
+      continue;
+    }
+
+    // Check for numbered list (1. 2. etc)
+    const numberedMatch = trimmedLine.match(/^(\d+)\.\s+(.+)$/);
+    if (numberedMatch) {
+      blocks.push({
+        type: 'numbered',
+        number: numberedMatch[1],
+        text: numberedMatch[2]
+      });
+      continue;
+    }
+
+    // Check for subheading (ends with :)
+    if (trimmedLine.endsWith(':') && trimmedLine.length < 60) {
+      blocks.push({
+        type: 'heading',
+        level: 3,
+        text: trimmedLine
+      });
+      continue;
+    }
+
+    // Regular paragraph
+    blocks.push({
+      type: 'paragraph',
+      text: trimmedLine
+    });
+  }
+
+  return blocks;
+}
+
+/**
+ * Parse inline formatting (bold with ** or __)
+ */
+function parseInlineFormatting(text) {
+  const boldRanges = [];
+  let result = text;
+  
+  // Match **text** or __text__
+  const boldPattern = /(\*\*|__)(.+?)\1/g;
+  let match;
+  let offset = 0;
+  
+  // Create a copy to work with
+  let workingText = text;
+  
+  while ((match = boldPattern.exec(text)) !== null) {
+    const fullMatch = match[0];
+    const innerText = match[2];
+    const startInOriginal = match.index;
+    
+    // Calculate position in result string (accounting for removed markers)
+    const startInResult = startInOriginal - offset;
+    
+    boldRanges.push({
+      start: startInResult,
+      end: startInResult + innerText.length
+    });
+    
+    // Update offset (4 characters removed: ** at start and ** at end)
+    offset += 4;
+  }
+  
+  // Remove all bold markers from result
+  result = text.replace(/(\*\*|__)(.+?)\1/g, '$2');
+  
+  return { text: result, boldRanges };
+}
+
 module.exports = {
   createDocument,
   insertText,
   appendText,
+  appendFormattedText,
   insertParagraphBreak,
   updateTextStyle,
   readDocument,

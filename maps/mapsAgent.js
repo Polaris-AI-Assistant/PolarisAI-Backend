@@ -312,8 +312,8 @@ Remember: You're helping users navigate and discover the world around them. Be h
           success: true,
           response: this.formatToolResult(forceToolExecution.toolName, toolResult),
           query: query,
-          toolsUsed: [forceToolExecution.toolName],
-          results: toolResult,
+          tools_used: [{ name: forceToolExecution.toolName, arguments: JSON.stringify(forceToolExecution.params) }],
+          raw_results: [toolResult],
           executionTime: Date.now() - startTime,
           timestamp: new Date().toISOString()
         };
@@ -352,7 +352,7 @@ Remember: You're helping users navigate and discover the world around them. Be h
           console.log(`[MapsAgent] 🔧 Executing tool: ${functionName}`);
           console.log(`[MapsAgent] 📋 Arguments:`, JSON.stringify(functionArgs, null, 2));
 
-          toolsUsed.push(functionName);
+          toolsUsed.push({ name: functionName, arguments: toolCall.function.arguments });
 
           try {
             // Get the actual function to call
@@ -406,14 +406,14 @@ Remember: You're helping users navigate and discover the world around them. Be h
 
       const executionTime = Date.now() - startTime;
       console.log(`[MapsAgent] ✨ Query processed successfully in ${executionTime}ms`);
-      console.log(`[MapsAgent] 🔧 Tools used: ${toolsUsed.join(', ') || 'none'}`);
+      console.log(`[MapsAgent] 🔧 Tools used: ${toolsUsed.map(t => t.name).join(', ') || 'none'}`);
 
       return {
         success: true,
         response: finalResponse,
         query: query,
-        toolsUsed: toolsUsed,
-        results: toolResults,
+        tools_used: toolsUsed,
+        raw_results: toolResults,
         executionTime: executionTime,
         timestamp: new Date().toISOString()
       };

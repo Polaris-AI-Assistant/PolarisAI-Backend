@@ -42,6 +42,7 @@ const MapsAgent = require('../maps/mapsAgent');
 const MicrosoftAgent = require('../microsoft/microsoftAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
+const { TimelineEmitter, TimelineEventType, AGENT_NAMES } = require('./timelineEvents');
 
 // Artifact Memory imports
 const { 
@@ -143,7 +144,7 @@ class MainAgent {
    * @param {string} userId - User ID for validation
    * @returns {object} - Result of the tool execution, plus nextConfirmation if part of chain
    */
-  async executeConfirmedAction(requestId, userId) {
+  async executeConfirmedAction(requestId, userId, timeline = null) {
     const pendingAction = confirmationStore.getPendingAction(requestId, userId);
     
     if (!pendingAction) {
@@ -160,6 +161,11 @@ class MainAgent {
       console.log(`[MainAgent]   ConversationId: ${conversationId || 'NOT SET'}`);
       if (chainId) {
         console.log(`[MainAgent]   Chain: ${chainId} (step ${chainIndex + 1}/${totalInChain})`);
+      }
+      
+      // Emit timeline event for agent execution
+      if (timeline) {
+        timeline.emitAgentExecuting(agentName, `Executing ${toolName}...`);
       }
       
       // Get the specialized agent
@@ -179,6 +185,11 @@ class MainAgent {
           params
         }
       });
+
+      // Emit timeline event for agent completion
+      if (timeline) {
+        timeline.emitAgentCompleted(agentName, result);
+      }
 
       // CRITICAL: Store artifact after confirmed action execution
       let storedArtifact = null;
@@ -217,7 +228,10 @@ class MainAgent {
           artifact: storedArtifact
         };
         
-        const nextChainAction = confirmationStore.getNextChainAction(chainId, userId, completedResult);
+        // Get timeline events from current step to accumulate in chain
+        const currentTimelineEvents = timeline ? timeline.getEvents() : [];
+        
+        const nextChainAction = confirmationStore.getNextChainAction(chainId, userId, completedResult, currentTimelineEvents);
         
         if (nextChainAction && !nextChainAction.chainComplete) {
           console.log(`[MainAgent] 🔗 Next action in chain: ${nextChainAction.nextAction.toolName}`);
@@ -268,6 +282,11 @@ class MainAgent {
       console.error(`[MainAgent] Error executing confirmed action:`, error);
       // Remove the pending action even on failure to prevent retries
       confirmationStore.removePendingAction(requestId);
+      
+      // Emit error event if timeline is available
+      if (timeline) {
+        timeline.emitError(error.message);
+      }
       
       return {
         success: false,
@@ -797,6 +816,31 @@ Guidelines:
 - Combine related information to avoid redundancy
 - Maintain conversation context across multiple queries
 
+**RESPONSE FORMATTING**:
+Your responses are rendered with full Markdown support. Use rich formatting to make your answers clear and visually appealing:
+
+1. Use headings (## and ###) to create clear sections and visual hierarchy
+2. Use **bold** for emphasis on key terms, names, or important details
+3. Use bullet points (-) and numbered lists (1.) for structured information
+4. Use \`inline code\` for technical terms, file names, commands, and variable names
+5. Use fenced code blocks (\`\`\`language) with the language specified for code snippets
+6. Use tables (| col1 | col2 |) when comparing items or showing structured data
+7. Use blockquotes (>) for important callouts or notes
+8. Use emoji/icons to enhance readability:
+   - ✅ for success, completion, or working items
+   - ❌ for errors, failures, or issues
+   - ⚠️ for warnings or important cautions
+   - 📄 for documents or files
+   - 🖼️ for images
+   - 💡 for tips or suggestions
+   - 🔧 for tools, settings, or configuration
+   - 📊 for data or statistics
+   - 🚀 for performance or launch
+   - 🔒 for security or privacy
+   - ⏱️ for time or duration
+9. Keep paragraphs concise; use blank lines between sections
+10. Never mention that you are using markdown formatting — just use it naturally
+
 **ARTIFACT MEMORY SYSTEM**:
 You have access to conversation artifact memory. This allows you to remember and operate on previously created items.
 
@@ -843,7 +887,7 @@ Remember: Artifacts are preserved within a conversation thread. Use this context
    * Uses OpenAI to intelligently route the request
    * Now includes artifact context and long-term memory for better query understanding
    */
-  async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '') {
+  async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '', fileContext = null) {
     try {
       // Pre-check: Detect common conversational queries BEFORE calling LLM
       const lowerQuery = query.toLowerCase().trim();
@@ -866,6 +910,32 @@ Remember: Artifacts are preserved within a conversation thread. Use this context
           agents: [],
           reasoning: "User is asking about past conversation or information - no agents needed"
         };
+      }
+
+      // Pre-check: If files are attached, detect file-related queries that should NOT route to agents
+      // These queries should be answered using the file content already injected into context
+      if (fileContext && fileContext.filesProcessed > 0) {
+        const fileQueryPatterns = [
+          /\b(read|summarize|summarise|analyze|analyse|explain|describe|review|look at|check|examine|inspect|parse|interpret|translate)\b.*\b(this|the|my|attached|uploaded)\b.*\b(file|document|pdf|image|photo|picture|attachment|code|text|content|data)/i,
+          /\b(what|tell|show)\b.*\b(this|the|my|attached|uploaded)\b.*\b(file|document|pdf|image|photo|picture|attachment|code)\b.*\b(contain|about|say|have|include)/i,
+          /\b(what)\b.*\b(in|inside|contain|about)\b.*\b(this|the|my)\b.*\b(file|document|pdf|image|photo|picture|attachment)/i,
+          /\b(read|summarize|summarise|analyze|analyse|explain|review)\b.*\b(this|it|the file|the document|the pdf)/i,
+          /\b(what does|what's in|what is in)\b.*\b(this|the|it)/i,
+          /\b(tell me|what)\b.*\b(it contains|it says|it includes|file contains|document contains)/i,
+          /\b(extract|pull out|get|find)\b.*\b(from|in)\b.*\b(this|the|my)\b.*\b(file|document|pdf)/i,
+          /^(read this|summarize this|analyze this|explain this|what is this|describe this)/i,
+          /^(read it|summarize it|analyze it|explain it|what does it contain)/i
+        ];
+
+        const isFileQuery = fileQueryPatterns.some(pattern => pattern.test(query));
+        
+        if (isFileQuery) {
+          console.log('[MainAgent] 📎 Detected file-related query with attached files - skipping agents, using file context');
+          return {
+            agents: [],
+            reasoning: `User is asking about attached file(s). ${fileContext.filesProcessed} file(s) are attached and their content is available in context - no agents needed, will answer directly from file content.`
+          };
+        }
       }
 
       // Build artifact context section for the prompt
@@ -915,24 +985,32 @@ Is the user asking about PAST information (what they already told you, what happ
 User Query: "${query}"
 ${conversationSection}
 
-If YES → You MUST return: {"agents": [], "reasoning": "User is asking about past conversation/information"}
-If NO → Continue to STEP 2
+CRITICAL - These words indicate NEW ACTIONS (NOT past queries - MUST use agents):
+- "create", "make", "build", "generate" → User wants to CREATE something NEW
+- "send", "email", "message" → User wants to SEND something
+- "schedule", "book", "set up" → User wants to SCHEDULE something
+- "search", "find", "look for", "show", "list", "check", "get" → User wants to FETCH/FIND data
 
-Common PAST queries (return empty agents):
+ABSOLUTELY NOT PAST QUERIES - Always route to agents:
+- "create a google form" → MUST use forms agent
+- "create a form for X" → MUST use forms agent  
+- "make a survey" → MUST use forms agent
+- "create a document" → MUST use docs agent
+- "send an email" → MUST use gmail/microsoft agent
+- "schedule a meeting" → MUST use calendar agent
+- Any query starting with "create", "make", "build", "send", "schedule" → REQUIRES agents
+
+If query contains "create", "make", "build", "send", "schedule", "search", "find", "show", "list", "get" → Skip to STEP 2
+
+Common PAST queries ONLY (return empty agents):
 - "what is my name" / "who am I" 
 - "what did I tell you" / "what did we discuss"
-- "what flights did I search" / "what forms did I create"
-- "remind me" / "tell me about"
-- Questions using "was", "were", "did" about past actions
+- "what flights did I search" / "what forms did I create" (asking about PAST actions)
+- "remind me" / "tell me about what we talked"
+- Questions using "was", "were", "did" about past actions they already performed
 
-IMPORTANT - These are NOT past queries (require agents to FETCH data):
-- "show my emails" / "show my outlook mails" → REQUIRES microsoft agent to FETCH emails
-- "list my emails" / "check my inbox" → REQUIRES agent to FETCH data
-- "show my recent outlook emails" → REQUIRES microsoft agent (fetching current data, not past conversation)
-- "read my gmail" → REQUIRES gmail agent
-- "show my calendar events" → REQUIRES agent to FETCH events
-- "show my onedrive files" → REQUIRES microsoft agent
-- Any "show", "list", "check", "read", "get" with email/calendar/files → REQUIRES an agent
+If YES (truly past query) → You MUST return: {"agents": [], "reasoning": "User is asking about past conversation/information"}
+If NO → Continue to STEP 2
 
 STEP 2: Only if query is NOT about past, determine which agents are needed.
 ${artifactSection}
@@ -1064,9 +1142,39 @@ Important:
 - Consider if operations need to be sequential (e.g., create then send) or can be parallel
 - ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar`;
 
+      // Build file context section for analysis prompt
+      let fileContextSection = '';
+      if (fileContext && fileContext.filesProcessed > 0) {
+        const fileNames = fileContext.textContexts ? fileContext.textContexts.map(f => f.filename).join(', ') : 'attached files';
+        fileContextSection = `\n\nATTACHED FILES (User has uploaded ${fileContext.filesProcessed} file(s) with this message):
+Files: ${fileNames}
+
+CRITICAL FILE ROUTING RULE:
+The user has attached file(s) to this message. Their content is ALREADY available in the conversation context.
+If the user is asking to READ, SUMMARIZE, ANALYZE, EXPLAIN, REVIEW, or ASK QUESTIONS ABOUT the attached file(s):
+→ Return {"agents": [], "reasoning": "User is asking about attached file content - already available in context"}
+Do NOT route to gmail, docs, microsoft, or any other agent for file-reading queries.
+Only route to agents if the user wants to DO SOMETHING EXTERNAL with the file (e.g., "email this file to someone" → gmail).`;
+      }
+
       const messages = [
-        { role: 'system', content: 'You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.\n\nCRITICAL RULE: If the user is asking about PAST conversation or information already discussed (e.g., "what is my name", "what did we discuss", "what flights did I search"), return {"agents": [], "reasoning": "..."}.\n\nBUT: "show my emails", "list my outlook mails", "check my inbox", "show my calendar events", "show my files" are NOT past queries - they require agents to FETCH current data from external services. These MUST route to the appropriate agent (gmail, microsoft, calendar, etc.).\n\nROUTE TO AGENTS for: show, list, check, read, get, fetch + emails/calendar/files/etc.' },
-        { role: 'user', content: analysisPrompt }
+        { role: 'system', content: `You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.
+${fileContext && fileContext.filesProcessed > 0 ? `\nIMPORTANT: The user has attached ${fileContext.filesProcessed} file(s) to this message. If the user is asking to read, summarize, analyze, explain, review, or understand the attached file content, return {"agents": [], "reasoning": "..."} since file content is already in context. Do NOT route file-reading queries to gmail, docs, or any agent.\n` : ''}
+CRITICAL RULE FOR ACTION VERBS - These ALWAYS require agents:
+- "create", "make", "build" → Route to appropriate creation agent (forms, docs, sheets, etc.)
+- "send", "email", "message" → Route to gmail or microsoft agent
+- "schedule", "book", "set up" → Route to calendar agent
+- "search", "find", "show", "list", "check", "get", "read" → Route to appropriate fetch agent
+${fileContext && fileContext.filesProcessed > 0 ? '- EXCEPTION: "read" with attached files → Return empty agents (file content already available)\n' : ''}
+ONLY return empty agents for truly conversational queries like:
+- "what is my name", "who am I", "what did we discuss", "remind me what I said"
+${fileContext && fileContext.filesProcessed > 0 ? '- "read this file", "summarize this", "what does it contain", "analyze this document" (when files are attached)\n' : ''}
+"create a google form" → MUST return {"agents": ["forms"], ...}
+"create a form for X" → MUST return {"agents": ["forms"], ...}
+"make a survey" → MUST return {"agents": ["forms"], ...}
+
+NEVER return empty agents for queries containing "create", "make", "send", "schedule", "search", "find".` },
+        { role: 'user', content: analysisPrompt + fileContextSection }
       ];
 
       const response = await this.openai.chat.completions.create({
@@ -1091,8 +1199,9 @@ Important:
   /**
    * Execute queries on the specified agents
    * Now includes artifact storage after successful operations
+   * Now passes conversationHistory to agents for context
    */
-  async executeAgentQueries(analysis, userId, conversationId = null, userLocation = null) {
+  async executeAgentQueries(analysis, userId, conversationId = null, userLocation = null, timeline = null, conversationHistory = []) {
     const results = {};
     const errors = {};
     const storedArtifacts = [];
@@ -1105,24 +1214,37 @@ Important:
             const agentQuery = analysis.queries[agentName];
             console.log(`[MainAgent] Executing ${agentName} sequentially with query: "${agentQuery}"`);
             
+            // Emit executing event BEFORE agent starts
+            if (timeline) {
+              timeline.emitAgentExecuting(agentName, agentQuery);
+            }
+            
             const agent = this.agents[agentName];
             if (!agent) {
               throw new Error(`Agent '${agentName}' not found`);
             }
 
-            // Pass userLocation if this is the maps agent
-            const agentOptions = agentName === 'maps' && userLocation 
-              ? { userLocation } 
-              : {};
+            // Build options for the agent (sequential execution)
+            const agentOptions = {
+              conversationHistory: conversationHistory,
+              ...(agentName === 'maps' && userLocation ? { userLocation } : {})
+            };
 
             const result = await agent.processQuery(agentQuery, userId, agentOptions);
             results[agentName] = result;
+            
+            // Emit completed event AFTER agent finishes
+            if (timeline) {
+              timeline.emitAgentCompleted(agentName, result);
+            }
 
-            // Store artifacts from successful tool executions
+            // Store artifacts from successful tool executions (SEQUENTIAL)
             if (conversationId && result.success && result.tools_used) {
-              for (const tool of result.tools_used) {
+              for (let i = 0; i < result.tools_used.length; i++) {
+                const tool = result.tools_used[i];
                 try {
-                  const rawResult = result.raw_results?.find(r => r.success !== false) || result;
+                  // Match the tool with its corresponding result by index
+                  const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
                   const artifact = await extractAndStoreArtifact(
                     conversationId, 
                     agentName, 
@@ -1144,6 +1266,10 @@ Important:
               error: error.message,
               query: analysis.queries[agentName]
             };
+            // Emit failed event
+            if (timeline) {
+              timeline.emitAgentFailed(agentName, error.message);
+            }
           }
         }
       } else {
@@ -1153,21 +1279,39 @@ Important:
             const agentQuery = analysis.queries[agentName];
             console.log(`[MainAgent] Executing ${agentName} in parallel with query: "${agentQuery}"`);
             
+            // Emit executing event BEFORE agent starts
+            if (timeline) {
+              timeline.emitAgentExecuting(agentName, agentQuery);
+            }
+            
             const agent = this.agents[agentName];
             if (!agent) {
               throw new Error(`Agent '${agentName}' not found`);
             }
 
-            // Pass userLocation if this is the maps agent
-            const agentOptions = agentName === 'maps' && userLocation 
-              ? { userLocation } 
-              : {};
+            // Build options for the agent (parallel execution)
+            const agentOptions = {
+              conversationHistory: conversationHistory,
+              ...(agentName === 'maps' && userLocation ? { userLocation } : {})
+            };
 
             const result = await agent.processQuery(agentQuery, userId, agentOptions);
+            
+            // Emit completed event AFTER agent finishes
+            if (timeline) {
+              timeline.emitAgentCompleted(agentName, result);
+            }
+            
             return { agentName, result };
 
           } catch (error) {
             console.error(`[MainAgent] Error executing ${agentName}:`, error);
+            
+            // Emit failed event
+            if (timeline) {
+              timeline.emitAgentFailed(agentName, error.message);
+            }
+            
             return { 
               agentName, 
               error: {
@@ -1187,11 +1331,13 @@ Important:
           } else {
             results[agentName] = result;
 
-            // Store artifacts from successful tool executions
+            // Store artifacts from successful tool executions (PARALLEL)
             if (conversationId && result.success && result.tools_used) {
-              for (const tool of result.tools_used) {
+              for (let i = 0; i < result.tools_used.length; i++) {
+                const tool = result.tools_used[i];
                 try {
-                  const rawResult = result.raw_results?.find(r => r.success !== false) || result;
+                  // Match the tool with its corresponding result by index
+                  const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
                   const artifact = await extractAndStoreArtifact(
                     conversationId, 
                     agentName, 
@@ -1299,11 +1445,14 @@ Instead, present the information as if you're directly reporting the results.`;
   /**
    * Main method to process user queries with streaming support
    * This orchestrates the entire flow from analysis to final response with SSE streaming
-   * Now includes confirmation flow for sensitive operations, artifact memory, and long-term memory
+   * Now includes confirmation flow for sensitive operations, artifact memory, long-term memory, and timeline events
    */
   async processQueryWithStreaming(query, userId, options = {}, onChunk) {
     const startTime = Date.now();
     const conversationId = options.conversationId;
+    
+    // Initialize timeline emitter for step-by-step progress updates
+    const timeline = new TimelineEmitter(onChunk, userId, conversationId);
     
     try {
       console.log(`\n${'='.repeat(60)}`);
@@ -1322,19 +1471,21 @@ Instead, present the information as if you're directly reporting the results.`;
         if (modificationResult) {
           // User is modifying the pending action - we've handled it
           console.log(`[PendingModification] ✅ Modification detected and handled`);
-          return;
+          // Return with flag indicating flow is not complete - don't save timeline yet
+          return { timelineEvents: timeline.getEvents(), pendingConfirmation: true };
         } else {
           console.log(`[PendingModification] ℹ️ Query is not a modification - proceeding normally`);
         }
       }
 
-      // Send initial status
-      onChunk({ type: 'status', message: 'Analyzing your request...' });
-
       // ========== LONG-TERM MEMORY RETRIEVAL ==========
       // Retrieve relevant memories before processing to provide context
       let relevantMemories = [];
       let memoryContext = '';
+      
+      // Emit real-time event: memory search starting
+      onChunk({ type: 'status', message: 'Searching memory...' });
+      timeline.emitMemorySearching();
       
       try {
         console.log(`\n[LongTermMemory] 🧠 Retrieving relevant memories for user ${userId}...`);
@@ -1351,12 +1502,16 @@ Instead, present the information as if you're directly reporting the results.`;
           relevantMemories.forEach((m, i) => {
             console.log(`[LongTermMemory]   ${i + 1}. [${m.memoryType}] similarity=${m.similarity.toFixed(3)}`);
           });
+          
+          // Emit memory retrieved event
+          timeline.emitMemoryRetrieved(relevantMemories.length, relevantMemories[0]?.memoryType);
         } else {
           console.log(`[LongTermMemory] ℹ️ No relevant memories found`);
         }
       } catch (memoryError) {
         console.error(`[LongTermMemory] ⚠️ Error retrieving memories:`, memoryError.message);
         // Continue without memories - don't block the main flow
+        timeline.emitMemoryRetrieved(0, null);
       }
 
       // Build artifact context if conversationId is provided
@@ -1364,6 +1519,10 @@ Instead, present the information as if you're directly reporting the results.`;
       let enhancedQuery = query;
       
       if (conversationId) {
+        // Emit real-time event: artifact scanning
+        onChunk({ type: 'status', message: 'Scanning conversation artifacts...' });
+        timeline.emitArtifactScanning(conversationId);
+        
         console.log(`\n[ArtifactMemory] 🔍 Building artifact context for conversation: ${conversationId}`);
         artifactContext = await buildArtifactContext(conversationId, query);
         
@@ -1381,21 +1540,40 @@ Instead, present the information as if you're directly reporting the results.`;
           console.log(`[ArtifactMemory] ✅ Artifact ID: ${artifactContext.resolvedArtifact?.id}`);
           console.log(`[ArtifactMemory] ✅ Artifact Type: ${artifactContext.resolvedArtifact?.type}`);
           console.log(`[ArtifactMemory] 📝 Enhanced query: ${enhancedQuery}`);
+          
+          // Emit real-time event: artifact resolved
+          timeline.emitArtifactResolved(artifactContext.resolvedArtifact?.title, artifactContext.resolvedArtifact?.type);
         } else {
           console.log(`[ArtifactMemory] ⚠️ No artifact reference detected in query`);
+          timeline.emitArtifactResolved(null, null);
         }
       } else {
         console.log(`\n[ArtifactMemory] ⚠️ No conversationId provided - artifact memory disabled`);
       }
 
+      // Emit file context processing event if files are attached
+      if (options.fileContext && options.fileContext.filesProcessed > 0) {
+        const fileNames = options.fileContext.textContexts 
+          ? options.fileContext.textContexts.map(f => f.filename).join(', ') 
+          : `${options.fileContext.filesProcessed} file(s)`;
+        timeline.emitNarrative(`Processing attached files: ${fileNames}`);
+      }
+
       // Step 1: Analyze the query to determine which agents are needed
-      // Pass artifact context and memory context to analysis for better routing
-      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext, memoryContext);
+      // Emit real-time event: analyzing query with AI
+      onChunk({ type: 'status', message: 'Analyzing with AI...' });
+      timeline.emitAnalyzingQuery();
+      
+      // Pass artifact context, memory context, and file context to analysis for better routing
+      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext, memoryContext, options.fileContext);
       
       console.log(`\n[MainAgent] 🤖 Query Analysis Result:`);
       console.log(`[MainAgent]   Agents: ${analysis.agents.join(', ')}`);
       console.log(`[MainAgent]   Reasoning: ${analysis.reasoning}`);
       console.log(`[MainAgent]   Queries:`, JSON.stringify(analysis.queries, null, 2));
+      
+      // Emit real-time event: analysis complete with actual reasoning
+      timeline.emitAnalysisComplete(analysis.agents, analysis.reasoning);
       
       // Send analysis result
       onChunk({ 
@@ -1403,29 +1581,44 @@ Instead, present the information as if you're directly reporting the results.`;
         agents: analysis.agents,
         reasoning: analysis.reasoning 
       });
+      
+      // Emit agent added events (real-time: which agents will be used)
+      if (analysis.agents.length > 0) {
+        for (const agentKey of analysis.agents) {
+          timeline.emitAgentAdded(agentKey);
+        }
+      }
 
       // Send status for agent execution
       if (analysis.agents.length === 1) {
         onChunk({ type: 'status', message: `Connecting to ${analysis.agents[0]} agent...` });
-      } else {
+      } else if (analysis.agents.length > 1) {
         onChunk({ type: 'status', message: `Coordinating ${analysis.agents.length} agents...` });
       }
 
       // Step 2: Check if any agent actions require confirmation
       // For now, we execute queries and check if any tool in the result needs confirmation
       // This will be enhanced when specialized agents report their intended tools
-      const { results, errors, confirmationRequest, storedArtifacts } = await this.executeAgentQueriesWithConfirmation(
+      const { results, errors, confirmationRequest, storedArtifacts } = await this.executeAgentQueriesWithConfirmationAndTimeline(
         analysis, 
         userId, 
         enhancedQuery, 
         options.conversationHistory || [],
         conversationId,
-        options.userLocation  // Pass userLocation for Maps agent
+        options.userLocation,  // Pass userLocation for Maps agent
+        timeline  // Pass timeline emitter
       );
 
       // If a confirmation is required, send confirmation_request and stop
       if (confirmationRequest) {
         onChunk({ type: 'thinking', status: 'stop' });
+        
+        // Emit confirmation required event
+        timeline.emitConfirmationRequired(
+          confirmationRequest.toolName,
+          confirmationRequest.agentName,
+          confirmationRequest.previewContent
+        );
         
         // If there are completed operations (e.g., document created before email confirmation),
         // send their results first so the user sees them
@@ -1462,14 +1655,16 @@ Instead, present the information as if you're directly reporting the results.`;
           type: 'confirmation_request',
           ...confirmationRequest
         });
-        return;
+        // Return with flag indicating flow is not complete - don't save timeline yet
+        return { timelineEvents: timeline.getEvents(), pendingConfirmation: true };
       }
 
-      // Send status for response generation
+      // Send status for response generation (real-time event)
       onChunk({ type: 'status', message: 'Generating response...' });
+      timeline.emitGeneratingResponse();
 
       // Step 3: Stream the final response generation
-      // Pass memory context and conversation history for inclusion in the response generation
+      // Pass memory context, conversation history, and file context for inclusion in the response generation
       await this.streamCombinedResponse(
         enhancedQuery, 
         analysis, 
@@ -1478,7 +1673,8 @@ Instead, present the information as if you're directly reporting the results.`;
         onChunk, 
         conversationId, 
         memoryContext,
-        options.conversationHistory || []
+        options.conversationHistory || [],
+        options.fileContext  // Pass file context for LLM
       );
 
       const processingTime = Date.now() - startTime;
@@ -1504,6 +1700,28 @@ Instead, present the information as if you're directly reporting the results.`;
       }
       
       onChunk(metadata);
+      
+      // Check if any agent result is asking for clarification
+      const needsClarification = Object.values(results).some(result => {
+        if (!result?.response) return false;
+        return timeline.detectClarificationRequest(result.response);
+      });
+      
+      // Emit timeline task completed at the very end
+      if (Object.keys(errors).length === 0) {
+        // Complete for both agent results AND empty-agent queries (conversational/file-context)
+        if (Object.keys(results).length > 0) {
+          timeline.emitTaskCompleted('Request completed successfully', needsClarification);
+        } else if (analysis.agents.length === 0) {
+          // No agents were used (conversational query or file-context query)
+          timeline.emitTaskCompleted('Request completed successfully', false);
+        }
+      }
+      
+      // Return timeline events for storage
+      return {
+        timelineEvents: timeline.getEvents()
+      };
 
     } catch (error) {
       console.error('[MainAgent] Error processing streaming query:', error);
@@ -1512,7 +1730,34 @@ Instead, present the information as if you're directly reporting the results.`;
         error: 'Failed to process query',
         message: error.message 
       });
+      
+      // Return timeline events even on error
+      return {
+        timelineEvents: timeline.getEvents()
+      };
     }
+  }
+
+  /**
+   * Execute agent queries with confirmation checking AND timeline events
+   * Wraps executeAgentQueriesWithConfirmation with timeline emitter support
+   */
+  async executeAgentQueriesWithConfirmationAndTimeline(analysis, userId, query, conversationHistory, conversationId = null, userLocation = null, timeline = null) {
+    // Pass timeline through to executeAgentQueriesWithConfirmation
+    // Timeline events are now emitted in real-time from within executeAgentQueries
+    const result = await this.executeAgentQueriesWithConfirmation(
+      analysis, userId, query, conversationHistory, conversationId, userLocation, timeline
+    );
+
+    // If confirmation is required, we'll handle it in the caller
+    if (result.confirmationRequest) {
+      return result;
+    }
+
+    // Task completion is now emitted at the very end after response generation
+    // (moved to processQueryWithStreaming for correct timeline order)
+
+    return result;
   }
 
   /**
@@ -1522,7 +1767,7 @@ Instead, present the information as if you're directly reporting the results.`;
    * Now includes artifact storage via conversationId
    * Now handles multi-step operations (create document + send email) properly using action chains
    */
-  async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory, conversationId = null, userLocation = null) {
+  async executeAgentQueriesWithConfirmation(analysis, userId, query, conversationHistory, conversationId = null, userLocation = null, timeline = null) {
     const lowerQuery = query.toLowerCase();
     
     // Check for multi-step operations that need special handling:
@@ -1681,7 +1926,9 @@ Instead, present the information as if you're directly reporting the results.`;
           confirmationActions,
           query,
           conversationHistory,
-          conversationId
+          conversationId,
+          undefined,  // ttlMs - use default
+          timeline ? timeline.getEvents() : []  // Pass timeline events from initial query
         );
         
         if (chainResult) {
@@ -1718,7 +1965,9 @@ Instead, present the information as if you're directly reporting the results.`;
           action.previewContent,
           query,
           conversationHistory,
-          conversationId
+          conversationId,
+          undefined,  // ttlMs - use default
+          timeline ? timeline.getEvents() : []  // Pass timeline events from initial query
         );
         
         return {
@@ -1775,12 +2024,21 @@ Instead, present the information as if you're directly reporting the results.`;
     if (confirmationRequiredActions.length > 1) {
       console.log(`[Confirmation] Creating action chain with ${confirmationRequiredActions.length} actions`);
       
+      // Debug: Log timeline events being stored
+      const timelineEventsToStore = timeline ? timeline.getEvents() : [];
+      console.log(`[Confirmation] 📊 Storing ${timelineEventsToStore.length} initial timeline events with action chain`);
+      if (timelineEventsToStore.length > 0) {
+        console.log(`[Confirmation] 📊 First event type: ${timelineEventsToStore[0]?.type}, Last event type: ${timelineEventsToStore[timelineEventsToStore.length - 1]?.type}`);
+      }
+      
       const chainResult = confirmationStore.storeActionChain(
         userId,
         confirmationRequiredActions,
         query,
         conversationHistory,
-        conversationId
+        conversationId,
+        undefined,  // ttlMs - use default
+        timelineEventsToStore  // Pass timeline events from initial query
       );
 
       if (chainResult) {
@@ -1822,7 +2080,9 @@ Instead, present the information as if you're directly reporting the results.`;
         action.previewContent,
         query,
         conversationHistory,
-        conversationId
+        conversationId,
+        undefined,  // ttlMs - use default
+        timeline ? timeline.getEvents() : []  // Pass timeline events from initial query
       );
 
       return {
@@ -1843,8 +2103,8 @@ Instead, present the information as if you're directly reporting the results.`;
     }
 
     // No confirmation required, proceed with normal execution
-    // Pass conversationId for artifact storage and userLocation for Maps agent
-    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId, userLocation);
+    // Pass conversationId for artifact storage, userLocation for Maps agent, and conversationHistory for context
+    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId, userLocation, timeline, conversationHistory);
     return { results, errors, storedArtifacts, confirmationRequest: null };
   }
 
@@ -1890,7 +2150,9 @@ Instead, present the information as if you're directly reporting the results.`;
           keywords: ['document', 'doc', 'file'],
           toolName: 'createDocument',
           extractParams: (q) => this.extractDocParams(q),
-          isAsync: false
+          isAsync: false,
+          // Skip confirmation if query involves content generation or updating - let docs agent LLM handle the full flow
+          excludePatterns: ['add content', 'with content', 'write content', 'accordingly', 'about', 'generate', 'populate', 'update', 'append', 'add to', 'modify', 'edit', 'change', 'first', 'second', 'both']
         },
         {
           patterns: ['delete', 'remove'],
@@ -2965,9 +3227,10 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
    * This provides a smooth word-by-word streaming experience like ChatGPT
    * Now includes context about next actions in chain
    */
-  async streamConfirmedActionResponse(executionResult, onChunk) {
+  async streamConfirmedActionResponse(executionResult, onChunk, timeline = null) {
     try {
       onChunk({ type: 'status', message: 'Processing your confirmed action...' });
+      if (timeline) timeline.emitGeneratingResponse();
 
       const { result, query, toolName, agentName, nextConfirmation } = executionResult;
 
@@ -3098,9 +3361,9 @@ If an email was sent, confirm it was sent successfully with the content that was
 
   /**
    * Stream the combined response using OpenAI's streaming API
-   * Now includes artifact context, long-term memory, and full conversation history
+   * Now includes artifact context, long-term memory, file context, and full conversation history
    */
-  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = []) {
+  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = [], fileContext = null) {
     try {
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
@@ -3119,6 +3382,14 @@ If an email was sent, confirm it was sent successfully with the content that was
         artifactContext = await formatArtifactsForPrompt(conversationId);
       }
 
+      // Build file context section for the prompt
+      let fileContextSection = '';
+      if (fileContext && (fileContext.textContent || (fileContext.visionContent && fileContext.visionContent.length > 0))) {
+        const hasFiles = true;
+        const fileCount = fileContext.filesProcessed || 0;
+        fileContextSection = `\n--- Attached Files (${fileCount} file${fileCount > 1 ? 's' : ''}) ---\nThe user has attached files to this message. Their content is provided in the system context and/or as images.\nAnalyze the attached file(s) and respond based on their content.\n---\n`;
+      }
+
       const responsePrompt = `The user asked: "${query}"
 
 Query Analysis:
@@ -3133,8 +3404,18 @@ ${artifactContext ? `\n--- Conversation Artifacts ---\n${artifactContext}\n---\n
 
 ${memoryContext ? `\n--- Long-Term Memories ---\n${memoryContext}\n(Use these memories only if directly relevant. Do not explicitly mention "from your memories" unless appropriate.)\n---\n` : ''}
 
+${fileContextSection}
+
 CRITICAL INSTRUCTION - Response Style:
-${analysis.agents && analysis.agents.length === 0 ? `
+${fileContext && fileContext.filesProcessed > 0 ? `
+📎 The user has attached files. Focus on ANALYZING and RESPONDING to the file content.
+- Read and understand the file content provided in the system context
+- For documents: summarize, extract key points, answer questions about the content
+- For images: describe what you see, analyze the visual content
+- For code: review, explain, or debug the code
+- Always reference the file by name when discussing it
+- Provide thorough analysis based on what the user asked
+` : analysis.agents && analysis.agents.length === 0 ? `
 ⚠️ This is a CONVERSATIONAL query (no agents were used).
 - Answer the question DIRECTLY and CONCISELY
 - DO NOT recap or summarize previous actions
@@ -3152,7 +3433,7 @@ This query required agent actions. Please provide a response that:
 
 Format the response in a clear, readable way.
 Do not include raw JSON or technical details unless specifically relevant.
-${analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the question directly without extra context or recaps!' : ''}`;
+${!fileContext?.filesProcessed && analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the question directly without extra context or recaps!' : ''}`;
 
       // Get dynamic system prompt with artifact context
       const systemPrompt = conversationId 
@@ -3163,6 +3444,17 @@ ${analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the q
       const messages = [
         { role: 'system', content: systemPrompt },
       ];
+
+      // Add file context if provided
+      // For vision files (images), we'll add them along with the user message
+      // For text content, add to system context
+      if (fileContext && fileContext.textContent) {
+        console.log(`[MainAgent] 📎 Adding file context to system: ${fileContext.filesProcessed} files, ~${fileContext.tokensUsed} tokens`);
+        messages.push({
+          role: 'system',
+          content: fileContext.textContent
+        });
+      }
 
       // Add conversation history (limit to last 10 messages to avoid token limits)
       if (conversationHistory && conversationHistory.length > 0) {
@@ -3181,6 +3473,40 @@ ${analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the q
 
       // Add the current response prompt
       messages.push({ role: 'user', content: responsePrompt });
+
+      // If there are vision files (images), add them as multimodal content
+      if (fileContext && fileContext.visionContent && fileContext.visionContent.length > 0) {
+        console.log(`[MainAgent] 🖼️ Adding ${fileContext.visionContent.length} vision files (images)`);
+        
+        // Remove the last text-only user message and combine with vision content
+        messages.pop();
+       
+        // Build multimodal content array
+        const multimodalContent = [
+          {
+            type: 'text',
+            text: responsePrompt
+          }
+        ];
+
+        // Add each vision file
+        for (const visionFile of fileContext.visionContent) {
+          if (visionFile.type === 'image') {
+            // Add the image content items (text + image_url)
+            for (const contentItem of visionFile.content) {
+              if (contentItem.type === 'image_url' || contentItem.type === 'text') {
+                multimodalContent.push(contentItem);
+              }
+            }
+          }
+        }
+
+        // Add multimodal message
+        messages.push({
+          role: 'user',
+          content: multimodalContent
+        });
+      }
 
       // Use OpenAI streaming
       const stream = await this.openai.chat.completions.create({

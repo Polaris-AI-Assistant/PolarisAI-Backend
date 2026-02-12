@@ -16,7 +16,14 @@
 const express = require('express');
 const MainAgent = require('./mainAgent');
 const confirmationStore = require('./confirmationStore');
+const { TimelineEmitter } = require('./timelineEvents');
 const { authenticateToken } = require('../middleware/auth');
+
+// File context imports
+const { buildFileContexts, trackFileReference } = require('../files/fileContextBuilder');
+
+// Socket.io imports for real-time WebSocket events
+const { emitAIThinking, emitAgentStatus, emitChatTitleUpdate } = require('../socket/socketManager');
 
 // Artifact Memory imports
 const { 
@@ -124,7 +131,7 @@ function shouldAutoStoreMemory(query, response, agentsUsed) {
  */
 router.post('/query/stream', authenticateToken, async (req, res) => {
   try {
-    const { query, conversationHistory, conversationId, addToMemory, userLocation, chatId } = req.body;
+    const { query, conversationHistory, conversationId, addToMemory, userLocation, chatId, messageId, fileIds, userMessageId } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -142,11 +149,40 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     if (chatId) {
       console.log(`[MainAgentController] Chat ID (Session ID): ${chatId}`);
     }
+    if (messageId) {
+      console.log(`[MainAgentController] Message ID: ${messageId}`);
+    }
     if (addToMemory) {
       console.log(`[MainAgentController] Auto-store to memory: enabled`);
     }
     if (userLocation) {
       console.log(`[MainAgentController] User location provided: ${userLocation.lat}, ${userLocation.lng}`);
+    }
+    if (fileIds && fileIds.length > 0) {
+      console.log(`[MainAgentController] File IDs provided: ${fileIds.length} files`);
+    }
+
+    // Build file contexts if fileIds provided
+    let fileContext = null;
+    if (fileIds && fileIds.length > 0) {
+      try {
+        console.log(`[MainAgentController] 📎 Building file context for ${fileIds.length} files...`);
+        fileContext = await buildFileContexts(fileIds, query, userId);
+        console.log(`[MainAgentController] ✅ File context built: ${fileContext.filesProcessed} files, ~${fileContext.tokensUsed} tokens`);
+        
+        // Track file references - link to user message (not assistant message) for chat persistence
+        const trackMessageId = userMessageId || messageId;
+        if (trackMessageId && chatId) {
+          for (const fileId of fileIds) {
+            await trackFileReference(fileId, trackMessageId, chatId).catch(err => {
+              console.error(`[MainAgentController] ⚠️ Error tracking file reference:`, err);
+            });
+          }
+        }
+      } catch (fileError) {
+        console.error(`[MainAgentController] ⚠️ Error building file context:`, fileError);
+        // Continue without file context if there's an error
+      }
     }
 
     // Retrieve full chat history from database if chatId is provided
@@ -174,8 +210,13 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); // Disable buffering in nginx
 
-    // Send thinking indicator
+    // Send thinking indicator (SSE)
     res.write(`data: ${JSON.stringify({ type: 'thinking', status: 'start' })}\n\n`);
+
+    // Emit "AI is thinking" via Socket.io for real-time WebSocket clients
+    if (conversationId || chatId) {
+      emitAIThinking(conversationId || chatId, true);
+    }
 
     // Track the complete response for memory storage
     let completeResponse = '';
@@ -185,11 +226,12 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
       // Process the query through the main agent with streaming
       // Now includes conversationId for artifact memory and userLocation for Maps
       // Uses fullChatHistory retrieved from database for complete conversation context
-      await mainAgent.processQueryWithStreaming(query, userId, { 
+      const result = await mainAgent.processQueryWithStreaming(query, userId, { 
         conversationHistory: fullChatHistory,  // Pass full chat history from database
         conversationId,  // Pass conversationId for artifact memory
         userLocation,  // Pass userLocation for Maps agent
-        chatId  // Pass chatId for reference
+        chatId,  // Pass chatId for reference
+        fileContext  // Pass file context for LLM
       }, (chunk) => {
         // Accumulate content chunks for memory storage
         if (chunk.type === 'content' && chunk.text) {
@@ -198,10 +240,38 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         if (chunk.type === 'metadata' && chunk.agentsUsed) {
           agentsUsed = chunk.agentsUsed;
         }
+
+        // Emit agent status updates via Socket.io for real-time listeners
+        if (chunk.type === 'status' && chunk.message) {
+          const activeChatId = conversationId || chatId;
+          if (activeChatId) {
+            emitAgentStatus(activeChatId, chunk.message);
+          }
+        }
         
         // Send each chunk to the client
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       });
+
+      // Save timeline events to database ONLY if flow is complete (no pending confirmation)
+      // If there's a pending confirmation, timeline will be saved after all confirmations are done
+      const hasPendingConfirmation = result?.pendingConfirmation === true;
+      console.log(`[MainAgentController] 📊 Timeline save check - messageId: ${messageId}, chatId: ${chatId}, hasResult: ${!!result}, timelineEvents: ${result?.timelineEvents?.length || 0}, pendingConfirmation: ${hasPendingConfirmation}`);
+      
+      if (!hasPendingConfirmation && messageId && chatId && result && result.timelineEvents && result.timelineEvents.length > 0) {
+        try {
+          console.log(`[MainAgentController] 📊 Saving ${result.timelineEvents.length} timeline events for message ${messageId}`);
+          await chatData.saveTimelineEvents(messageId, chatId, userId, result.timelineEvents);
+          console.log(`[MainAgentController] ✅ Timeline events saved successfully`);
+        } catch (timelineError) {
+          console.error('[MainAgentController] ⚠️ Error saving timeline events:', timelineError.message);
+          // Don't fail the request if timeline storage fails
+        }
+      } else if (hasPendingConfirmation) {
+        console.log(`[MainAgentController] ⏳ Timeline events NOT saved - pending confirmation, will save after all confirmations complete`);
+      } else {
+        console.log(`[MainAgentController] ⚠️ Timeline events NOT saved - missing: messageId=${!!messageId}, chatId=${!!chatId}, result=${!!result}, events=${result?.timelineEvents?.length || 0}`);
+      }
 
       // Auto-store to memory if enabled or if auto-store conditions are met
       if (addToMemory || shouldAutoStoreMemory(query, completeResponse, agentsUsed)) {
@@ -253,12 +323,23 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         }
       }
 
+      // Stop AI thinking indicator via Socket.io
+      if (conversationId || chatId) {
+        emitAIThinking(conversationId || chatId, false);
+      }
+
       // Send completion signal
       res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
       res.end();
 
     } catch (error) {
       console.error('[MainAgentController] Streaming error:', error);
+
+      // Stop AI thinking indicator on error via Socket.io
+      if (conversationId || chatId) {
+        emitAIThinking(conversationId || chatId, false);
+      }
+
       res.write(`data: ${JSON.stringify({ 
         type: 'error', 
         error: error.message || 'Failed to process query' 
@@ -369,14 +450,16 @@ router.post('/query', authenticateToken, async (req, res) => {
  * 
  * Request body:
  * {
- *   "requestId": "uuid-of-pending-action"
+ *   "requestId": "uuid-of-pending-action",
+ *   "messageId": "optional-message-id-for-timeline-storage",
+ *   "chatId": "optional-chat-id-for-timeline-storage"
  * }
  * 
  * Response: Server-Sent Events (SSE) stream with execution result
  */
 router.post('/confirm-action', authenticateToken, async (req, res) => {
   try {
-    const { requestId } = req.body;
+    const { requestId, messageId, chatId } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -387,7 +470,7 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
       });
     }
 
-    console.log(`[MainAgentController] User ${userId} confirming action: ${requestId}`);
+    console.log(`[MainAgentController] User ${userId} confirming action: ${requestId}, messageId: ${messageId}, chatId: ${chatId}`);
 
     // Verify the pending action exists and belongs to this user
     const pendingAction = confirmationStore.getPendingAction(requestId, userId);
@@ -398,6 +481,12 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
         message: 'The action you are trying to confirm is no longer available. It may have expired or been canceled.'
       });
     }
+    
+    // Debug: Log pending action timeline events
+    console.log(`[MainAgentController] 🔍 PendingAction timelineEvents: ${pendingAction.timelineEvents?.length || 0} events`);
+    if (pendingAction.chainId) {
+      console.log(`[MainAgentController] 🔗 Chain: ${pendingAction.chainId}, step ${(pendingAction.chainIndex || 0) + 1}/${pendingAction.totalInChain || '?'}`);
+    }
 
     // Set up SSE headers for streaming response
     res.setHeader('Content-Type', 'text/event-stream');
@@ -405,15 +494,30 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
 
+    // Create timeline emitter for confirmation flow
+    const onChunk = (chunk) => {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    };
+    const timeline = new TimelineEmitter(onChunk, userId, pendingAction.conversationId);
+
     // Send thinking indicator
     res.write(`data: ${JSON.stringify({ type: 'thinking', status: 'start' })}\n\n`);
-    res.write(`data: ${JSON.stringify({ type: 'status', message: 'Executing your confirmed action...' })}\n\n`);
+
+    // Emit AI thinking via Socket.io for confirmation flow
+    if (chatId) {
+      emitAIThinking(chatId, true);
+    }
+    
+    // Emit confirmation received timeline event
+    timeline.emitConfirmationReceived(pendingAction.toolName, pendingAction.agentName, true);
+    timeline.emitNarrative('Executing confirmed action...');
 
     try {
-      // Execute the confirmed action
-      const executionResult = await mainAgent.executeConfirmedAction(requestId, userId);
+      // Execute the confirmed action with timeline
+      const executionResult = await mainAgent.executeConfirmedAction(requestId, userId, timeline);
 
       if (!executionResult.success) {
+        timeline.emitTaskFailed(executionResult.error || 'Failed to execute action');
         res.write(`data: ${JSON.stringify({ 
           type: 'error', 
           error: executionResult.error || 'Failed to execute action'
@@ -424,19 +528,56 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
       }
 
       // Stream the response after successful execution
-      await mainAgent.streamConfirmedActionResponse(executionResult, (chunk) => {
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      });
+      await mainAgent.streamConfirmedActionResponse(executionResult, onChunk, timeline);
 
       // Check if there's a next action in the chain that needs confirmation
       if (executionResult.nextConfirmation) {
         console.log(`[MainAgentController] Sending next confirmation in chain: ${executionResult.nextConfirmation.toolName}`);
+        
+        // Emit step completed event to mark the current generating_response as done
+        // This prevents the "Generating response..." from staying stuck
+        timeline.emitNarrative(`Step completed. Proceeding to ${executionResult.nextConfirmation.toolName}...`);
+        
+        // Emit waiting for next confirmation
+        timeline.emitConfirmationRequired(
+          executionResult.nextConfirmation.toolName,
+          executionResult.nextConfirmation.agentName,
+          executionResult.nextConfirmation.previewContent
+        );
         
         // Send the next confirmation request
         res.write(`data: ${JSON.stringify({ 
           type: 'confirmation_request',
           ...executionResult.nextConfirmation
         })}\n\n`);
+      } else {
+        // Emit task completed - this is the final step
+        timeline.emitTaskCompleted('All tasks completed successfully');
+        
+        // Save timeline events now that the chain is complete
+        // MERGE initial timeline events from the query with confirmation flow events
+        if (messageId && chatId) {
+          try {
+            const confirmationEvents = timeline.getEvents();
+            // Merge: initial query events + confirmation flow events
+            const initialEvents = pendingAction.timelineEvents || [];
+            const allTimelineEvents = [...initialEvents, ...confirmationEvents];
+            
+            console.log(`[MainAgentController] 📊 Confirmation chain complete - Merging ${initialEvents.length} initial + ${confirmationEvents.length} confirmation = ${allTimelineEvents.length} total events for message ${messageId}`);
+            await chatData.saveTimelineEvents(messageId, chatId, userId, allTimelineEvents);
+            console.log(`[MainAgentController] ✅ Timeline events saved successfully after confirmation chain`);
+          } catch (timelineError) {
+            console.error('[MainAgentController] ⚠️ Error saving timeline events after confirmation:', timelineError.message);
+            // Don't fail the request if timeline storage fails
+          }
+        } else {
+          console.log(`[MainAgentController] ⚠️ Timeline events NOT saved after confirmation - missing messageId or chatId`);
+        }
+      }
+
+      // Stop AI thinking via Socket.io after confirmation completes
+      if (chatId) {
+        emitAIThinking(chatId, false);
       }
 
       // Send completion signal
@@ -445,6 +586,12 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
 
     } catch (error) {
       console.error('[MainAgentController] Confirm action error:', error);
+
+      // Stop AI thinking on error via Socket.io
+      if (chatId) {
+        emitAIThinking(chatId, false);
+      }
+
       res.write(`data: ${JSON.stringify({ 
         type: 'error', 
         error: error.message || 'Failed to execute confirmed action'
