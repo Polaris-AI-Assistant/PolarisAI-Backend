@@ -131,7 +131,7 @@ function shouldAutoStoreMemory(query, response, agentsUsed) {
  */
 router.post('/query/stream', authenticateToken, async (req, res) => {
   try {
-    const { query, conversationHistory, conversationId, addToMemory, userLocation, chatId, messageId, fileIds, userMessageId } = req.body;
+    const { query, conversationHistory, conversationId, addToMemory, userLocation, chatId, messageId, fileIds, userMessageId, responseLanguage } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -231,7 +231,8 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         conversationId,  // Pass conversationId for artifact memory
         userLocation,  // Pass userLocation for Maps agent
         chatId,  // Pass chatId for reference
-        fileContext  // Pass file context for LLM
+        fileContext,  // Pass file context for LLM
+        responseLanguage  // Pass response language preference for multi-language support
       }, (chunk) => {
         // Accumulate content chunks for memory storage
         if (chunk.type === 'content' && chunk.text) {

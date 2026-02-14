@@ -77,7 +77,7 @@ class MainAgent {
     this.agents = {
       calendar: new CalendarAgent(),
       docs: {
-        processQuery: (query, userId) => docsAgent.processQuery(query, userId)
+        processQuery: (query, userId, options) => docsAgent.processQuery(query, userId, options)
       },
       forms: new FormsAgent(),
       github: new GitHubAgent(),
@@ -506,6 +506,122 @@ Return ONLY a JSON object:
   }
 
   /**
+   * Enrich a sequential agent's query with concrete data from previous agent results.
+   * For example, if calendar created a Google Meet, inject the real meet link
+   * into the gmail query so the email contains the actual URL.
+   */
+  async _enrichQueryWithPreviousResults(agentQuery, agentName, previousResults, userId) {
+    try {
+      // Only enrich email-sending agents (gmail, microsoft)
+      if (agentName !== 'gmail' && agentName !== 'microsoft') {
+        return agentQuery;
+      }
+
+      // Collect links and data from all previous results
+      const collectedData = [];
+
+      for (const [prevAgent, prevResult] of Object.entries(previousResults)) {
+        if (!prevResult || !prevResult.success) continue;
+
+        // Extract links from raw_results
+        if (prevResult.raw_results && Array.isArray(prevResult.raw_results)) {
+          for (const raw of prevResult.raw_results) {
+            // Google Meet / Calendar
+            if (raw.hangoutLink) {
+              collectedData.push({ type: 'Google Meet', link: raw.hangoutLink, title: raw.event?.summary || 'Meeting' });
+            }
+            if (raw.htmlLink && !raw.hangoutLink) {
+              collectedData.push({ type: 'Calendar Event', link: raw.htmlLink, title: raw.event?.summary || 'Event' });
+            }
+            // Google Forms
+            if (raw.formUrl) {
+              collectedData.push({ type: 'Google Form', link: raw.formUrl, title: raw.formTitle || 'Form' });
+            }
+            // Google Docs
+            if (raw.documentUrl) {
+              collectedData.push({ type: 'Google Doc', link: raw.documentUrl, title: raw.title || 'Document' });
+            }
+            // Google Sheets
+            if (raw.spreadsheetUrl) {
+              collectedData.push({ type: 'Google Sheet', link: raw.spreadsheetUrl, title: raw.title || 'Spreadsheet' });
+            }
+            // Microsoft
+            if (raw.webUrl) {
+              collectedData.push({ type: 'Document', link: raw.webUrl, title: raw.name || 'Document' });
+            }
+          }
+        }
+
+        // Also try extracting URLs from the response text as fallback
+        if (collectedData.length === 0 && prevResult.response && typeof prevResult.response === 'string') {
+          const urlMatches = prevResult.response.match(/https:\/\/[^\s\)\]]+/g);
+          if (urlMatches) {
+            for (const url of urlMatches) {
+              if (url.includes('meet.google.com')) {
+                collectedData.push({ type: 'Google Meet', link: url, title: 'Meeting' });
+              } else if (url.includes('docs.google.com/forms')) {
+                collectedData.push({ type: 'Google Form', link: url });
+              } else if (url.includes('docs.google.com/document')) {
+                collectedData.push({ type: 'Google Doc', link: url });
+              } else if (url.includes('docs.google.com/spreadsheets')) {
+                collectedData.push({ type: 'Google Sheet', link: url });
+              } else if (url.includes('google.com/calendar')) {
+                collectedData.push({ type: 'Calendar Event', link: url });
+              }
+            }
+          }
+        }
+      }
+
+      if (collectedData.length === 0) {
+        return agentQuery;
+      }
+
+      // Get sender's display name
+      let senderName = '';
+      try {
+        const supabase = require('../supabase/supabaseConnect');
+        const { data: calendarData } = await supabase
+          .from('calendar_tokens')
+          .select('name')
+          .eq('user_id', userId)
+          .single();
+        if (calendarData?.name) {
+          senderName = calendarData.name;
+        }
+        if (!senderName) {
+          const { data: userData } = await supabase.auth.admin.getUserById(userId);
+          if (userData?.user) {
+            senderName = userData.user.user_metadata?.full_name ||
+                         userData.user.user_metadata?.name || '';
+          }
+        }
+      } catch (e) {
+        console.log(`[MainAgent] Could not fetch sender name: ${e.message}`);
+      }
+
+      // Build enrichment context
+      const linksText = collectedData.map(d => `- ${d.type}: ${d.link}${d.title ? ` (${d.title})` : ''}`).join('\n');
+
+      const enrichedQuery = `${agentQuery}
+
+IMPORTANT CONTEXT FROM PREVIOUS ACTION:
+The following items were just created and their links MUST be included in the email:
+${linksText}
+
+Include the actual link(s) above in the email body — do NOT use placeholders like "[Google Meet Link]".
+${senderName ? `The sender's name is "${senderName}" — use it in the sign-off instead of "[Your Name]".` : ''}`;
+
+      console.log(`[MainAgent] ✅ Enriched ${agentName} query with ${collectedData.length} link(s) from previous results`);
+      return enrichedQuery;
+
+    } catch (error) {
+      console.error(`[MainAgent] Error enriching query:`, error);
+      return agentQuery;
+    }
+  }
+
+  /**
    * Cancel a pending action
    * 
    * @param {string} requestId - The pending action request ID
@@ -862,7 +978,24 @@ When you create or modify something:
 - Use the existing artifact ID for follow-up modifications
 - Always confirm successful operations with the artifact details
 
-Remember: Artifacts are preserved within a conversation thread. Use this context to provide seamless multi-step interactions.`;
+Remember: Artifacts are preserved within a conversation thread. Use this context to provide seamless multi-step interactions.
+
+**MULTI-LANGUAGE SUPPORT**:
+You support ALL languages. Always detect the EXACT language of the user's message and respond in the SAME language.
+
+Language Detection Rules:
+1. CAREFULLY distinguish between similar languages. Do NOT default to Hindi for all Indian languages:
+   - Marathi: words like "kara", "navane", "mhanje", "aahe", "karayche", "zala", "tya" → respond in Marathi
+   - Hindi: words like "karo", "naam", "hai", "karna", "hua", "uska" → respond in Hindi
+   - Tamil, Telugu, Gujarati, Bengali, etc. each have distinct vocabulary — identify them accurately
+   - Similarly: distinguish Portuguese vs Spanish, Czech vs Slovak, etc.
+2. MATCH THE SCRIPT the user used:
+   - If user writes in Romanized/Latin script (e.g., "google docs taiyarr kara"), respond in the SAME Romanized/Latin script of that language (e.g., "Tumcha document tayaar zala ahe!")
+   - If user writes in native script (e.g., Devanagari "गूगल डॉक्स बनवा"), respond in native script
+   - NEVER convert Romanized input to a native script — always mirror the user's script choice
+3. Technical terms, product names (Google Docs, Gmail, etc.), URLs, and identifiers can remain in English
+4. Markdown formatting should still be used regardless of language
+5. Keep the same helpful, friendly tone in whatever language the user uses`;
   }
 
   /**
@@ -966,8 +1099,20 @@ Use this context to better understand the user's intent and route accordingly.`;
       if (conversationHistory && conversationHistory.length > 0) {
         // Get last few messages for context (max 6 messages)
         const recentHistory = conversationHistory.slice(-6);
+        
+        // Check if the current query references content from conversation
+        // (e.g., "add this summary", "put this in a doc", "add that to")
+        const lowerQ = query.toLowerCase();
+        const referencesContent = /\b(add|put|insert|paste|copy|include|use)\b.*\b(this|that|the|it|above|previous|last)\b.*\b(summary|content|text|response|answer|result|info|information|details|data)\b/i.test(query) ||
+          /\b(add|put)\b.*\b(this|that|it)\b.*\b(to|into|in)\b/i.test(query) ||
+          /\b(this|that|the)\b.*\b(summary|content|text)\b.*\b(to|into|in)\b/i.test(query);
+        
+        // Use higher char limit when user references content from conversation
+        // to ensure the full content is available for the routing LLM
+        const charLimit = referencesContent ? 8000 : 500;
+        
         const historyText = recentHistory.map(msg => 
-          `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, 500)}`
+          `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, charLimit)}`
         ).join('\n');
         
         conversationSection = `\n\nRECENT CONVERSATION HISTORY:
@@ -1140,7 +1285,14 @@ Important:
 - Be specific in the queries for each agent
 - Set requiresSequential to true when one action depends on another (create something, then share/email it)
 - Consider if operations need to be sequential (e.g., create then send) or can be parallel
-- ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar`;
+- ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar
+
+CRITICAL - Content Reference Rule for Docs/Sheets/Microsoft:
+When the user says "add this summary to a new doc", "put this in a google doc", "add the summary to a doc", or similar phrases that reference content from a PREVIOUS assistant message in the conversation:
+- The query you generate for the agent MUST include the FULL content from that previous assistant message
+- Do NOT just say "add the summary" - include the ACTUAL summary text in the query
+- Example: If the previous assistant message contained a resume summary, the docs query should be: "create a new google doc titled 'resume summary' and add the following content to it: [FULL SUMMARY TEXT FROM CONVERSATION]"
+- This ensures the agent has the actual content to add to the document`;
 
       // Build file context section for analysis prompt
       let fileContextSection = '';
@@ -1211,8 +1363,15 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
         // Execute agents sequentially based on dependencies
         for (const agentName of analysis.agents) {
           try {
-            const agentQuery = analysis.queries[agentName];
+            let agentQuery = analysis.queries[agentName];
             console.log(`[MainAgent] Executing ${agentName} sequentially with query: "${agentQuery}"`);
+
+            // ====== ENRICH QUERY WITH PREVIOUS RESULTS ======
+            // When executing sequentially, inject concrete data from prior agents
+            // into the current agent's query (e.g. real Meet link, doc URL, form link).
+            if (Object.keys(results).length > 0) {
+              agentQuery = await this._enrichQueryWithPreviousResults(agentQuery, agentName, results, userId);
+            }
             
             // Emit executing event BEFORE agent starts
             if (timeline) {
@@ -1400,7 +1559,14 @@ Please create a single, coherent, user-friendly response that:
 6. Uses a friendly, helpful tone
 
 Do not use phrases like "Agent X said" or "According to the Calendar Agent". 
-Instead, present the information as if you're directly reporting the results.`;
+Instead, present the information as if you're directly reporting the results.
+
+**CRITICAL - LANGUAGE MATCHING**:
+Detect the EXACT language of the user's query above and respond ENTIRELY in that SAME language.
+- CAREFULLY distinguish between similar languages: Marathi vs Hindi ("kara/navane/zala" = Marathi, "karo/naam/hua" = Hindi), Portuguese vs Spanish, etc. Do NOT default to Hindi for all Indian languages.
+- MATCH THE SCRIPT: If the user typed in Romanized/Latin script (e.g., "taiyarr kara"), respond in the same Romanized script (e.g., "Tumcha document tayaar zala!"). If they used native script (Devanagari, Arabic, CJK), respond in native script. NEVER convert Romanized input into a different script.
+- Technical terms, product names (Google Docs), URLs, and identifiers can remain in English
+- Markdown formatting should still be used`;
 
       const messages = [
         { role: 'system', content: this.systemPrompt },
@@ -1664,7 +1830,7 @@ Instead, present the information as if you're directly reporting the results.`;
       timeline.emitGeneratingResponse();
 
       // Step 3: Stream the final response generation
-      // Pass memory context, conversation history, and file context for inclusion in the response generation
+      // Pass memory context, conversation history, file context, and response language for inclusion in the response generation
       await this.streamCombinedResponse(
         enhancedQuery, 
         analysis, 
@@ -1674,7 +1840,8 @@ Instead, present the information as if you're directly reporting the results.`;
         conversationId, 
         memoryContext,
         options.conversationHistory || [],
-        options.fileContext  // Pass file context for LLM
+        options.fileContext,  // Pass file context for LLM
+        options.responseLanguage  // Pass response language preference
       );
 
       const processingTime = Date.now() - startTime;
@@ -2152,7 +2319,7 @@ Instead, present the information as if you're directly reporting the results.`;
           extractParams: (q) => this.extractDocParams(q),
           isAsync: false,
           // Skip confirmation if query involves content generation or updating - let docs agent LLM handle the full flow
-          excludePatterns: ['add content', 'with content', 'write content', 'accordingly', 'about', 'generate', 'populate', 'update', 'append', 'add to', 'modify', 'edit', 'change', 'first', 'second', 'both']
+          excludePatterns: ['add content', 'with content', 'write content', 'accordingly', 'about', 'generate', 'populate', 'update', 'append', 'add to', 'add this', 'add the', 'add my', 'add that', 'add it', 'put this', 'put the', 'put my', 'into a new', 'summary', 'modify', 'edit', 'change', 'first', 'second', 'both']
         },
         {
           patterns: ['delete', 'remove'],
@@ -3311,6 +3478,16 @@ IMPORTANT: If the result shows success=true, the action DID complete successfull
 If emailSent=true, the email WAS sent successfully with all the content that was specified.
 If msWebUrl or microsoftLink is present, that link WAS included in any emails that referenced it.
 
+**CRITICAL - LANGUAGE MATCHING**:
+Detect the EXACT language of the "Original Query" above and respond ENTIRELY in that SAME language.
+- CAREFULLY distinguish between similar languages: Marathi vs Hindi ("kara/navane" = Marathi, "karo/naam" = Hindi), Portuguese vs Spanish, etc.
+- MATCH THE SCRIPT: If the user typed in Romanized/Latin script (e.g., "taiyarr kara"), respond in Romanized script too (e.g., "Tumcha document tayaar zala!"). If they used native script (Devanagari, Arabic, CJK), respond in native script.
+- NEVER convert Romanized input into a different script — always mirror the user's script choice
+- All explanations, confirmations, and conversational text must be in the user's detected language
+- Technical terms, product names (Google Docs, Google Meet), URLs, and identifiers can remain in English
+- Markdown formatting should still be used
+- Keep the same helpful, friendly tone
+
 Format the response clearly. If an event was created, include the event details like title, date, time.
 If a document was created, include the title and link if available.
 If a form was created, include the form title and a link to view/edit it.
@@ -3361,9 +3538,9 @@ If an email was sent, confirm it was sent successfully with the content that was
 
   /**
    * Stream the combined response using OpenAI's streaming API
-   * Now includes artifact context, long-term memory, file context, and full conversation history
+   * Now includes artifact context, long-term memory, file context, full conversation history, and multi-language support
    */
-  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = [], fileContext = null) {
+  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = [], fileContext = null, responseLanguage = null) {
     try {
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
@@ -3433,7 +3610,16 @@ This query required agent actions. Please provide a response that:
 
 Format the response in a clear, readable way.
 Do not include raw JSON or technical details unless specifically relevant.
-${!fileContext?.filesProcessed && analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the question directly without extra context or recaps!' : ''}`;
+${!fileContext?.filesProcessed && analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the question directly without extra context or recaps!' : ''}
+
+**CRITICAL - LANGUAGE MATCHING**:
+${responseLanguage && responseLanguage !== 'English' ? `The user's preferred language is **${responseLanguage}**. You MUST respond ENTIRELY in ${responseLanguage}.` : `Detect the EXACT language of the user's query above. If the user wrote in a non-English language, you MUST respond ENTIRELY in that SAME language.`}
+- CAREFULLY distinguish between similar languages: Marathi vs Hindi ("kara/navane/zala" = Marathi, "karo/naam/hua" = Hindi), Portuguese vs Spanish, etc. Do NOT default to Hindi for all Indian languages.
+- MATCH THE SCRIPT: If the user typed in Romanized/Latin script (e.g., "taiyarr kara"), respond in the same Romanized script (e.g., "Tumcha document tayaar zala!"). If they used native script (e.g., Devanagari "डॉक्स बनवा"), respond in native script. NEVER convert Romanized input into a different script.
+- All explanations, summaries, confirmations must be in the user's language and script
+- Technical terms, product names (Google Docs), URLs, and identifiers can remain in English
+- Markdown formatting should still be used
+`;
 
       // Get dynamic system prompt with artifact context
       const systemPrompt = conversationId 
@@ -3547,7 +3733,10 @@ ${!fileContext?.filesProcessed && analysis.agents && analysis.agents.length === 
       const analysis = await this.analyzeQuery(query, options.conversationHistory);
 
       // Step 2: Execute queries on the appropriate agents
-      const { results, errors } = await this.executeAgentQueries(analysis, userId);
+      // Pass conversationHistory so agents receive context (e.g. scheduled action instructions)
+      const { results, errors } = await this.executeAgentQueries(
+        analysis, userId, null, null, null, options.conversationHistory || []
+      );
 
       // Step 3: Combine responses into a coherent final response
       const finalResponse = await this.combineResponses(query, analysis, results, errors);

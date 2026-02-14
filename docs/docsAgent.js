@@ -425,11 +425,20 @@ Use these markdown patterns in the \`content\` parameter of appendFormattedText:
    - Use blank lines between paragraphs
 
 **CONTENT GENERATION WORKFLOW:**
-When user says "create a document about X" or "add content about X":
 
+**CRITICAL RULE - USING CONTENT FROM CONVERSATION HISTORY:**
+When the user says "add this summary", "add the summary", "put this in a doc", "add that to a doc", or references ANY content from a previous message in the conversation:
+1. Look through the conversation history for the content the user is referring to
+2. Use THAT EXACT content (properly formatted in markdown) - do NOT generate new content
+3. Call createDocument with the appropriate title
+4. Call appendFormattedText with the content from conversation history, formatted in markdown
+
+**For NEW content generation** (e.g., "create a document about X"):
 1. Call createDocument with appropriate title
 2. Generate comprehensive, well-structured content using YOUR KNOWLEDGE
 3. Call appendFormattedText with markdown-formatted content
+
+**IMPORTANT:** If the conversation history contains content the user wants to add (like a summary, analysis, or any previous AI response), ALWAYS use that content verbatim. Do NOT just create an empty document.
 
 **EXAMPLE - Creating a document about Indian Government:**
 

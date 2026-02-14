@@ -63,6 +63,10 @@ const microsoftAgentRoutes = require('./microsoft/microsoftAgentController');
 // File upload routes
 const filesRoutes = require('./files/filesRoutes');
 
+// Schedule routes
+const scheduleRoutes = require('./schedules/scheduleController');
+const scheduleEngine = require('./schedules/scheduleEngine');
+
 const app = express();
 const server = http.createServer(app);
 const port = process.env.PORT || 3000;
@@ -168,6 +172,9 @@ app.use('/api/microsoft', microsoftAgentRoutes);
 // Use File upload routes
 app.use('/api', filesRoutes);
 
+// Use Schedule routes
+app.use('/api/schedules', scheduleRoutes);
+
 // Health check route
 app.get('/health', async (req, res) => {
   try {
@@ -209,6 +216,15 @@ app.get('/api', (req, res) => {
         'POST /api/memory/retrieve': 'Retrieve relevant memories using semantic search',
         'GET /api/memory/list': 'List all memories for a user',
         'DELETE /api/memory/:id': 'Delete a specific memory'
+      },
+      schedules: {
+        'POST /api/schedules': 'Create a new schedule (reminder or action)',
+        'GET /api/schedules': 'List user schedules (filter by status)',
+        'GET /api/schedules/:id': 'Get a specific schedule',
+        'PATCH /api/schedules/:id': 'Update a schedule',
+        'DELETE /api/schedules/:id': 'Delete a schedule',
+        'POST /api/schedules/:id/pause': 'Pause a schedule',
+        'POST /api/schedules/:id/resume': 'Resume a paused schedule'
       },
       specializedAgents: {
         'POST /api/calendar/agent/query': 'Google Calendar AI Agent',
@@ -314,4 +330,7 @@ server.listen(port, () => {
   console.log(`📚 API documentation available at http://localhost:${port}/api`);
   console.log(`❤️  Health check available at http://localhost:${port}/health`);
   console.log(`🔌 Socket.io ready for WebSocket connections`);
+
+  // Start the self-hosted schedule engine
+  scheduleEngine.start();
 });
