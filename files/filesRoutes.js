@@ -6,6 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const filesController = require('./filesController');
+const fileGenerationController = require('./fileGenerationController');
 const authMiddleware = require('../middleware/auth');
 
 // Middleware to verify user authentication (compatible with both methods)
@@ -72,5 +73,18 @@ router.delete('/files/:id', filesController.deleteFile);
 
 // Manually trigger file processing
 router.post('/files/:id/process', filesController.reprocessFile);
+
+/**
+ * File Generation Routes
+ */
+
+// Generate PDF or TXT file from content
+router.post('/files/generate', fileGenerationController.generateFile);
+
+// Generate PDF specifically
+router.post('/files/generate-pdf', fileGenerationController.generatePDFFile);
+
+// Generate TXT file specifically
+router.post('/files/generate-txt', fileGenerationController.generateTextFile);
 
 module.exports = router;

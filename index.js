@@ -56,12 +56,18 @@ const chatRoutes = require('./chat/chatController');
 const memoryRoutes = require('./memory/memoryController');
 const memorySettingsRoutes = require('./memory/memorySettingsController');
 
+// User Settings routes
+const userSettingsRoutes = require('./user/userSettingsController');
+
 // Microsoft routes
 const microsoftAuthRoutes = require('./microsoft/microsoftAuth');
 const microsoftAgentRoutes = require('./microsoft/microsoftAgentController');
 
 // File upload routes
 const filesRoutes = require('./files/filesRoutes');
+
+// Vault (file management) routes
+const vaultRoutes = require('./files/vaultRoutes');
 
 // Schedule routes
 const scheduleRoutes = require('./schedules/scheduleController');
@@ -165,12 +171,18 @@ app.use('/api/memory', memoryRoutes);
 // Use Memory Settings routes
 app.use('/api/settings', memorySettingsRoutes);
 
+// Use User Settings routes
+app.use('/api/user', userSettingsRoutes);
+
 // Use Microsoft routes
 app.use('/api', microsoftAuthRoutes.router);
 app.use('/api/microsoft', microsoftAgentRoutes);
 
 // Use File upload routes
 app.use('/api', filesRoutes);
+
+// Use Vault (file management) routes
+app.use('/api/vault', vaultRoutes);
 
 // Use Schedule routes
 app.use('/api/schedules', scheduleRoutes);

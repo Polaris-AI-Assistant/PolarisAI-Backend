@@ -112,6 +112,7 @@ const ACTION_KEYWORDS = {
 
 /**
  * Check if query contains a reference to a previous artifact
+ * Requires both a reference word AND an action verb to reduce false positives
  * 
  * @param {string} query - User query
  * @returns {boolean} - True if query contains an artifact reference
@@ -119,7 +120,20 @@ const ACTION_KEYWORDS = {
 const containsArtifactReference = (query) => {
     const lowercased = query.toLowerCase();
     
-    return REFERENCE_PATTERNS.some(pattern => pattern.test(lowercased));
+    // Must contain a reference pattern
+    const hasReference = REFERENCE_PATTERNS.some(pattern => pattern.test(lowercased));
+    if (!hasReference) return false;
+    
+    // ALSO must contain an action keyword to disambiguate from generic pronouns
+    const actionKeywords = [
+        'update', 'modify', 'change', 'edit', 'add', 'remove', 'delete',
+        'send', 'publish', 'share', 'forward', 'submit', 'view', 'show',
+        'display', 'open', 'check', 'book', 'select', 'choose', 'continue'
+    ];
+    
+    const hasAction = actionKeywords.some(kw => lowercased.includes(kw));
+    
+    return hasReference && hasAction;
 };
 
 /**

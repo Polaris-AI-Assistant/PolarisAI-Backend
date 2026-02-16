@@ -1045,6 +1045,25 @@ Language Detection Rules:
         };
       }
 
+      // Pre-check: Detect planning/advisory queries vs actual action queries
+      // "planning to create", "thinking about", "want to know how", "help me make a plan" = ADVISORY, no agents
+      const advisoryPatterns = [
+        /\b(planning|thinking|wondering|considering|i want to know|how\s+should|help me|suggest|advise|give me|provide|explain)\b.*\b(how|what|way|approach|strategy|plan|steps|process)\b/i,
+        /\b(planning to create|planning to make|thinking about creating|considering creating|what.*to create)\b/i,
+        /\b(help me.*plan|give me.*plan|how.*to.*project|how.*should.*proceed|project.*plan|implementation.*plan)\b/i,
+        /\b(guide me|walk me through|tell me how|what is|what are|best practices|approach|methodology)\b/i
+      ];
+
+      const isAdvisory = advisoryPatterns.some(pattern => pattern.test(query));
+      
+      if (isAdvisory && !/(create|make|send|book|schedule|build)\s+(a|the|my)?\s*(form|document|email|calendar|event|meet|form|sheet)/i.test(query)) {
+        console.log('[MainAgent] 💡 Detected advisory/planning query - skipping agents:', query);
+        return {
+          agents: [],
+          reasoning: "User is asking for advice, guidance, or planning help - no agents needed, will provide advisory response"
+        };
+      }
+
       // Pre-check: If files are attached, detect file-related queries that should NOT route to agents
       // These queries should be answered using the file content already injected into context
       if (fileContext && fileContext.filesProcessed > 0) {
@@ -3612,13 +3631,15 @@ Format the response in a clear, readable way.
 Do not include raw JSON or technical details unless specifically relevant.
 ${!fileContext?.filesProcessed && analysis.agents && analysis.agents.length === 0 ? 'Remember: Just answer the question directly without extra context or recaps!' : ''}
 
-**CRITICAL - LANGUAGE MATCHING**:
-${responseLanguage && responseLanguage !== 'English' ? `The user's preferred language is **${responseLanguage}**. You MUST respond ENTIRELY in ${responseLanguage}.` : `Detect the EXACT language of the user's query above. If the user wrote in a non-English language, you MUST respond ENTIRELY in that SAME language.`}
+**CRITICAL - LANGUAGE MATCHING** (Detect from current query ONLY):
+ALWAYS detect the EXACT language of the user's LATEST query above, regardless of any previous queries or user preferences.
+Respond ENTIRELY in the language of the current query - if they asked in English, answer in English. If they asked in Marathi, answer in Marathi.
 - CAREFULLY distinguish between similar languages: Marathi vs Hindi ("kara/navane/zala" = Marathi, "karo/naam/hua" = Hindi), Portuguese vs Spanish, etc. Do NOT default to Hindi for all Indian languages.
 - MATCH THE SCRIPT: If the user typed in Romanized/Latin script (e.g., "taiyarr kara"), respond in the same Romanized script (e.g., "Tumcha document tayaar zala!"). If they used native script (e.g., Devanagari "डॉक्स बनवा"), respond in native script. NEVER convert Romanized input into a different script.
 - All explanations, summaries, confirmations must be in the user's language and script
 - Technical terms, product names (Google Docs), URLs, and identifiers can remain in English
 - Markdown formatting should still be used
+- IGNORE any stored language preferences - ONLY respond in the language of this current query
 `;
 
       // Get dynamic system prompt with artifact context

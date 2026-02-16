@@ -41,8 +41,8 @@ router.get('/memory', authenticateToken, async (req, res) => {
 
         // Try to get existing settings
         const { data, error } = await supabase
-            .from('memory_settings')
-            .select('*')
+            .from('user_settings')
+            .select('notifications')
             .eq('user_id', userId)
             .single();
 

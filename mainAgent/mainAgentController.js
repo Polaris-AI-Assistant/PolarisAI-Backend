@@ -51,67 +51,18 @@ const mainAgent = new MainAgent();
  * Determine if an exchange should be automatically stored in long-term memory
  * Based on heuristics about the exchange content and type
  * 
+ * IMPORTANT: This is now disabled by default. Only explicit user action (clicking "remember")
+ * should trigger memory storage to respect user consent.
+ * 
  * @param {string} query - User's query
  * @param {string} response - Assistant's response
  * @param {string[]} agentsUsed - List of agents used
- * @returns {boolean} - Whether to auto-store
+ * @returns {boolean} - Whether to auto-store (ALWAYS FALSE now - require explicit user action)
  */
 function shouldAutoStoreMemory(query, response, agentsUsed) {
-  // Skip if auto-store is disabled in config
-  if (!MEMORY_CONFIG.AUTO_STORE_ENABLED) {
-    return false;
-  }
-  
-  // Skip if response is too short (likely an error or trivial response)
-  if (!response || response.length < MEMORY_CONFIG.MIN_CONTENT_LENGTH) {
-    return false;
-  }
-  
-  // Skip if query is too short (likely a follow-up or clarification)
-  if (!query || query.length < 10) {
-    return false;
-  }
-  
-  const lowerQuery = query.toLowerCase();
-  const lowerResponse = response.toLowerCase();
-  
-  // Auto-store if multiple agents were used (cross-app context)
-  if (agentsUsed && agentsUsed.length > 1) {
-    return true;
-  }
-  
-  // Auto-store if it contains user preference indicators
-  const preferenceIndicators = [
-    'i prefer', 'i like', 'i always', 'i usually', 'i never',
-    'my favorite', 'my default', 'i want to', 'remind me',
-    'i work', 'my job', 'my role', 'my team', 'my manager',
-    'my timezone', 'my calendar', 'my email'
-  ];
-  if (preferenceIndicators.some(ind => lowerQuery.includes(ind))) {
-    return true;
-  }
-  
-  // Auto-store if it's a task creation/completion
-  const taskIndicators = [
-    'created', 'scheduled', 'sent', 'added', 'updated',
-    'form', 'document', 'spreadsheet', 'event', 'meeting',
-    'email', 'repository', 'issue', 'pull request'
-  ];
-  if (taskIndicators.filter(ind => lowerResponse.includes(ind)).length >= 2) {
-    return true;
-  }
-  
-  // Auto-store if response contains important links or IDs
-  if (lowerResponse.includes('docs.google.com') || 
-      lowerResponse.includes('github.com') ||
-      lowerResponse.includes('meet.google.com') ||
-      lowerResponse.includes('formid') ||
-      lowerResponse.includes('documentid') ||
-      lowerResponse.includes('eventid')) {
-    return true;
-  }
-  
-  // Don't auto-store by default
+  // ⚠️ DISABLED: Auto-storage requires explicit user consent via "Remember" button
+  // Memory should only be stored when user EXPLICITLY clicks "Remember" on a conversation
+  // This respects user privacy and preferences
   return false;
 }
 
