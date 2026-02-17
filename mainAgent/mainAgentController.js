@@ -42,10 +42,65 @@ const {
 // Chat History imports
 const chatData = require('../chat/chatData');
 
+// File Generation Service
+const fileGenerationService = require('../files/fileGenerationService');
+
 const router = express.Router();
 
 // Initialize the Main Coordinator Agent
 const mainAgent = new MainAgent();
+
+/**
+ * Detect if a query is requesting file generation (PDF or TXT)
+ * @param {string} query - User's query
+ * @returns {Object} - { fileType: 'pdf' | 'txt' | null, isExplicit: boolean }
+ */
+function detectFileGenerationRequest(query) {
+  if (!query) return { fileType: null, isExplicit: false };
+
+  const lowerQuery = query.toLowerCase();
+
+  // Regex patterns for explicit file generation requests
+  const pdfPatterns = [
+    /generate\s+(?:a\s+)?pdf/i,
+    /export\s+(?:as\s+)?pdf/i,
+    /create\s+(?:a\s+)?pdf/i,
+    /make\s+(?:a\s+)?pdf/i,
+    /convert\s+(?:to\s+)?pdf/i,
+    /save\s+(?:as\s+)?pdf/i,
+    /download\s+(?:as\s+)?pdf/i,
+    /in\s+(?:a\s+)?pdf/i,
+    /in\s+pdf\s+(?:format|file)/i,
+    /as\s+(?:a\s+)?pdf/i,
+    /\bpdf\b.*(?:file|document|export|generate|create|download|format)/i,
+    /(?:file|document|export|generate|create|download)\s+.*pdf/i,
+  ];
+
+  const txtPatterns = [
+    /generate\s+(?:a\s+)?(?:text|txt)\s+file/i,
+    /export\s+(?:as\s+)?(?:text|txt)/i,
+    /create\s+(?:a\s+)?(?:text|txt)\s+file/i,
+    /make\s+(?:a\s+)?(?:text|txt)\s+file/i,
+    /convert\s+(?:to\s+)?(?:text|txt)/i,
+    /save\s+(?:as\s+)?(?:text|txt)/i,
+    /download\s+(?:as\s+)?(?:text|txt)/i,
+    /in\s+(?:a\s+)?(?:text|txt)\s+(?:file|format)/i,
+    /as\s+(?:a\s+)?(?:text|txt)/i,
+    /\b(?:text|txt)\b.*(?:file|export|generate|create|download|format)/i,
+  ];
+
+  // Check for PDF request
+  if (pdfPatterns.some(pattern => pattern.test(query))) {
+    return { fileType: 'pdf', isExplicit: true };
+  }
+
+  // Check for TXT request
+  if (txtPatterns.some(pattern => pattern.test(query))) {
+    return { fileType: 'txt', isExplicit: true };
+  }
+
+  return { fileType: null, isExplicit: false };
+}
 
 /**
  * Determine if an exchange should be automatically stored in long-term memory
@@ -273,6 +328,56 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
           console.error('[MainAgentController] ⚠️ Error storing memory:', memoryError.message);
           // Don't fail the request if memory storage fails
         }
+      }
+
+      // Check if file generation was requested and generate PDF/TXT if needed
+      try {
+        const { fileType, isExplicit } = detectFileGenerationRequest(query);
+        
+        if (isExplicit && fileType && completeResponse.length > 0) {
+          console.log(`[MainAgentController] 📄 Generating ${fileType.toUpperCase()} for file generation request`);
+          
+          // Generate appropriate file title from query or use default
+          const titleMatch = query.match(/["']([^"']+)["']/) || query.match(/(?:titled?\s+|named?\s+)([^\s,\.!?]+)/i);
+          const fileTitle = titleMatch ? titleMatch[1] : `response-${Date.now()}`;
+          
+          try {
+            // Generate and upload file based on type
+            const fileResult = await fileGenerationService.generateAndUploadFile({
+              type: fileType,
+              content: completeResponse,
+              title: fileTitle,
+              userId
+            });
+
+            if (fileResult && fileResult.success && fileResult.fileUrl) {
+              console.log(`[MainAgentController] ✅ ${fileType.toUpperCase()} generated successfully: ${fileResult.filename}`);
+              
+              // Send file generation result to client
+              res.write(`data: ${JSON.stringify({
+                type: 'file_generated',
+                fileType: fileType,
+                filename: fileResult.filename,
+                fileUrl: fileResult.fileUrl,
+                fileSize: fileResult.fileSize,
+                expiresIn: fileResult.expiresIn,
+                message: `${fileType.toUpperCase()} file generated and ready for download`
+              })}\n\n`);
+            } else {
+              console.error(`[MainAgentController] ⚠️ File generation failed:`, fileResult?.message || 'Unknown error');
+            }
+          } catch (fileGenError) {
+            console.error(`[MainAgentController] ⚠️ Error generating file:`, fileGenError.message);
+            // Don't fail the request if file generation fails - respond content was still provided
+            res.write(`data: ${JSON.stringify({
+              type: 'file_generation_error',
+              message: `Failed to generate ${fileType.toUpperCase()}: ${fileGenError.message}`
+            })}\n\n`);
+          }
+        }
+      } catch (fileGenCheckError) {
+        console.error('[MainAgentController] ⚠️ Error checking file generation request:', fileGenCheckError.message);
+        // Don't fail the request if file generation check fails
       }
 
       // Stop AI thinking indicator via Socket.io

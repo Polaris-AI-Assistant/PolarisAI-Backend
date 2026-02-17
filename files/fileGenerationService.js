@@ -25,6 +25,8 @@ async function generatePDF(htmlContent, filename = 'document.pdf') {
   const tempFilePath = path.join(TEMP_DIR, `${uuidv4()}.pdf`);
 
   try {
+    console.log(`[generatePDF] Starting PDF generation - filename: ${filename}, contentLength: ${htmlContent?.length || 0}`);
+    
     // Launch browser with optimized settings
     browser = await puppeteer.launch({
       headless: true,
@@ -34,6 +36,8 @@ async function generatePDF(htmlContent, filename = 'document.pdf') {
         '--disable-dev-shm-usage', // Disable /dev/shm usage to reduce memory
       ],
     });
+
+    console.log('[generatePDF] Browser launched successfully');
 
     const page = await browser.newPage();
 
@@ -138,28 +142,48 @@ async function generatePDF(htmlContent, filename = 'document.pdf') {
 
     // Set content and generate PDF
     await page.setContent(htmlTemplate, { waitUntil: 'networkidle0' });
+    console.log('[generatePDF] HTML content set successfully');
+    
     await page.pdf({
       path: tempFilePath,
       format: 'A4',
       margin: { top: '20px', right: '20px', bottom: '20px', left: '20px' },
       printBackground: true,
     });
+    console.log('[generatePDF] PDF file written to disk successfully');
 
     // Read PDF as buffer
     const pdfBuffer = fs.readFileSync(tempFilePath);
+    console.log(`[generatePDF] PDF buffer created - size: ${pdfBuffer.length} bytes`);
 
     return pdfBuffer;
   } catch (error) {
-    console.error('[generatePDF] Error:', error);
+    console.error('[generatePDF] Error during PDF generation:', {
+      message: error.message,
+      stack: error.stack,
+      filename: filename,
+      contentLength: htmlContent?.length || 0,
+      tempFilePath: tempFilePath,
+    });
     throw new Error(`Failed to generate PDF: ${error.message}`);
   } finally {
     // Cleanup
     if (browser) {
-      await browser.close();
+      try {
+        await browser.close();
+        console.log('[generatePDF] Browser closed successfully');
+      } catch (closeError) {
+        console.error('[generatePDF] Error closing browser:', closeError.message);
+      }
     }
     // Delete temp file if it exists
     if (fs.existsSync(tempFilePath)) {
-      fs.unlinkSync(tempFilePath);
+      try {
+        fs.unlinkSync(tempFilePath);
+        console.log('[generatePDF] Temp file deleted');
+      } catch (deleteError) {
+        console.error('[generatePDF] Error deleting temp file:', deleteError.message);
+      }
     }
   }
 }
@@ -199,13 +223,15 @@ async function uploadToSupabase(fileBuffer, filename, userId, fileType = 'pdf') 
       throw new Error('File buffer is empty');
     }
 
+    console.log(`[uploadToSupabase] Starting upload - fileType: ${fileType}, filename: ${filename}, bufferSize: ${fileBuffer.length}, userId: ${userId}`);
+
     // Create unique storage path
     const timestamp = Date.now();
     const randomSuffix = uuidv4().slice(0, 8);
     const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
     const storagePath = `generated-files/${userId}/${fileType}/${timestamp}_${randomSuffix}_${sanitizedFilename}`;
 
-    console.log(`[uploadToSupabase] Uploading to: ${storagePath}`);
+    console.log(`[uploadToSupabase] Storage path: ${storagePath}`);
 
     // Upload to Supabase Storage (using Admin client to bypass RLS)
     const { data, error } = await supabaseAdmin.storage
@@ -240,9 +266,15 @@ async function uploadToSupabase(fileBuffer, filename, userId, fileType = 'pdf') 
       throw new Error('Failed to generate signed URL');
     }
 
+    const signedUrl = signedUrlData.signedUrl;
+    console.log(`[uploadToSupabase] Signed URL generated successfully`);
+    console.log(`[uploadToSupabase] Signed URL scheme: ${new URL(signedUrl).protocol}`);
+    console.log(`[uploadToSupabase] Signed URL hostname: ${new URL(signedUrl).hostname}`);
+    console.log(`[uploadToSupabase] Signed URL expires in: ${SIGNED_URL_EXPIRY} seconds`);
+
     return {
       success: true,
-      fileUrl: signedUrlData.signedUrl,
+      fileUrl: signedUrl,
       filePath: storagePath,
       expiresIn: SIGNED_URL_EXPIRY,
     };
@@ -280,7 +312,7 @@ async function generateAndUploadFile({
       throw new Error('User ID is required');
     }
 
-    console.log(`[generateAndUploadFile] Generating ${type.toUpperCase()} for user ${userId}`);
+    console.log(`[generateAndUploadFile] Starting file generation - type: ${type}, userId: ${userId}, contentLength: ${content.length}, title: ${title}`);
 
     // Generate file
     let fileBuffer;
@@ -288,14 +320,20 @@ async function generateAndUploadFile({
 
     if (type === 'pdf') {
       filename = `${title}.pdf`;
+      console.log('[generateAndUploadFile] Calling generatePDF...');
       fileBuffer = await generatePDF(content, filename);
+      console.log(`[generateAndUploadFile] PDF generated successfully - buffer size: ${fileBuffer.length} bytes`);
     } else if (type === 'txt') {
       filename = `${title}.txt`;
+      console.log('[generateAndUploadFile] Calling generateTextFile...');
       fileBuffer = await generateTextFile(content, filename);
+      console.log(`[generateAndUploadFile] Text file generated successfully - buffer size: ${fileBuffer.length} bytes`);
     }
 
+    console.log(`[generateAndUploadFile] Uploading to Supabase - filename: ${filename}`);
     // Upload to Supabase
     const uploadResult = await uploadToSupabase(fileBuffer, filename, userId, type);
+    console.log(`[generateAndUploadFile] Upload completed successfully - fileUrl: ${uploadResult.fileUrl}`);
 
     return {
       success: true,
@@ -308,11 +346,18 @@ async function generateAndUploadFile({
       message: `${type.toUpperCase()} file generated and ready for download`,
     };
   } catch (error) {
-    console.error('[generateAndUploadFile] Error:', error);
+    console.error('[generateAndUploadFile] Error during file generation:', {
+      message: error.message,
+      stack: error.stack,
+      type: type,
+      title: title,
+      userId: userId,
+      contentLength: content?.length || 0,
+    });
     return {
       success: false,
       error: error.message,
-      message: `Failed to generate ${type.toUpperCase()} file`,
+      message: `Failed to generate ${type.toUpperCase()} file: ${error.message}`,
     };
   }
 }

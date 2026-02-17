@@ -1045,6 +1045,29 @@ Language Detection Rules:
         };
       }
 
+      // Pre-check: Detect file generation requests (PDF/TXT) - these should NOT use agents
+      // Instead, get AI response directly and convert to file
+      const fileGenerationPatterns = [
+        /\b(generate|export|create|make|save|download|convert)\s+(a\s+)?(pdf|txt|text|document|file)/i,
+        /\b(in|as)\s+(a\s+)?(pdf|txt|text)\b/i,
+        /\bpdf\b.*\b(file|format|export|generate|create|download)/i,
+        /\bpdf\b/i, // Catch any mention of "pdf"
+        /\b(text|txt)\s+file\b/i
+      ];
+
+      const hasFileGenerationRequest = fileGenerationPatterns.some(pattern => pattern.test(query));
+      
+      if (hasFileGenerationRequest) {
+        console.log('[MainAgent] 📄 Detected file generation request (PDF/TXT) - skipping agents, will generate content and convert to file:', query);
+        // File generation requests get direct AI response (no agents)
+        // The content will be converted to PDF/TXT by the controller after streaming
+        return {
+          agents: [],
+          reasoning: "User requested file generation (PDF/TXT). The AI-generated content will be automatically converted to the requested file format.",
+          skipAgents: true  // Flag to indicate this is a file generation request
+        };
+      }
+
       // Pre-check: Detect planning/advisory queries vs actual action queries
       // "planning to create", "thinking about", "want to know how", "help me make a plan" = ADVISORY, no agents
       const advisoryPatterns = [
@@ -1056,7 +1079,7 @@ Language Detection Rules:
 
       const isAdvisory = advisoryPatterns.some(pattern => pattern.test(query));
       
-      if (isAdvisory && !/(create|make|send|book|schedule|build)\s+(a|the|my)?\s*(form|document|email|calendar|event|meet|form|sheet)/i.test(query)) {
+      if (isAdvisory && !/(create|make|send|book|schedule|build)\s+(a|the|my)?\s*(form|document|email|calendar|event|meet|form|sheet|pdf|txt)/i.test(query)) {
         console.log('[MainAgent] 💡 Detected advisory/planning query - skipping agents:', query);
         return {
           agents: [],

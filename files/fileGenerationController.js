@@ -140,6 +140,7 @@ async function generatePDFFile(req, res) {
     }
 
     console.log(`[generatePDFFile] Successfully generated PDF for user ${userId}`);
+    console.log(`[generatePDFFile] Returning fileUrl: ${result.fileUrl}`);
 
     return res.status(200).json({
       success: true,
@@ -208,6 +209,7 @@ async function generateTextFile(req, res) {
     }
 
     console.log(`[generateTextFile] Successfully generated TXT for user ${userId}`);
+    console.log(`[generateTextFile] Returning fileUrl: ${result.fileUrl}`);
 
     return res.status(200).json({
       success: true,
