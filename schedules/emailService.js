@@ -1,5 +1,6 @@
 const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
+const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
 
 // ─── SMTP transporter (Titan) ────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -115,9 +116,37 @@ async function sendScheduleReminder(userId, content, scheduleId) {
     });
 
     console.log(`[Email] Reminder sent to ${recipientEmail} (messageId: ${info.messageId})`);
+
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'info',
+        title: 'Reminder sent',
+        message: 'A reminder email was sent.',
+        data: {
+          scheduleId,
+          dedupeKey: `schedule:reminder:sent:${scheduleId}`,
+        },
+      });
+    } catch (_) {}
+
     return info;
   } catch (err) {
     console.error(`[Email] Failed to send reminder to ${recipientEmail}:`, err.message);
+
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'error',
+        title: 'Reminder email failed',
+        message: err.message || 'Failed to send reminder email',
+        data: {
+          scheduleId,
+          dedupeKey: `schedule:reminder:error:${scheduleId}`,
+        },
+      });
+    } catch (_) {}
+
     return null;
   }
 }
@@ -189,9 +218,39 @@ async function sendActionCompleted(userId, actionContent, scheduleId, chatId) {
     });
 
     console.log(`[Email] Action-completed email sent to ${recipientEmail} (messageId: ${info.messageId})`);
+
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'success',
+        title: 'Scheduled action completed',
+        message: 'A scheduled action finished successfully.',
+        data: {
+          scheduleId,
+          chatId,
+          dedupeKey: `schedule:action:completed:${scheduleId}`,
+        },
+      });
+    } catch (_) {}
+
     return info;
   } catch (err) {
     console.error(`[Email] Failed to send action email to ${recipientEmail}:`, err.message);
+
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'error',
+        title: 'Action email failed',
+        message: err.message || 'Failed to send action completion email',
+        data: {
+          scheduleId,
+          chatId,
+          dedupeKey: `schedule:action:email:error:${scheduleId}`,
+        },
+      });
+    } catch (_) {}
+
     return null;
   }
 }

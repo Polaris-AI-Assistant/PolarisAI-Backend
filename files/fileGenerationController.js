@@ -4,6 +4,7 @@
  */
 
 const fileGenerationService = require('./fileGenerationService');
+const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
 
 /**
  * Generate a file (PDF or TXT) from content
@@ -64,6 +65,15 @@ async function generateFile(req, res) {
 
     if (!result.success) {
       console.error('[generateFile] Generation failed:', result.error);
+      // Real-time toast notification (best-effort)
+      try {
+        sendSocketNotification(userId, {
+          type: 'error',
+          title: 'File generation failed',
+          message: result.message || 'Failed to generate file',
+          data: { dedupeKey: `filegen:error:${type}:${title || ''}` },
+        });
+      } catch (_) {}
       return res.status(500).json({
         success: false,
         error: 'Generation failed',
@@ -72,6 +82,22 @@ async function generateFile(req, res) {
     }
 
     console.log(`[generateFile] Successfully generated ${type} for user ${userId}`);
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'success',
+        title: 'File generated',
+        message: result.message || `${type.toUpperCase()} file generated and ready for download`,
+        data: {
+          fileType: result.type,
+          filename: result.filename,
+          fileUrl: result.fileUrl,
+          fileSize: result.fileSize,
+          expiresIn: result.expiresIn,
+          dedupeKey: `filegen:success:${result.filePath || result.filename || ''}`,
+        },
+      });
+    } catch (_) {}
 
     return res.status(200).json({
       success: true,
@@ -84,6 +110,18 @@ async function generateFile(req, res) {
     });
   } catch (error) {
     console.error('[generateFile] Error:', error);
+    // Real-time toast notification (best-effort)
+    try {
+      const userId = req.user?.id || req.headers['x-user-id'];
+      if (userId) {
+        sendSocketNotification(userId, {
+          type: 'error',
+          title: 'File generation failed',
+          message: error.message || 'An unexpected error occurred',
+          data: { dedupeKey: `filegen:exception:${Date.now()}` },
+        });
+      }
+    } catch (_) {}
     return res.status(500).json({
       success: false,
       error: 'Internal server error',
@@ -132,6 +170,15 @@ async function generatePDFFile(req, res) {
 
     if (!result.success) {
       console.error('[generatePDFFile] Generation failed:', result.error);
+      // Real-time toast notification (best-effort)
+      try {
+        sendSocketNotification(userId, {
+          type: 'error',
+          title: 'PDF generation failed',
+          message: result.message || 'Failed to generate PDF',
+          data: { dedupeKey: `filegen:pdf:error:${title || ''}` },
+        });
+      } catch (_) {}
       return res.status(500).json({
         success: false,
         error: 'Generation failed',
@@ -141,6 +188,22 @@ async function generatePDFFile(req, res) {
 
     console.log(`[generatePDFFile] Successfully generated PDF for user ${userId}`);
     console.log(`[generatePDFFile] Returning fileUrl: ${result.fileUrl}`);
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'success',
+        title: 'PDF generated',
+        message: result.message || 'PDF generated successfully',
+        data: {
+          fileType: result.type,
+          filename: result.filename,
+          fileUrl: result.fileUrl,
+          fileSize: result.fileSize,
+          expiresIn: result.expiresIn,
+          dedupeKey: `filegen:pdf:success:${result.filePath || result.filename || ''}`,
+        },
+      });
+    } catch (_) {}
 
     return res.status(200).json({
       success: true,
@@ -153,6 +216,18 @@ async function generatePDFFile(req, res) {
     });
   } catch (error) {
     console.error('[generatePDFFile] Error:', error);
+    // Real-time toast notification (best-effort)
+    try {
+      const userId = req.user?.id || req.headers['x-user-id'];
+      if (userId) {
+        sendSocketNotification(userId, {
+          type: 'error',
+          title: 'PDF generation failed',
+          message: error.message || 'Failed to generate PDF',
+          data: { dedupeKey: `filegen:pdf:exception:${Date.now()}` },
+        });
+      }
+    } catch (_) {}
     return res.status(500).json({
       success: false,
       error: 'Internal server error',
@@ -201,6 +276,15 @@ async function generateTextFile(req, res) {
 
     if (!result.success) {
       console.error('[generateTextFile] Generation failed:', result.error);
+      // Real-time toast notification (best-effort)
+      try {
+        sendSocketNotification(userId, {
+          type: 'error',
+          title: 'Text file generation failed',
+          message: result.message || 'Failed to generate text file',
+          data: { dedupeKey: `filegen:txt:error:${title || ''}` },
+        });
+      } catch (_) {}
       return res.status(500).json({
         success: false,
         error: 'Generation failed',
@@ -210,6 +294,22 @@ async function generateTextFile(req, res) {
 
     console.log(`[generateTextFile] Successfully generated TXT for user ${userId}`);
     console.log(`[generateTextFile] Returning fileUrl: ${result.fileUrl}`);
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'success',
+        title: 'Text file generated',
+        message: result.message || 'Text file generated successfully',
+        data: {
+          fileType: result.type,
+          filename: result.filename,
+          fileUrl: result.fileUrl,
+          fileSize: result.fileSize,
+          expiresIn: result.expiresIn,
+          dedupeKey: `filegen:txt:success:${result.filePath || result.filename || ''}`,
+        },
+      });
+    } catch (_) {}
 
     return res.status(200).json({
       success: true,
@@ -222,6 +322,18 @@ async function generateTextFile(req, res) {
     });
   } catch (error) {
     console.error('[generateTextFile] Error:', error);
+    // Real-time toast notification (best-effort)
+    try {
+      const userId = req.user?.id || req.headers['x-user-id'];
+      if (userId) {
+        sendSocketNotification(userId, {
+          type: 'error',
+          title: 'Text file generation failed',
+          message: error.message || 'Failed to generate text file',
+          data: { dedupeKey: `filegen:txt:exception:${Date.now()}` },
+        });
+      }
+    } catch (_) {}
     return res.status(500).json({
       success: false,
       error: 'Internal server error',

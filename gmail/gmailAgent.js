@@ -1092,14 +1092,13 @@ Write a complete, professional email that looks like it was written by a real pe
     } else if (errorMessage.includes('invalid') || errorMessage.includes('400')) {
       userFriendlyMessage += 'Invalid request. Please check your input and try again.';
     } else {
-      userFriendlyMessage += `Error: ${errorMessage}`;
+      userFriendlyMessage += 'Please try again.';
     }
 
     return {
       success: false,
       response: userFriendlyMessage,
       query: query,
-      error: errorMessage,
       timestamp: new Date().toISOString()
     };
   }

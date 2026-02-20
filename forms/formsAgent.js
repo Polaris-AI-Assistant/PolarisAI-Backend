@@ -675,14 +675,13 @@ Always confirm successful operations and provide relevant links or IDs for refer
     } else if (errorMessage.includes('rate limit')) {
       userFriendlyMessage += 'Too many requests. Please try again in a moment.';
     } else {
-      userFriendlyMessage += `Error: ${errorMessage}`;
+      userFriendlyMessage += 'Please try again.';
     }
 
     return {
       success: false,
       response: userFriendlyMessage,
       query: query,
-      error: errorMessage,
       timestamp: new Date().toISOString()
     };
   }

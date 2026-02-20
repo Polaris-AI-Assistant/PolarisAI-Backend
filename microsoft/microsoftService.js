@@ -205,8 +205,47 @@ async function sendEmail(userId, email) {
     }));
   }
 
-  await graphRequest(userId, '/me/sendMail', 'POST', messagePayload);
-  return { success: true, message: 'Email sent successfully' };
+  try {
+    await graphRequest(userId, '/me/sendMail', 'POST', messagePayload);
+
+    // Real-time toast notification (best-effort)
+    try {
+      const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
+      const primaryTo = Array.isArray(to) ? to[0] : to;
+      sendSocketNotification(userId, {
+        type: 'success',
+        title: 'Email sent',
+        message: primaryTo ? `Email sent to ${primaryTo}` : 'Email sent successfully',
+        data: {
+          provider: 'microsoft',
+          to,
+          subject,
+          dedupeKey: `email:microsoft:sent:${primaryTo || ''}:${subject || ''}`,
+        },
+      });
+    } catch (_) {}
+
+    return { success: true, message: 'Email sent successfully' };
+  } catch (err) {
+    // Real-time toast notification (best-effort)
+    try {
+      const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
+      const primaryTo = Array.isArray(to) ? to[0] : to;
+      sendSocketNotification(userId, {
+        type: 'error',
+        title: 'Email failed',
+        message: err?.message || 'Failed to send email',
+        data: {
+          provider: 'microsoft',
+          to,
+          subject,
+          dedupeKey: `email:microsoft:error:${primaryTo || ''}:${subject || ''}`,
+        },
+      });
+    } catch (_) {}
+
+    throw err;
+  }
 }
 
 /**

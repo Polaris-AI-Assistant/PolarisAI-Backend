@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 const supabase = require('../supabase/supabaseConnect');
 const OpenAI = require('openai');
+const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
 
 // Define OAuth scopes - Extended for full Gmail agent functionality
 const SCOPES = [
@@ -295,6 +296,10 @@ async function sendEmail(auth, to, subject, body, options = {}) {
  * @returns {Promise<Object>} Result object with success/error status
  */
 async function sendEmailForUser(userIdentifier, to, subject, body, options = {}) {
+  const fallbackNotifyUserId = (typeof userIdentifier === 'string' && !userIdentifier.includes('@'))
+    ? userIdentifier
+    : null;
+
   try {
     // Get tokens from Supabase gmail_tokens table
     let query = supabase.from("gmail_tokens").select("access_token, refresh_token, email, user_id");
@@ -352,6 +357,26 @@ async function sendEmailForUser(userIdentifier, to, subject, body, options = {})
     // Send the email
     const result = await sendEmail(oAuth2Client, to, subject, body, options);
     
+    // Real-time toast notification (best-effort)
+    try {
+      const notifyUserId = tokenRow.user_id || fallbackNotifyUserId;
+      if (notifyUserId) {
+        sendSocketNotification(notifyUserId, {
+          type: 'success',
+          title: 'Email sent',
+          message: `Email sent to ${to}`,
+          data: {
+            provider: 'gmail',
+            to,
+            subject,
+            threadId: result.threadId,
+            messageId: result.id,
+            dedupeKey: `email:gmail:sent:${to}:${subject}`,
+          },
+        });
+      }
+    } catch (_) {}
+
     return {
       success: true,
       messageId: result.id,
@@ -361,6 +386,25 @@ async function sendEmailForUser(userIdentifier, to, subject, body, options = {})
     
   } catch (error) {
     console.error('Send email for user error:', error);
+
+    // Real-time toast notification (best-effort)
+    try {
+      const notifyUserId = fallbackNotifyUserId;
+      if (notifyUserId) {
+        sendSocketNotification(notifyUserId, {
+          type: 'error',
+          title: 'Email failed',
+          message: error.message || 'Failed to send email',
+          data: {
+            provider: 'gmail',
+            to,
+            subject,
+            dedupeKey: `email:gmail:error:${to}:${subject}`,
+          },
+        });
+      }
+    } catch (_) {}
+
     return {
       success: false,
       error: error.message

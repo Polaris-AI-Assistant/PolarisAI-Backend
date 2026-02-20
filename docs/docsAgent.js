@@ -358,6 +358,8 @@ async function processQuery(query, userId, options = {}) {
     if (options.forceToolExecution && options.forceToolExecution.toolName && options.forceToolExecution.params) {
       console.log(`[DocsAgent] Force executing tool: ${options.forceToolExecution.toolName}`);
       console.log(`[DocsAgent] With exact params:`, JSON.stringify(options.forceToolExecution.params, null, 2));
+      // Explicitly log extracted parameters for clarity
+      console.log(`[DocsAgent] Extracted parameters:`, JSON.stringify(options.forceToolExecution.params, null, 2));
       
       const functionMap = createFunctionMap(userId);
       const functionToCall = functionMap[options.forceToolExecution.toolName];
@@ -508,6 +510,8 @@ When content is requested, ALWAYS generate PROFESSIONALLY FORMATTED content usin
         const functionName = toolCall.function.name;
         const functionArgs = JSON.parse(toolCall.function.arguments);
 
+        // Explicitly log extracted parameters for each tool call
+        console.log(`[DocsAgent] Extracted parameters for ${functionName}:`, JSON.stringify(functionArgs, null, 2));
         console.log(`Executing function: ${functionName}`, functionArgs);
 
         let functionResponse;

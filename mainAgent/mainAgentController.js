@@ -23,7 +23,7 @@ const { authenticateToken } = require('../middleware/auth');
 const { buildFileContexts, trackFileReference } = require('../files/fileContextBuilder');
 
 // Socket.io imports for real-time WebSocket events
-const { emitAIThinking, emitAgentStatus, emitChatTitleUpdate } = require('../socket/socketManager');
+const { emitAIThinking, emitAgentStatus, emitChatTitleUpdate, sendNotification: sendSocketNotification } = require('../socket/socketManager');
 
 // Artifact Memory imports
 const { 
@@ -253,6 +253,36 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
           const activeChatId = conversationId || chatId;
           if (activeChatId) {
             emitAgentStatus(activeChatId, chunk.message);
+          }
+        }
+
+        // Emit task completion/failure notifications via Socket.io (toasts)
+        // This ensures users get a toast even if SSE handlers vary by page/component.
+        if (chunk.type === 'timeline_task_completed' || chunk.type === 'timeline_task_failed') {
+          try {
+            const status = chunk.status || (chunk.type === 'timeline_task_failed' ? 'failed' : 'completed');
+            const isNeedsInput = status === 'needs_input';
+            const notifType =
+              chunk.type === 'timeline_task_failed' ? 'error' : isNeedsInput ? 'warning' : 'success';
+
+            sendSocketNotification(userId, {
+              type: notifType,
+              title: chunk.type === 'timeline_task_failed'
+                ? 'Action failed'
+                : isNeedsInput
+                ? 'Needs your input'
+                : 'Action completed',
+              message: chunk.message || chunk.summary || (chunk.type === 'timeline_task_failed' ? 'Action failed' : 'Action completed'),
+              data: {
+                chatId: chatId || conversationId || null,
+                conversationId: conversationId || null,
+                messageId: messageId || null,
+                status,
+                dedupeKey: `agent:${chunk.type}:${userId}:${chatId || conversationId || 'none'}:${messageId || 'none'}:${chunk.eventId || ''}`,
+              },
+            });
+          } catch (e) {
+            console.warn('[MainAgentController] ⚠️ Failed to emit socket notification:', e.message);
           }
         }
         
@@ -553,6 +583,35 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
 
     // Create timeline emitter for confirmation flow
     const onChunk = (chunk) => {
+      // Emit task completion/failure notifications via Socket.io (toasts) for confirmation flows too
+      if (chunk.type === 'timeline_task_completed' || chunk.type === 'timeline_task_failed') {
+        try {
+          const status = chunk.status || (chunk.type === 'timeline_task_failed' ? 'failed' : 'completed');
+          const isNeedsInput = status === 'needs_input';
+          const notifType =
+            chunk.type === 'timeline_task_failed' ? 'error' : isNeedsInput ? 'warning' : 'success';
+
+          sendSocketNotification(userId, {
+            type: notifType,
+            title: chunk.type === 'timeline_task_failed'
+              ? 'Action failed'
+              : isNeedsInput
+              ? 'Needs your input'
+              : 'Action completed',
+            message: chunk.message || chunk.summary || (chunk.type === 'timeline_task_failed' ? 'Action failed' : 'Action completed'),
+            data: {
+              chatId: pendingAction.conversationId || null,
+              conversationId: pendingAction.conversationId || null,
+              requestId,
+              status,
+              dedupeKey: `agent:confirm:${chunk.type}:${userId}:${pendingAction.conversationId || 'none'}:${requestId}:${chunk.eventId || ''}`,
+            },
+          });
+        } catch (e) {
+          console.warn('[MainAgentController] ⚠️ Failed to emit socket notification (confirm flow):', e.message);
+        }
+      }
+
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     };
     const timeline = new TimelineEmitter(onChunk, userId, pendingAction.conversationId);

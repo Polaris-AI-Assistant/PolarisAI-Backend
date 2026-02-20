@@ -1,6 +1,7 @@
 const MainAgent = require('../mainAgent/mainAgent');
 const supabase = require('../supabase/supabaseConnect');
 const { sendActionCompleted } = require('./emailService');
+const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
 
 // Single shared MainAgent instance for all scheduled actions
 const mainAgent = new MainAgent();
@@ -81,14 +82,51 @@ Current time: ${new Date().toISOString()}`
     if (wasActuallyExecuted) {
       await sendActionCompleted(userId, content, scheduleId, chat.id);
       console.log(`[ActionService] Action executed successfully for schedule ${scheduleId}`);
+
+      // Real-time toast notification (best-effort)
+      try {
+        sendSocketNotification(userId, {
+          type: 'success',
+          title: 'Scheduled action completed',
+          message: 'Scheduled action finished successfully.',
+          data: {
+            scheduleId,
+            chatId: chat.id,
+            dedupeKey: `schedule:executed:${scheduleId}`,
+          },
+        });
+      } catch (_) {}
     } else {
       console.warn(`[ActionService] Action was NOT actually executed for schedule ${scheduleId} — agent asked for clarification instead`);
+
+      // Real-time toast notification (best-effort)
+      try {
+        sendSocketNotification(userId, {
+          type: 'warning',
+          title: 'Scheduled action needs attention',
+          message: 'The scheduled action may need more details. Open the Scheduled Actions chat to review.',
+          data: {
+            scheduleId,
+            chatId: chat.id,
+            dedupeKey: `schedule:needs-attention:${scheduleId}`,
+          },
+        });
+      } catch (_) {}
     }
 
     return responseText;
 
   } catch (error) {
     console.error('[ActionService] Error executing action:', error);
+    // Real-time toast notification (best-effort)
+    try {
+      sendSocketNotification(userId, {
+        type: 'error',
+        title: 'Scheduled action failed',
+        message: error.message || 'Failed to execute scheduled action',
+        data: { scheduleId, dedupeKey: `schedule:error:${scheduleId}` },
+      });
+    } catch (_) {}
     throw error;
   }
 }

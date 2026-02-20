@@ -18,6 +18,8 @@
 
 const OpenAI = require('openai');
 const githubFunctions = require('./githubFunctions');
+const githubTools = require('../github-tools');
+const supabase = require('../supabase/supabaseConnect');
 
 class GitHubAgent {
   constructor() {
@@ -34,6 +36,281 @@ class GitHubAgent {
 
     // System prompt that defines the agent's behavior and capabilities
     this.systemPrompt = this.createSystemPrompt();
+  }
+
+  /**
+   * Resolve the connected GitHub username for a userId.
+   * @param {string} userId
+   * @returns {Promise<string|null>}
+   */
+  async getConnectedGithubUsername(userId) {
+    try {
+      const { data, error } = await supabase
+        .from('github_tokens')
+        .select('github_username')
+        .eq('user_id', userId)
+        .single();
+      if (error || !data) return null;
+      return data.github_username || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Normalize/auto-fill common GitHub params to prevent avoidable failures:
+   * - owner: fill from connected username when missing/placeholder
+   * - repo: supports "owner/repo" format by splitting
+   * @param {string} userId
+   * @param {object} args
+   * @param {object} options
+   * @returns {Promise<object>}
+   */
+  async normalizeGithubArgs(userId, args, options = {}) {
+    const normalized = { ...(args || {}) };
+
+    // Split "owner/repo" if provided in repo field
+    if (typeof normalized.repo === 'string' && normalized.repo.includes('/') && !normalized.owner) {
+      const [owner, repo] = normalized.repo.split('/');
+      if (owner && repo) {
+        normalized.owner = owner;
+        normalized.repo = repo;
+      }
+    }
+
+    const placeholderOwners = new Set([
+      'your_username',
+      'your-username',
+      'your username',
+      'pending',
+      'me',
+      'my',
+      'owner',
+    ]);
+
+    // Auto-fill owner when missing/placeholder
+    if (!normalized.owner || placeholderOwners.has(String(normalized.owner).toLowerCase())) {
+      const fromOptions = options.githubUsername;
+      const fromDb = fromOptions || (await this.getConnectedGithubUsername(userId));
+      if (fromDb) normalized.owner = fromDb;
+    }
+
+    return normalized;
+  }
+
+  /**
+   * Create or update README.md for a repo by generating content from repo structure.
+   * This is agent-level orchestration (multiple GitHub API calls via wrappers).
+   * @param {string} userId
+   * @param {object} params - { owner?, repo }
+   * @returns {Promise<{ success: boolean, data: any, error: any }>}
+   */
+  async upsertReadme(userId, params = {}) {
+    try {
+      const normalized = await this.normalizeGithubArgs(userId, params, {});
+      const { owner, repo } = normalized;
+      if (!repo) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'repo is required' } };
+      }
+      if (!owner) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'owner could not be resolved' } };
+      }
+
+      const repoInfo = await githubTools.github_getRepoInfo({ owner, repo }, { userId });
+      if (!repoInfo.success) return repoInfo;
+
+      const defaultBranch = repoInfo.data?.default_branch || 'main';
+
+      const treeRes = await githubTools.github_getRepoFileTree(
+        { owner, repo, ref: defaultBranch, recursive: true },
+        { userId }
+      );
+      if (!treeRes.success) return treeRes;
+
+      const paths = Array.isArray(treeRes.data?.tree)
+        ? treeRes.data.tree.map((t) => t.path).filter(Boolean).slice(0, 300)
+        : [];
+
+      const system = `You write high-quality README.md files for software repositories.
+Return ONLY markdown content for README.md (no code fences around the whole file).`;
+
+      const user = `Repository: ${owner}/${repo}
+Description: ${repoInfo.data?.description || ''}
+Default branch: ${defaultBranch}
+
+File tree (top 300 paths):
+${paths.map((p) => `- ${p}`).join('\n')}
+
+Task:
+Generate a clear, professional README.md tailored to this repository. Include:
+- Overview
+- Key features (infer from structure if possible)
+- Tech stack (infer from file names like package.json, requirements.txt, etc.)
+- Setup / Installation
+- Usage
+- Project structure (brief)
+- Contributing
+- License (if detectable, otherwise say \"See LICENSE\" if present, else omit)
+Keep it concise but useful.`;
+
+      const completion = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        temperature: 0.2,
+        max_tokens: 1800,
+      });
+
+      const readmeContent = (completion.choices[0].message.content || '').trim();
+      if (!readmeContent) {
+        return { success: false, data: null, error: { code: 'GENERATION_FAILED', message: 'Failed to generate README content' } };
+      }
+
+      const readmePath = 'README.md';
+      const existing = await githubTools.github_getFileContent(
+        { owner, repo, path: readmePath, ref: defaultBranch },
+        { userId }
+      );
+
+      if (existing.success) {
+        const sha = existing.data?.sha;
+        if (!sha) {
+          return { success: false, data: null, error: { code: 'MISSING_SHA', message: 'Could not determine README sha for update' } };
+        }
+        const updated = await githubTools.github_updateWholeFile(
+          { owner, repo, path: readmePath, message: 'Update README.md', content: readmeContent, sha, branch: defaultBranch },
+          { userId }
+        );
+        if (!updated.success) return updated;
+        return { success: true, data: { action: 'updated', owner, repo, branch: defaultBranch, path: readmePath }, error: null };
+      }
+
+      if (existing.error && existing.error.code === 'GITHUB_404') {
+        const created = await githubTools.github_createFile(
+          { owner, repo, path: readmePath, message: 'Add README.md', content: readmeContent, branch: defaultBranch },
+          { userId }
+        );
+        if (!created.success) return created;
+        return { success: true, data: { action: 'created', owner, repo, branch: defaultBranch, path: readmePath }, error: null };
+      }
+
+      return existing;
+    } catch (err) {
+      return { success: false, data: null, error: { code: 'UNKNOWN', message: err.message || 'Unknown error' } };
+    }
+  }
+
+  /**
+   * Update a file by resolving its SHA automatically.
+   * @param {string} userId
+   * @param {object} params - { owner?, repo, path, content, message?, branch? }
+   */
+  async safeUpdateFile(userId, params = {}) {
+    try {
+      const normalized = await this.normalizeGithubArgs(userId, params, {});
+      const { owner, repo, path, content } = normalized;
+      if (!repo || !path || content === undefined) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'repo, path, and content are required' } };
+      }
+      if (!owner) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'owner could not be resolved' } };
+      }
+
+      const repoInfo = await githubTools.github_getRepoInfo({ owner, repo }, { userId });
+      if (!repoInfo.success) return repoInfo;
+      const branch = normalized.branch || repoInfo.data?.default_branch || 'main';
+      const message = normalized.message || `Update ${path}`;
+
+      const existing = await githubTools.github_getFileContent({ owner, repo, path, ref: branch }, { userId });
+      if (!existing.success) return existing;
+      const sha = existing.data?.sha;
+      if (!sha) return { success: false, data: null, error: { code: 'MISSING_SHA', message: 'Could not determine file sha for update' } };
+
+      const updated = await githubTools.github_updateWholeFile({ owner, repo, path, message, content, sha, branch }, { userId });
+      if (!updated.success) return updated;
+      return { success: true, data: { action: 'updated', owner, repo, branch, path }, error: null };
+    } catch (err) {
+      return { success: false, data: null, error: { code: 'UNKNOWN', message: err.message || 'Unknown error' } };
+    }
+  }
+
+  /**
+   * Delete a file by resolving its SHA automatically.
+   * @param {string} userId
+   * @param {object} params - { owner?, repo, path, message?, branch? }
+   */
+  async safeDeleteFile(userId, params = {}) {
+    try {
+      const normalized = await this.normalizeGithubArgs(userId, params, {});
+      const { owner, repo, path } = normalized;
+      if (!repo || !path) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'repo and path are required' } };
+      }
+      if (!owner) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'owner could not be resolved' } };
+      }
+
+      const repoInfo = await githubTools.github_getRepoInfo({ owner, repo }, { userId });
+      if (!repoInfo.success) return repoInfo;
+      const branch = normalized.branch || repoInfo.data?.default_branch || 'main';
+      const message = normalized.message || `Delete ${path}`;
+
+      const existing = await githubTools.github_getFileContent({ owner, repo, path, ref: branch }, { userId });
+      if (!existing.success) return existing;
+      const sha = existing.data?.sha;
+      if (!sha) return { success: false, data: null, error: { code: 'MISSING_SHA', message: 'Could not determine file sha for delete' } };
+
+      const deleted = await githubTools.github_deleteFile({ owner, repo, path, message, sha, branch }, { userId });
+      if (!deleted.success) return deleted;
+      return { success: true, data: { action: 'deleted', owner, repo, branch, path }, error: null };
+    } catch (err) {
+      return { success: false, data: null, error: { code: 'UNKNOWN', message: err.message || 'Unknown error' } };
+    }
+  }
+
+  /**
+   * Create OR update a file by checking for existence first (prevents 422 errors).
+   * @param {string} userId
+   * @param {object} params - { owner?, repo, path, content, message?, branch? }
+   */
+  async upsertFile(userId, params = {}) {
+    try {
+      const normalized = await this.normalizeGithubArgs(userId, params, {});
+      const { owner, repo, path, content } = normalized;
+      if (!repo || !path || content === undefined) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'repo, path, and content are required' } };
+      }
+      if (!owner) {
+        return { success: false, data: null, error: { code: 'VALIDATION', message: 'owner could not be resolved' } };
+      }
+
+      const repoInfo = await githubTools.github_getRepoInfo({ owner, repo }, { userId });
+      if (!repoInfo.success) return repoInfo;
+      const branch = normalized.branch || repoInfo.data?.default_branch || 'main';
+
+      const existing = await githubTools.github_getFileContent({ owner, repo, path, ref: branch }, { userId });
+      if (existing.success) {
+        const sha = existing.data?.sha;
+        if (!sha) return { success: false, data: null, error: { code: 'MISSING_SHA', message: 'Could not determine file sha for update' } };
+        const message = normalized.message || `Update ${path}`;
+        const updated = await githubTools.github_updateWholeFile({ owner, repo, path, message, content, sha, branch }, { userId });
+        if (!updated.success) return updated;
+        return { success: true, data: { action: 'updated', owner, repo, branch, path }, error: null };
+      }
+
+      if (existing.error && existing.error.code === 'GITHUB_404') {
+        const message = normalized.message || `Add ${path}`;
+        const created = await githubTools.github_createFile({ owner, repo, path, message, content, branch }, { userId });
+        if (!created.success) return created;
+        return { success: true, data: { action: 'created', owner, repo, branch, path }, error: null };
+      }
+
+      return existing;
+    } catch (err) {
+      return { success: false, data: null, error: { code: 'UNKNOWN', message: err.message || 'Unknown error' } };
+    }
   }
 
   /**
@@ -264,8 +541,553 @@ class GitHubAgent {
             required: ["owner", "repo"]
           }
         }
+      },
+      {
+        type: "function",
+        function: {
+          name: "getRepoFileTree",
+          description: "Get a repository file tree (optionally recursive). Use for requests like 'show entire file structure'. If owner is omitted, it will be inferred from the connected GitHub account.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username (optional; inferred if omitted)"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name (required)"
+              },
+              ref: {
+                type: "string",
+                description: "Branch/tag name to use as tree reference (default: main)"
+              },
+              tree_sha: {
+                type: "string",
+                description: "Tree SHA (optional; if provided it overrides ref)"
+              },
+              recursive: {
+                type: "boolean",
+                description: "Whether to return the full recursive tree (default: false)"
+              }
+            },
+            required: ["repo"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "upsertReadme",
+          description: "Generate and create/update README.md for a repository based on its contents.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: { type: "string", description: "Repository owner (optional; inferred if omitted)" },
+              repo: { type: "string", description: "Repository name (required)" }
+            },
+            required: ["repo"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "upsertFile",
+          description: "Create or update a file in a repository by checking existence first (prevents errors).",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: { type: "string", description: "Repository owner (optional; inferred if omitted)" },
+              repo: { type: "string", description: "Repository name (required)" },
+              path: { type: "string", description: "File path (required)" },
+              content: { type: "string", description: "File content (plain text)" },
+              message: { type: "string", description: "Commit message" },
+              branch: { type: "string", description: "Branch name (optional)" }
+            },
+            required: ["repo", "path", "content"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "safeUpdateFile",
+          description: "Update a file in a repository by resolving the file SHA automatically.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: { type: "string", description: "Repository owner (optional; inferred if omitted)" },
+              repo: { type: "string", description: "Repository name (required)" },
+              path: { type: "string", description: "File path (required)" },
+              content: { type: "string", description: "New file content (plain text)" },
+              message: { type: "string", description: "Commit message" },
+              branch: { type: "string", description: "Branch name (optional)" }
+            },
+            required: ["repo", "path", "content"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "safeDeleteFile",
+          description: "Delete a file in a repository by resolving the file SHA automatically.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: { type: "string", description: "Repository owner (optional; inferred if omitted)" },
+              repo: { type: "string", description: "Repository name (required)" },
+              path: { type: "string", description: "File path (required)" },
+              message: { type: "string", description: "Commit message" },
+              branch: { type: "string", description: "Branch name (optional)" }
+            },
+            required: ["repo", "path"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "createRepository",
+          description: "Create a new GitHub repository. Use when user wants to create a new repo.",
+          parameters: {
+            type: "object",
+            properties: {
+              name: {
+                type: "string",
+                description: "Repository name (required)"
+              },
+              description: {
+                type: "string",
+                description: "Repository description"
+              },
+              private: {
+                type: "boolean",
+                description: "Whether the repository should be private (default: false for public)"
+              },
+              auto_init: {
+                type: "boolean",
+                description: "Initialize repository with README (default: false)"
+              }
+            },
+            required: ["name"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "createIssue",
+          description: "Create a new GitHub issue in a repository. Use when user wants to create an issue.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              title: {
+                type: "string",
+                description: "Issue title (required)"
+              },
+              body: {
+                type: "string",
+                description: "Issue body/description"
+              },
+              assignees: {
+                type: "array",
+                items: { type: "string" },
+                description: "Array of GitHub usernames to assign"
+              },
+              labels: {
+                type: "array",
+                items: { type: "string" },
+                description: "Array of label names"
+              }
+            },
+            required: ["owner", "repo", "title"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "createPullRequest",
+          description: "Create a new GitHub pull request. Use when user wants to create a PR.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              title: {
+                type: "string",
+                description: "PR title (required)"
+              },
+              head: {
+                type: "string",
+                description: "Branch name to merge FROM (required)"
+              },
+              base: {
+                type: "string",
+                description: "Branch name to merge INTO (required, usually 'main' or 'master')"
+              },
+              body: {
+                type: "string",
+                description: "PR description"
+              },
+              draft: {
+                type: "boolean",
+                description: "Create as draft PR (default: false)"
+              }
+            },
+            required: ["owner", "repo", "title", "head", "base"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "createFile",
+          description: "Create a new file in a repository. Use when user wants to create a file.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              path: {
+                type: "string",
+                description: "File path (required)"
+              },
+              message: {
+                type: "string",
+                description: "Commit message (required)"
+              },
+              content: {
+                type: "string",
+                description: "File content as plain text (will be base64 encoded automatically)"
+              },
+              branch: {
+                type: "string",
+                description: "Branch name (default: default branch)"
+              }
+            },
+            required: ["owner", "repo", "path", "message", "content"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "updateFile",
+          description: "Update an existing file in a repository. Use when user wants to modify a file.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              path: {
+                type: "string",
+                description: "File path (required)"
+              },
+              message: {
+                type: "string",
+                description: "Commit message (required)"
+              },
+              content: {
+                type: "string",
+                description: "New file content as plain text"
+              },
+              sha: {
+                type: "string",
+                description: "SHA of the file being updated (required, get from getFileContent first)"
+              },
+              branch: {
+                type: "string",
+                description: "Branch name"
+              }
+            },
+            required: ["owner", "repo", "path", "message", "content", "sha"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "deleteFile",
+          description: "Delete a file from a repository. Use when user wants to delete a file.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              path: {
+                type: "string",
+                description: "File path to delete (required)"
+              },
+              message: {
+                type: "string",
+                description: "Commit message (required)"
+              },
+              sha: {
+                type: "string",
+                description: "SHA of the file being deleted (required, get from getFileContent first)"
+              },
+              branch: {
+                type: "string",
+                description: "Branch name"
+              }
+            },
+            required: ["owner", "repo", "path", "message", "sha"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "createBranch",
+          description: "Create a new branch in a repository. Use when user wants to create a branch.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              ref: {
+                type: "string",
+                description: "Full ref name like 'refs/heads/branch-name' or just 'branch-name' (required)"
+              },
+              sha: {
+                type: "string",
+                description: "SHA to base the branch on (required, usually 'main' or 'master')"
+              }
+            },
+            required: ["owner", "repo", "ref", "sha"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "mergePullRequest",
+          description: "Merge a pull request. Use when user wants to merge a PR.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              pull_number: {
+                type: "number",
+                description: "Pull request number (required)"
+              },
+              commit_title: {
+                type: "string",
+                description: "Custom merge commit title"
+              },
+              commit_message: {
+                type: "string",
+                description: "Custom merge commit message"
+              },
+              merge_method: {
+                type: "string",
+                enum: ["merge", "squash", "rebase"],
+                description: "Merge method (default: merge)"
+              }
+            },
+            required: ["owner", "repo", "pull_number"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "closeIssue",
+          description: "Close a GitHub issue. Use when user wants to close an issue.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              issue_number: {
+                type: "number",
+                description: "Issue number (required)"
+              }
+            },
+            required: ["owner", "repo", "issue_number"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "closePR",
+          description: "Close a pull request without merging. Use when user wants to close a PR.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              pull_number: {
+                type: "number",
+                description: "Pull request number (required)"
+              }
+            },
+            required: ["owner", "repo", "pull_number"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "addIssueComment",
+          description: "Add a comment to an issue. Use when user wants to comment on an issue.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              issue_number: {
+                type: "number",
+                description: "Issue number (required)"
+              },
+              body: {
+                type: "string",
+                description: "Comment body (required)"
+              }
+            },
+            required: ["owner", "repo", "issue_number", "body"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "commentOnPR",
+          description: "Add a comment to a pull request. Use when user wants to comment on a PR.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              pull_number: {
+                type: "number",
+                description: "Pull request number (required)"
+              },
+              body: {
+                type: "string",
+                description: "Comment body (required)"
+              }
+            },
+            required: ["owner", "repo", "pull_number", "body"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "approvePR",
+          description: "Approve a pull request. Use when user wants to approve a PR.",
+          parameters: {
+            type: "object",
+            properties: {
+              owner: {
+                type: "string",
+                description: "Repository owner username"
+              },
+              repo: {
+                type: "string",
+                description: "Repository name"
+              },
+              pull_number: {
+                type: "number",
+                description: "Pull request number (required)"
+              },
+              body: {
+                type: "string",
+                description: "Optional approval comment"
+              }
+            },
+            required: ["owner", "repo", "pull_number"]
+          }
+        }
       }
     ];
+  }
+
+  /**
+   * Create adapter wrapper for new tools (params, context) -> (userId, params)
+   * This allows the new tools to work with the existing agent signature
+   * Made static to avoid binding issues
+   */
+  static createToolAdapter(toolFunction) {
+    return async (userId, params) => {
+      const result = await toolFunction(params || {}, { userId });
+      // Convert to old format if needed (new tools already return { success, data, error })
+      return result;
+    };
   }
 
   /**
@@ -273,7 +1095,8 @@ class GitHubAgent {
    * This allows the agent to execute the correct function based on OpenAI's selection
    */
   createFunctionMap() {
-    return {
+    // Legacy functions (read-only, old signature)
+    const legacyMap = {
       'getGithubStatus': githubFunctions.getGithubStatus,
       'getGithubProfile': githubFunctions.getGithubProfile,
       'getGithubRepos': githubFunctions.getGithubRepos,
@@ -281,8 +1104,149 @@ class GitHubAgent {
       'getGithubIssues': githubFunctions.getGithubIssues,
       'getGithubPullRequests': githubFunctions.getGithubPullRequests,
       'getGithubNotifications': githubFunctions.getGithubNotifications,
-      'getGithubRepository': githubFunctions.getGithubRepository
+      'getGithubRepository': githubFunctions.getGithubRepository,
+      // New read tool for file structure
+      'getRepoFileTree': GitHubAgent.createToolAdapter(githubTools.github_getRepoFileTree)
     };
+
+    // New tools (all operations, new signature wrapped)
+    const newToolsMap = {
+      // README orchestration
+      'upsertReadme': async (userId, params) => this.upsertReadme(userId, params),
+      // Safe file operations (resolve SHA / upsert)
+      'upsertFile': async (userId, params) => this.upsertFile(userId, params),
+      'safeUpdateFile': async (userId, params) => this.safeUpdateFile(userId, params),
+      'safeDeleteFile': async (userId, params) => this.safeDeleteFile(userId, params),
+
+      // Repository operations
+      'createRepository': GitHubAgent.createToolAdapter(githubTools.github_createRepo),
+      'createRepo': GitHubAgent.createToolAdapter(githubTools.github_createRepo),
+      'listRepos': GitHubAgent.createToolAdapter(githubTools.github_listRepos),
+      'getRepoInfo': GitHubAgent.createToolAdapter(githubTools.github_getRepoInfo),
+      'createOrgRepo': GitHubAgent.createToolAdapter(githubTools.github_createOrgRepo),
+      'setRepoVisibility': GitHubAgent.createToolAdapter(githubTools.github_setRepoVisibility),
+      'updateRepoSettings': GitHubAgent.createToolAdapter(githubTools.github_updateRepoSettings),
+      'archiveRepo': GitHubAgent.createToolAdapter(githubTools.github_archiveRepo),
+      'transferRepo': GitHubAgent.createToolAdapter(githubTools.github_transferRepo),
+      'forkRepo': GitHubAgent.createToolAdapter(githubTools.github_forkRepo),
+      
+      // File operations
+      'listRepoContents': GitHubAgent.createToolAdapter(githubTools.github_listRepoContents),
+      'getFileContent': GitHubAgent.createToolAdapter(githubTools.github_getFileContent),
+      'createFile': GitHubAgent.createToolAdapter(githubTools.github_createFile),
+      'updateFile': GitHubAgent.createToolAdapter(githubTools.github_updateWholeFile),
+      'deleteFile': GitHubAgent.createToolAdapter(githubTools.github_deleteFile),
+      'searchRepoCode': GitHubAgent.createToolAdapter(githubTools.github_searchRepoCode),
+      'getRepoFileTree': GitHubAgent.createToolAdapter(githubTools.github_getRepoFileTree),
+      
+      // Branch operations
+      'listBranches': GitHubAgent.createToolAdapter(githubTools.github_listBranches),
+      'createBranch': GitHubAgent.createToolAdapter(githubTools.github_createBranch),
+      'deleteBranch': GitHubAgent.createToolAdapter(githubTools.github_deleteBranch),
+      'compareBranches': GitHubAgent.createToolAdapter(githubTools.github_compareBranches),
+      'protectBranch': GitHubAgent.createToolAdapter(githubTools.github_protectBranch),
+      'unprotectBranch': GitHubAgent.createToolAdapter(githubTools.github_unprotectBranch),
+      'rebaseBranch': GitHubAgent.createToolAdapter(githubTools.github_rebaseBranch),
+      
+      // Pull request operations
+      'listPullRequests': GitHubAgent.createToolAdapter(githubTools.github_listPullRequests),
+      'createPullRequest': GitHubAgent.createToolAdapter(githubTools.github_createPullRequest),
+      'getPullRequestInfo': GitHubAgent.createToolAdapter(githubTools.github_getPullRequestInfo),
+      'updatePullRequest': GitHubAgent.createToolAdapter(githubTools.github_updatePullRequest),
+      'mergePullRequest': GitHubAgent.createToolAdapter(githubTools.github_mergePullRequest),
+      'closePR': GitHubAgent.createToolAdapter(githubTools.github_closePR),
+      'checkPullRequestMergeability': GitHubAgent.createToolAdapter(githubTools.github_checkPullRequestMergeability),
+      'getPullRequestFiles': GitHubAgent.createToolAdapter(githubTools.github_getPullRequestFiles),
+      'getPullRequestFilesSummary': GitHubAgent.createToolAdapter(githubTools.github_getPullRequestFilesSummary),
+      'listPRComments': GitHubAgent.createToolAdapter(githubTools.github_listPRComments),
+      'addPRReviewers': GitHubAgent.createToolAdapter(githubTools.github_addPRReviewers),
+      'approvePR': GitHubAgent.createToolAdapter(githubTools.github_approvePR),
+      'requestChangesOnPR': GitHubAgent.createToolAdapter(githubTools.github_requestChangesOnPR),
+      'commentOnPR': GitHubAgent.createToolAdapter(githubTools.github_commentOnPR),
+      
+      // Issue operations
+      'listIssues': GitHubAgent.createToolAdapter(githubTools.github_listIssues),
+      'getIssueDetails': GitHubAgent.createToolAdapter(githubTools.github_getIssueDetails),
+      'createIssue': GitHubAgent.createToolAdapter(githubTools.github_createIssue),
+      'updateIssue': GitHubAgent.createToolAdapter(githubTools.github_updateIssue),
+      'closeIssue': GitHubAgent.createToolAdapter(githubTools.github_closeIssue),
+      'addIssueComment': GitHubAgent.createToolAdapter(githubTools.github_addIssueComment),
+      'addLabelsToIssue': GitHubAgent.createToolAdapter(githubTools.github_addLabelsToIssue),
+      'listOrgIssues': GitHubAgent.createToolAdapter(githubTools.github_listOrgIssues),
+      'listIssuesByAssignee': GitHubAgent.createToolAdapter(githubTools.github_listIssuesByAssignee),
+      
+      // Commit operations
+      'listCommits': GitHubAgent.createToolAdapter(githubTools.github_listCommits),
+      'getCommit': GitHubAgent.createToolAdapter(githubTools.github_getCommit),
+      'getCommitComments': GitHubAgent.createToolAdapter(githubTools.github_getCommitComments),
+      'createCommitComment': GitHubAgent.createToolAdapter(githubTools.github_createCommitComment),
+      'getCommitStatuses': GitHubAgent.createToolAdapter(githubTools.github_getCommitStatuses),
+      'getCommitCheckRuns': GitHubAgent.createToolAdapter(githubTools.github_getCommitCheckRuns),
+      'getCommitSignatureVerification': GitHubAgent.createToolAdapter(githubTools.github_getCommitSignatureVerification),
+      'revertCommit': GitHubAgent.createToolAdapter(githubTools.github_revertCommit),
+      'deleteCommitComment': GitHubAgent.createToolAdapter(githubTools.github_deleteCommitComment),
+      
+      // Collaborator operations
+      'listRepoCollaborators': GitHubAgent.createToolAdapter(githubTools.github_listRepoCollaborators),
+      'addCollaborator': GitHubAgent.createToolAdapter(githubTools.github_addCollaborator),
+      'removeCollaborator': GitHubAgent.createToolAdapter(githubTools.github_removeCollaborator),
+      'listPendingInvitations': GitHubAgent.createToolAdapter(githubTools.github_listPendingInvitations),
+      'listUserRepositoryInvitations': GitHubAgent.createToolAdapter(githubTools.github_listUserRepositoryInvitations),
+      'acceptRepositoryInvitation': GitHubAgent.createToolAdapter(githubTools.github_acceptRepositoryInvitation),
+      'declineRepositoryInvitation': GitHubAgent.createToolAdapter(githubTools.github_declineRepositoryInvitation),
+      
+      // Organization operations
+      'listUserOrgs': GitHubAgent.createToolAdapter(githubTools.github_listUserOrgs),
+      'listOrgMembers': GitHubAgent.createToolAdapter(githubTools.github_listOrgMembers),
+      'listOrgOutsideCollaborators': GitHubAgent.createToolAdapter(githubTools.github_listOrgOutsideCollaborators),
+      'listPendingOrgInvitations': GitHubAgent.createToolAdapter(githubTools.github_listPendingOrgInvitations),
+      'getOrgBillingInfo': GitHubAgent.createToolAdapter(githubTools.github_getOrgBillingInfo),
+      'listPrsByAssignee': GitHubAgent.createToolAdapter(githubTools.github_listPrsByAssignee),
+      
+      // Label operations
+      'listLabels': GitHubAgent.createToolAdapter(githubTools.github_listLabels),
+      'createLabel': GitHubAgent.createToolAdapter(githubTools.github_createLabel),
+      'updateLabel': GitHubAgent.createToolAdapter(githubTools.github_updateLabel),
+      'deleteLabel': GitHubAgent.createToolAdapter(githubTools.github_deleteLabel),
+      
+      // Project operations
+      'listRepoProjects': GitHubAgent.createToolAdapter(githubTools.github_listRepoProjects),
+      'listOrgProjects': GitHubAgent.createToolAdapter(githubTools.github_listOrgProjects),
+      'getProject': GitHubAgent.createToolAdapter(githubTools.github_getProject),
+      'createRepoProject': GitHubAgent.createToolAdapter(githubTools.github_createRepoProject),
+      'createOrgProject': GitHubAgent.createToolAdapter(githubTools.github_createOrgProject),
+      'updateProject': GitHubAgent.createToolAdapter(githubTools.github_updateProject),
+      'deleteProject': GitHubAgent.createToolAdapter(githubTools.github_deleteProject),
+      'listProjectColumns': GitHubAgent.createToolAdapter(githubTools.github_listProjectColumns),
+      'addProjectCard': GitHubAgent.createToolAdapter(githubTools.github_addProjectCard),
+      
+      // Workflow operations
+      'triggerWorkflow': GitHubAgent.createToolAdapter(githubTools.github_triggerWorkflow),
+      'getWorkflowStatus': GitHubAgent.createToolAdapter(githubTools.github_getWorkflowStatus),
+      'listWorkflowRuns': GitHubAgent.createToolAdapter(githubTools.github_listWorkflowRuns),
+      
+      // Stats operations
+      'getCommitActivity': GitHubAgent.createToolAdapter(githubTools.github_getCommitActivity),
+      'getContributorsStats': GitHubAgent.createToolAdapter(githubTools.github_getContributorsStats),
+      
+      // Gist operations
+      'createGist': GitHubAgent.createToolAdapter(githubTools.github_createGist),
+      'listGists': GitHubAgent.createToolAdapter(githubTools.github_listGists),
+      'getGist': GitHubAgent.createToolAdapter(githubTools.github_getGist),
+      'updateGist': GitHubAgent.createToolAdapter(githubTools.github_updateGist),
+      'deleteGist': GitHubAgent.createToolAdapter(githubTools.github_deleteGist),
+      'listPublicGists': GitHubAgent.createToolAdapter(githubTools.github_listPublicGists),
+      'listUserGists': GitHubAgent.createToolAdapter(githubTools.github_listUserGists),
+      
+      // User operations
+      'getUserProfile': GitHubAgent.createToolAdapter(githubTools.github_getUserProfile),
+      
+      // Comment operations
+      'deleteIssueComment': GitHubAgent.createToolAdapter(githubTools.github_deleteIssueComment),
+      'deletePRComment': GitHubAgent.createToolAdapter(githubTools.github_deletePRComment),
+    };
+
+    return { ...legacyMap, ...newToolsMap };
   }
 
   /**
@@ -311,6 +1275,12 @@ Your capabilities include:
 - Finding issues and pull requests
 - Checking notifications
 - Getting detailed repository information
+- Creating repositories, issues, pull requests, files, and branches
+- Updating and deleting files
+- Merging pull requests
+- Adding comments to issues and PRs
+- Managing collaborators and labels
+- And many more GitHub operations
 
 Guidelines:
 1. Always be helpful and provide clear, concise responses
@@ -334,7 +1304,11 @@ IMPORTANT: When users specify a number of repositories to show, always use that 
 IMPORTANT: When users ask about repositories "where [language] is used" or "written in [language]", they want to filter by programming language, not repository name.
 CRITICAL: For repository-specific queries, always assume the repository belongs to the authenticated user unless explicitly told otherwise. Never default to 'octocat' or other external owners.
 
-Remember: You can only access GitHub data for the authenticated user. You cannot perform write operations like creating issues or commits.`;
+You can perform both read and write operations:
+- Read: repositories, commits, issues, PRs, files, branches, etc.
+- Write: create repositories, issues, PRs, files, branches; update/delete files; merge PRs; add comments; and more.
+
+When performing write operations, be careful and confirm the user's intent. Always use the appropriate tool for the action requested.`;
   }
 
   /**
@@ -360,7 +1334,8 @@ Remember: You can only access GitHub data for the authenticated user. You cannot
           throw new Error(`Unknown function: ${options.forceToolExecution.toolName}`);
         }
 
-        const result = await functionToCall(userId, options.forceToolExecution.params);
+        const normalizedArgs = await this.normalizeGithubArgs(userId, options.forceToolExecution.params, options);
+        const result = await functionToCall(userId, normalizedArgs);
         
         let responseText = result.success ? `Successfully executed ${options.forceToolExecution.toolName}` : result.error;
         
@@ -446,7 +1421,8 @@ Remember: You can only access GitHub data for the authenticated user. You cannot
       // Execute each tool call
       for (const toolCall of toolCalls) {
         const functionName = toolCall.function.name;
-        const functionArgs = JSON.parse(toolCall.function.arguments);
+        const rawArgs = JSON.parse(toolCall.function.arguments);
+        const functionArgs = await this.normalizeGithubArgs(userId, rawArgs, options);
         
         console.log(`Executing tool: ${functionName} with args:`, functionArgs);
         

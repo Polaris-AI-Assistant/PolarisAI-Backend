@@ -271,6 +271,104 @@ const confirmationConfig = {
   
   // GitHub Agent - Create/Delete operations need confirmation
   github: {
+    upsertReadme: {
+      confirmationRequired: true,
+      actionType: 'upsert_readme',
+      description: 'Create or update README.md in a GitHub repository',
+      generatePreview: (params) => {
+        const lines = ['📝 **Create/Update README.md**\n'];
+        const repoLabel = params.owner && params.repo ? `${params.owner}/${params.repo}` : (params.repo || 'pending');
+        lines.push(`**Repository:** ${repoLabel}`);
+        lines.push('**File:** README.md');
+        lines.push('\nThis will generate a README.md based on the repository structure and update it if it already exists.');
+        return lines.join('\n');
+      }
+    },
+    upsertFile: {
+      confirmationRequired: true,
+      actionType: 'upsert_file',
+      description: 'Create or update a file in a GitHub repository',
+      generatePreview: (params) => {
+        const lines = ['🧩 **Create/Update GitHub File**\n'];
+        if (params.repo && params.repo !== 'pending') lines.push(`**Repository:** ${params.repo}`);
+        if (params.path && params.path !== 'pending') lines.push(`**File Path:** ${params.path}`);
+        lines.push('\nIf the file already exists, it will be updated; otherwise it will be created.');
+        return lines.join('\n');
+      }
+    },
+    safeUpdateFile: {
+      confirmationRequired: true,
+      actionType: 'update_file',
+      description: 'Update a file in a GitHub repository',
+      generatePreview: (params) => confirmationConfig.github.updateFile.generatePreview(params)
+    },
+    safeDeleteFile: {
+      confirmationRequired: true,
+      actionType: 'delete_file',
+      description: 'Delete a file from a GitHub repository',
+      generatePreview: (params) => confirmationConfig.github.deleteFile.generatePreview(params)
+    },
+    createFile: {
+      confirmationRequired: true,
+      actionType: 'create_file',
+      description: 'Create a file in a GitHub repository',
+      generatePreview: (params) => {
+        const lines = ['📄 **Create GitHub File**\n'];
+        if (params.repo && params.repo !== 'pending') {
+          lines.push(`**Repository:** ${params.repo}`);
+        }
+        if (params.path && params.path !== 'pending') {
+          lines.push(`**File Path:** ${params.path}`);
+        }
+        if (params.content && params.content !== 'pending') {
+          const preview = params.content.length > 100 
+            ? params.content.substring(0, 100) + '...' 
+            : params.content;
+          lines.push(`**Content:** \`${preview}\``);
+        }
+        if (params.message && params.message !== 'Create file') {
+          lines.push(`**Commit Message:** ${params.message}`);
+        }
+        return lines.join('\n');
+      }
+    },
+    updateFile: {
+      confirmationRequired: true,
+      actionType: 'update_file',
+      description: 'Update a file in a GitHub repository',
+      generatePreview: (params) => {
+        const lines = ['✏️ **Update GitHub File**\n'];
+        if (params.repo && params.repo !== 'pending') {
+          lines.push(`**Repository:** ${params.repo}`);
+        }
+        if (params.path && params.path !== 'pending') {
+          lines.push(`**File Path:** ${params.path}`);
+        }
+        if (params.content && params.content !== 'pending') {
+          const preview = params.content.length > 100 
+            ? params.content.substring(0, 100) + '...' 
+            : params.content;
+          lines.push(`**New Content:** \`${preview}\``);
+        }
+        return lines.join('\n');
+      }
+    },
+    deleteFile: {
+      confirmationRequired: true,
+      actionType: 'delete_file',
+      description: 'Delete a file from a GitHub repository',
+      generatePreview: (params) => {
+        const lines = ['🗑️ **Delete GitHub File**\n'];
+        if (params.repo && params.repo !== 'pending') {
+          lines.push(`**Repository:** ${params.repo}`);
+        }
+        if (params.path && params.path !== 'pending') {
+          lines.push(`**File Path:** ${params.path}`);
+        }
+        lines.push('\n⚠️ This will permanently delete the file from the repository!');
+        return lines.join('\n');
+      }
+    },
     createRepository: {
       confirmationRequired: true,
       actionType: 'create_repository',

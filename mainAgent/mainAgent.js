@@ -93,6 +93,177 @@ class MainAgent {
     this.systemPrompt = this.createSystemPrompt();
   }
 
+  // ==================== LLM Parameter Extraction (GitHub) ====================
+
+  /**
+   * Use the LLM to extract parameters for GitHub tools (preferred over regex).
+   * Falls back to existing regex extractors if LLM extraction fails.
+   * @param {string} toolName
+   * @param {string} query
+   * @param {string|null} userId
+   * @param {Array<{role:string,content:string}>} conversationHistory
+   * @returns {Promise<object>}
+   */
+  async extractGithubParamsWithLLM(toolName, query, userId = null, conversationHistory = []) {
+    const supabase = require('../supabase/supabaseConnect');
+
+    const schemas = {
+      upsertReadme: `{\n  \"owner\"?: string,\n  \"repo\": string\n}`,
+      createRepository: `{\n  \"name\": string,\n  \"description\"?: string,\n  \"private\"?: boolean\n}`,
+      deleteRepository: `{\n  \"owner\"?: string,\n  \"repo\": string\n}`,
+      createIssue: `{\n  \"owner\"?: string,\n  \"repo\": string,\n  \"title\": string,\n  \"body\"?: string,\n  \"labels\"?: string[],\n  \"assignees\"?: string[]\n}`,
+      createPullRequest: `{\n  \"owner\"?: string,\n  \"repo\": string,\n  \"title\": string,\n  \"head\": string,\n  \"base\": string,\n  \"body\"?: string,\n  \"draft\"?: boolean\n}`,
+      createFile: `{\n  \"owner\"?: string,\n  \"repo\": string,\n  \"path\": string,\n  \"content\": string,\n  \"message\"?: string,\n  \"branch\"?: string\n}`,
+      upsertFile: `{\n  \"owner\"?: string,\n  \"repo\": string,\n  \"path\": string,\n  \"content\": string,\n  \"message\"?: string,\n  \"branch\"?: string\n}`,
+      safeUpdateFile: `{\n  \"owner\"?: string,\n  \"repo\": string,\n  \"path\": string,\n  \"content\": string,\n  \"message\"?: string,\n  \"branch\"?: string\n}`,
+      safeDeleteFile: `{\n  \"owner\"?: string,\n  \"repo\": string,\n  \"path\": string,\n  \"message\"?: string,\n  \"branch\"?: string\n}`,
+    };
+
+    const schema = schemas[toolName] || `{} // unknown tool`;
+
+    // Pull connected GitHub username (helps with \"this repo\" requests)
+    let connectedUsername = null;
+    if (userId) {
+      try {
+        const { data } = await supabase
+          .from('github_tokens')
+          .select('github_username')
+          .eq('user_id', userId)
+          .single();
+        connectedUsername = data?.github_username || null;
+      } catch (_) {
+        connectedUsername = null;
+      }
+    }
+
+    const history = Array.isArray(conversationHistory) ? conversationHistory.slice(-8) : [];
+    const historyText = history
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 400)}`)
+      .join('\n');
+
+    const stopwords = [
+      'and', 'then', 'it', 'this', 'that', 'repo', 'repository', 'github', 'my', 'the', 'a', 'an', 'to', 'in', 'for', 'of'
+    ];
+
+    try {
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+`You extract structured parameters for GitHub tool execution.\n\n` +
+`Tool: ${toolName}\n` +
+`Return ONLY a JSON object matching this schema:\n${schema}\n\n` +
+`Rules:\n` +
+`- Prefer repository names explicitly mentioned earlier in the sentence (e.g., \"PolarisAI repository\").\n` +
+`- Never set repo/name/path to conjunctions or filler words like: ${stopwords.join(', ')}.\n` +
+`- If user says \"this repo\" and the repo name is present in conversation history, use it.\n` +
+`- If owner is missing, omit it (GitHub agent will infer from connected account).\n` +
+`- repo should be the repo name only (no URL). If user provides owner/repo, set repo to repo part and (optionally) owner.\n` +
+`- For README intents, repo must be the repository they mentioned (NOT the word after \"repo\").\n` +
+`- For file tools, path must be a valid path like \"README.md\" or \"src/index.js\".\n` +
+`- For file content: if user didn't provide content and tool requires content, set content to an empty string.\n`
+          },
+          {
+            role: 'user',
+            content:
+`User query:\n${query}\n\n` +
+`${historyText ? `Recent conversation:\n${historyText}\n\n` : ''}` +
+`${connectedUsername ? `Connected GitHub username: ${connectedUsername}\n\n` : ''}` +
+`Return ONLY the JSON object.`
+          }
+        ],
+      });
+
+      const extracted = JSON.parse(response.choices[0].message.content);
+
+      // Minimal sanity checks to avoid obvious failures like repo=\"and\"
+      if (extracted && typeof extracted === 'object') {
+        if (typeof extracted.repo === 'string' && stopwords.includes(extracted.repo.toLowerCase())) {
+          extracted.repo = 'pending';
+        }
+        if (typeof extracted.name === 'string' && stopwords.includes(extracted.name.toLowerCase())) {
+          extracted.name = 'new-repository';
+        }
+        if (typeof extracted.path === 'string' && stopwords.includes(extracted.path.toLowerCase())) {
+          extracted.path = 'pending';
+        }
+        return extracted;
+      }
+    } catch (err) {
+      console.warn(`[MainAgent] GitHub LLM param extraction failed for ${toolName}:`, err.message);
+    }
+
+    // Fallbacks (regex/heuristics) to keep system functional if LLM extraction fails
+    if (toolName === 'createRepository') return this.extractGitHubRepoParams(query);
+    if (toolName === 'upsertReadme') return this.extractGitHubReadmeParams(query, userId);
+    if (toolName === 'createIssue') return this.extractGitHubIssueParams(query);
+    if (['createFile', 'upsertFile', 'safeUpdateFile', 'safeDeleteFile'].includes(toolName)) {
+      return this.extractGitHubFileParams(query, userId);
+    }
+
+    return {};
+  }
+
+  // ==================== Integration Preflight & Error Sanitization ====================
+
+  _integrationConfig(agentName) {
+    const configs = {
+      gmail: { table: 'gmail_tokens', label: 'Gmail', connectHint: 'Dashboard → Apps → Connect Gmail' },
+      calendar: { table: 'calendar_tokens', label: 'Google Calendar', connectHint: 'Dashboard → Apps → Connect Google Calendar' },
+      docs: { table: 'docs_tokens', label: 'Google Docs', connectHint: 'Dashboard → Apps → Connect Google Docs' },
+      sheets: { table: 'sheets_tokens', label: 'Google Sheets', connectHint: 'Dashboard → Apps → Connect Google Sheets' },
+      forms: { table: 'forms_tokens', label: 'Google Forms', connectHint: 'Dashboard → Apps → Connect Google Forms' },
+      meet: { table: 'meet_tokens', label: 'Google Meet', connectHint: 'Dashboard → Apps → Connect Google Meet' },
+      github: { table: 'github_tokens', label: 'GitHub', connectHint: 'Dashboard → Apps → Connect GitHub' },
+      microsoft: { table: 'microsoft_tokens', label: 'Microsoft 365', connectHint: 'Dashboard → Apps → Connect Microsoft 365' },
+    };
+    return configs[agentName] || null;
+  }
+
+  async _isIntegrationConnected(agentName, userId) {
+    const cfg = this._integrationConfig(agentName);
+    if (!cfg) return true; // agent doesn't require connection (or unknown)
+
+    const supabase = require('../supabase/supabaseConnect');
+    try {
+      const { data, error } = await supabase
+        .from(cfg.table)
+        .select('user_id')
+        .eq('user_id', userId)
+        .limit(1)
+        .single();
+      return !error && !!data;
+    } catch {
+      return false;
+    }
+  }
+
+  _friendlyIntegrationError(agentName) {
+    const cfg = this._integrationConfig(agentName);
+    if (!cfg) return 'This integration is not connected. Please connect it from the Dashboard and try again.';
+    return `${cfg.label} is not connected. Please connect it first (${cfg.connectHint}) and try again.`;
+  }
+
+  _sanitizeErrorForUser(agentName, rawMessage) {
+    const msg = String(rawMessage || '');
+    const lower = msg.toLowerCase();
+
+    if (lower.includes('tokens not found') || lower.includes('user tokens not found')) {
+      return this._friendlyIntegrationError(agentName);
+    }
+
+    if (lower.includes('invalid or expired token')) {
+      return `Your ${this._integrationConfig(agentName)?.label || 'integration'} session seems expired. Please reconnect it from the Dashboard → Apps and try again.`;
+    }
+
+    // Default: don't leak internal details
+    return 'Something went wrong while processing your request. Please try again.';
+  }
+
   /**
    * Check if a tool call requires confirmation and handle accordingly
    * This intercepts tool calls from specialized agents when confirmation is needed
@@ -108,6 +279,21 @@ class MainAgent {
   checkForConfirmationRequired(agentName, toolName, params, userId, query, conversationHistory = []) {
     if (!confirmationUtils.requiresConfirmation(agentName, toolName)) {
       return null;
+    }
+
+    // Preflight: don't even show confirmation if integration isn't connected
+    // (prevents misleading previews when tokens are missing)
+    // Note: This function is sync, so we only do a lightweight message here.
+    // The full async check is done in executeAgentQueriesWithConfirmation.
+    const cfg = this._integrationConfig(agentName);
+    if (cfg) {
+      const previewBlocked = `${cfg.label} is not connected. Please connect it first (${cfg.connectHint}) and try again.`;
+      return {
+        type: 'integration_not_connected',
+        agentName,
+        toolName,
+        message: previewBlocked,
+      };
     }
 
     console.log(`[MainAgent] Tool ${toolName} requires confirmation`);
@@ -1381,6 +1567,19 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
       const analysis = JSON.parse(response.choices[0].message.content);
       
       console.log('[MainAgent] Query analysis:', JSON.stringify(analysis, null, 2));
+
+      // ===== Heuristic routing overrides (post-LLM) =====
+      // README.md (or other repo file) requests should use GitHub agent, not Docs.
+      const lq = lowerQuery;
+      const mentionsRepoContext = /\b(repo|repository|github)\b/i.test(query);
+      const mentionsReadme = /\breadme(\.md)?\b/i.test(query);
+      const mentionsFileExt = /\b[\w\-\/]+\.(js|ts|tsx|jsx|py|java|cpp|c|rb|go|rs|php|html|css|json|md|txt|xml|yml|yaml)\b/i.test(query);
+
+      if ((mentionsReadme || mentionsFileExt) && mentionsRepoContext) {
+        analysis.agents = ['github'];
+        analysis.queries = { github: query };
+        analysis.reasoning = `User is requesting repository file operations (README/files) in a GitHub repository; route to github agent.`;
+      }
       
       return analysis;
 
@@ -1407,6 +1606,12 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
           try {
             let agentQuery = analysis.queries[agentName];
             console.log(`[MainAgent] Executing ${agentName} sequentially with query: "${agentQuery}"`);
+
+            // Preflight integration connection (avoid leaking token errors later)
+            const isConnected = await this._isIntegrationConnected(agentName, userId);
+            if (!isConnected) {
+              throw new Error(this._friendlyIntegrationError(agentName));
+            }
 
             // ====== ENRICH QUERY WITH PREVIOUS RESULTS ======
             // When executing sequentially, inject concrete data from prior agents
@@ -1463,13 +1668,14 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
           } catch (error) {
             console.error(`[MainAgent] Error executing ${agentName}:`, error);
+            const friendly = this._sanitizeErrorForUser(agentName, error.message);
             errors[agentName] = {
-              error: error.message,
+              error: friendly,
               query: analysis.queries[agentName]
             };
             // Emit failed event
             if (timeline) {
-              timeline.emitAgentFailed(agentName, error.message);
+              timeline.emitAgentFailed(agentName, friendly);
             }
           }
         }
@@ -1479,6 +1685,12 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
           try {
             const agentQuery = analysis.queries[agentName];
             console.log(`[MainAgent] Executing ${agentName} in parallel with query: "${agentQuery}"`);
+
+            // Preflight integration connection
+            const isConnected = await this._isIntegrationConnected(agentName, userId);
+            if (!isConnected) {
+              throw new Error(this._friendlyIntegrationError(agentName));
+            }
             
             // Emit executing event BEFORE agent starts
             if (timeline) {
@@ -1507,16 +1719,17 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
           } catch (error) {
             console.error(`[MainAgent] Error executing ${agentName}:`, error);
+            const friendly = this._sanitizeErrorForUser(agentName, error.message);
             
             // Emit failed event
             if (timeline) {
-              timeline.emitAgentFailed(agentName, error.message);
+              timeline.emitAgentFailed(agentName, friendly);
             }
             
             return { 
               agentName, 
               error: {
-                error: error.message,
+                error: friendly,
                 query: analysis.queries[agentName]
               }
             };
@@ -1916,7 +2129,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         return timeline.detectClarificationRequest(result.response);
       });
       
-      // Emit timeline task completed at the very end
+      // Emit timeline task completed/failed at the very end
       if (Object.keys(errors).length === 0) {
         // Complete for both agent results AND empty-agent queries (conversational/file-context)
         if (Object.keys(results).length > 0) {
@@ -1924,6 +2137,15 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         } else if (analysis.agents.length === 0) {
           // No agents were used (conversational query or file-context query)
           timeline.emitTaskCompleted('Request completed successfully', false);
+        }
+      } else {
+        // Emit task failed if we have any errors and no task_failed has been emitted yet
+        const alreadyFailed = timeline.getEvents().some(e => e.type === 'timeline_task_failed');
+        if (!alreadyFailed) {
+          const firstErrorKey = Object.keys(errors)[0];
+          const firstError = errors[firstErrorKey];
+          const friendly = (firstError && (firstError.error || firstError.message)) || 'Something went wrong.';
+          timeline.emitTaskFailed(new Error(friendly));
         }
       }
       
@@ -2204,7 +2426,26 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
     for (const agentName of analysis.agents) {
       const agentQuery = analysis.queries[agentName];
       console.log(`[Confirmation] Checking agent: ${agentName}, query: ${agentQuery}`);
-      const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery, userId);
+
+      // Preflight integration connection BEFORE generating previews or confirmations
+      const isConnected = await this._isIntegrationConnected(agentName, userId);
+      if (!isConnected) {
+        const friendly = this._friendlyIntegrationError(agentName);
+        console.warn(`[Confirmation] Integration not connected for ${agentName}: ${friendly}`);
+        if (timeline) {
+          timeline.emitTaskFailed(new Error(friendly));
+        }
+        return {
+          results: {},
+          errors: {
+            [agentName]: { error: friendly, query: agentQuery }
+          },
+          storedArtifacts: [],
+          confirmationRequest: null
+        };
+      }
+
+      const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery, userId, conversationHistory);
       
       if (detectedAction) {
         console.log(`[Confirmation] Detected action for ${agentName}:`, JSON.stringify(detectedAction, null, 2));
@@ -2325,7 +2566,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
    * Detect if the query requires confirmation before execution
    * Returns async because some extractors (like forms, gmail) need AI generation
    */
-  async detectConfirmationRequiredAction(agentName, agentQuery, userId = null) {
+  async detectConfirmationRequiredAction(agentName, agentQuery, userId = null, conversationHistory = []) {
     const query = agentQuery.toLowerCase();
     
     // Define patterns for each agent's confirmation-required actions
@@ -2428,32 +2669,76 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       ],
       github: [
         {
+          // README.md create/update (single action that safely handles both cases)
+          patterns: ['create', 'update', 'make', 'write', 'generate'],
+          keywords: ['readme', 'readme.md'],
+          toolName: 'upsertReadme',
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('upsertReadme', q, userId, history),
+          isAsync: true,
+          // Avoid firing when user is explicitly creating a new repository named README, etc.
+          excludePatterns: ['new repository', 'new repo', 'create repository', 'create repo']
+        },
+        {
+          // Create or update a file when user explicitly asks for both (prevents 422 / missing sha)
+          patterns: ['if exists', 'already exists', 'create or update', 'update it if', 'if already exists'],
+          keywords: ['file', '.js', '.ts', '.py', '.java', '.cpp', '.c', '.rb', '.go', '.rs', '.php', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yml', '.yaml', 'index.js', 'package.json', 'readme', '.jsx', '.tsx'],
+          toolName: 'upsertFile',
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('upsertFile', q, userId, history),
+          isAsync: true
+        },
+        {
+          // File creation - check FIRST (order matters!)
+          patterns: ['create', 'add', 'new', 'make'],
+          keywords: ['file', '.js', '.ts', '.py', '.java', '.cpp', '.c', '.rb', '.go', '.rs', '.php', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yml', '.yaml', 'index.js', 'package.json', 'readme', '.jsx', '.tsx'],
+          toolName: 'createFile',
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('createFile', q, userId, history),
+          isAsync: true, // Need async to fetch GitHub username
+          // Exclude if it's clearly about creating a repository
+          excludePatterns: ['new repository', 'new repo', 'create repository', 'create repo']
+        },
+        {
+          patterns: ['update', 'modify', 'edit', 'change'],
+          keywords: ['file', '.js', '.ts', '.py', '.java', '.cpp', '.c', '.rb', '.go', '.rs', '.php', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yml', '.yaml'],
+          toolName: 'safeUpdateFile',
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('safeUpdateFile', q, userId, history),
+          isAsync: true
+        },
+        {
+          patterns: ['delete', 'remove'],
+          keywords: ['file', '.js', '.ts', '.py', '.java', '.cpp', '.c', '.rb', '.go', '.rs', '.php', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yml', '.yaml'],
+          toolName: 'safeDeleteFile',
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('safeDeleteFile', q, userId, history),
+          isAsync: true
+        },
+        {
           patterns: ['create', 'new'],
           keywords: ['repository', 'repo'],
           toolName: 'createRepository',
-          extractParams: (q) => this.extractGitHubRepoParams(q),
-          isAsync: false
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('createRepository', q, userId, history),
+          isAsync: true,
+          // Exclude if query mentions file paths or file extensions (likely file creation)
+          excludePatterns: ['.js', '.ts', '.py', '.java', '.cpp', '.c', '.rb', '.go', '.rs', '.php', '.html', '.css', '.json', '.md', '.txt', '.xml', '.yml', '.yaml', ' with ', ' in ', 'index.js', 'package.json', 'readme']
         },
         {
           patterns: ['delete', 'remove'],
           keywords: ['repository', 'repo'],
           toolName: 'deleteRepository',
-          extractParams: () => ({ owner: 'pending', repo: 'pending' }),
-          isAsync: false
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('deleteRepository', q, userId, history),
+          isAsync: true
         },
         {
           patterns: ['create', 'open', 'file', 'new'],
           keywords: ['issue', 'bug', 'feature request'],
           toolName: 'createIssue',
-          extractParams: (q) => this.extractGitHubIssueParams(q),
-          isAsync: false
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('createIssue', q, userId, history),
+          isAsync: true
         },
         {
           patterns: ['create', 'open', 'new'],
           keywords: ['pull request', 'pr'],
           toolName: 'createPullRequest',
-          extractParams: () => ({ owner: 'pending', repo: 'pending', title: 'pending' }),
-          isAsync: false
+          extractParams: (q, userId, history) => this.extractGithubParamsWithLLM('createPullRequest', q, userId, history),
+          isAsync: true
         }
       ],
       gmail: [
@@ -2567,8 +2852,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         // Handle async extractors (like forms with AI-generated questions, gmail with AI content)
         // Pass userId for extractors that need it (like gmail for user signature)
         const inferredParams = pattern.isAsync 
-          ? await pattern.extractParams(agentQuery, userId)
-          : pattern.extractParams(agentQuery, userId);
+          ? await pattern.extractParams(agentQuery, userId, conversationHistory)
+          : pattern.extractParams(agentQuery, userId, conversationHistory);
           
         return {
           toolName: pattern.toolName,
@@ -2938,6 +3223,114 @@ Respond with ONLY valid JSON, no markdown formatting.`
     if (titleMatch) {
       params.title = titleMatch[1].trim();
     }
+    return params;
+  }
+
+  /**
+   * Extract GitHub README parameters from query.
+   * Used for \"create/update README.md\" intents; execution generates content with AI in GitHub agent.
+   */
+  async extractGitHubReadmeParams(query, userId = null) {
+    const base = await this.extractGitHubFileParams(query, userId);
+    return {
+      owner: base.owner,
+      repo: base.repo,
+      path: 'README.md',
+      // Optional hint for agent; default branch is resolved there.
+      ref: base.ref
+    };
+  }
+
+  /**
+   * Extract GitHub file creation/update parameters from query
+   * Handles: "Create index.js with console.log('Hello') in my-project repository"
+   */
+  async extractGitHubFileParams(query, userId = null) {
+    const params = { 
+      owner: 'pending', 
+      repo: 'pending', 
+      path: 'pending', 
+      content: 'pending', 
+      message: 'Create file'
+    };
+    
+    // Extract file path/name (look for file extensions or common file names)
+    const filePathPatterns = [
+      /(?:create|add|make|update|edit|delete|remove)\s+([^\s]+\.(js|ts|py|java|cpp|c|rb|go|rs|php|html|css|json|md|txt|xml|yml|yaml|jsx|tsx))/i,
+      /(?:create|add|make|update|edit|delete|remove)\s+([^\s]+)\s+(?:with|containing|in)/i,
+      /(?:file|path)\s+["']?([^"'\s]+)["']?/i,
+      /index\.js|package\.json|readme|readme\.md/i
+    ];
+    
+    for (const pattern of filePathPatterns) {
+      const match = query.match(pattern);
+      if (match) {
+        params.path = match[1] || match[0];
+        break;
+      }
+    }
+    
+    // Extract repository name (favor "<name> repository" and "in <name> repo")
+    const repoPatterns = [
+      /([^\s]+)\s+repository/i,
+      /([^\s]+)\s+repo/i,
+      /in\s+([^\s]+)\s+repository/i,
+      /in\s+([^\s]+)\s+repo/i
+    ];
+    
+    for (const pattern of repoPatterns) {
+      const match = query.match(pattern);
+      if (match && match[1] && !match[1].includes('.')) { // Exclude file paths
+        params.repo = match[1].trim();
+        break;
+      }
+    }
+    
+    // Extract file content (look for "with <content>" or "containing <content>")
+    const contentPatterns = [
+      /with\s+["']([^"']+)["']/i,
+      /with\s+([^"']+?)(?:\s+in|\s+repository|\s+repo|$)/i,
+      /containing\s+["']([^"']+)["']/i,
+      /containing\s+([^"']+?)(?:\s+in|\s+repository|\s+repo|$)/i,
+      /console\.log\([^)]+\)/i,
+      /["']([^"']+)["']/i
+    ];
+    
+    for (const pattern of contentPatterns) {
+      const match = query.match(pattern);
+      if (match && match[1] && !match[1].includes('repository') && !match[1].includes('repo')) {
+        params.content = match[1].trim();
+        break;
+      }
+    }
+    
+    // Generate commit message
+    if (query.toLowerCase().includes('create') || query.toLowerCase().includes('add')) {
+      params.message = `Create ${params.path || 'file'}`;
+    } else if (query.toLowerCase().includes('update') || query.toLowerCase().includes('modify')) {
+      params.message = `Update ${params.path || 'file'}`;
+    } else if (query.toLowerCase().includes('delete') || query.toLowerCase().includes('remove')) {
+      params.message = `Delete ${params.path || 'file'}`;
+    }
+    
+    // Try to get GitHub username if userId is provided
+    if (userId && params.owner === 'pending') {
+      try {
+        const supabase = require('../supabase/supabaseConnect');
+        const { data } = await supabase
+          .from('github_tokens')
+          .select('github_username')
+          .eq('user_id', userId)
+          .single();
+        if (data && data.github_username) {
+          params.owner = data.github_username;
+        }
+      } catch (error) {
+        console.warn('[MainAgent] Could not fetch GitHub username:', error.message);
+        // Keep owner as 'pending' - GitHub agent will need to handle it
+      }
+    }
+    
     return params;
   }
 
@@ -3663,6 +4056,8 @@ Respond ENTIRELY in the language of the current query - if they asked in English
 - Technical terms, product names (Google Docs), URLs, and identifiers can remain in English
 - Markdown formatting should still be used
 - IGNORE any stored language preferences - ONLY respond in the language of this current query
+
+${responseLanguage ? `\n**LANGUAGE OVERRIDE (STRICT)**: The UI indicates the user's current message language is **${responseLanguage}**.\nYou MUST respond entirely in **${responseLanguage}**. Do not use any other language.\n` : ''}
 `;
 
       // Get dynamic system prompt with artifact context
