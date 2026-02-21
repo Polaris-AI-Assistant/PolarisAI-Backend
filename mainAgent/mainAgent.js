@@ -43,6 +43,7 @@ const MicrosoftAgent = require('../microsoft/microsoftAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 const { TimelineEmitter, TimelineEventType, AGENT_NAMES } = require('./timelineEvents');
+const IntentClassifier = require('./intentClassifier');
 
 // Artifact Memory imports
 const { 
@@ -1208,22 +1209,14 @@ Language Detection Rules:
    */
   async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '', fileContext = null) {
     try {
-      // Pre-check: Detect common conversational queries BEFORE calling LLM
-      const lowerQuery = query.toLowerCase().trim();
-      const conversationalPatterns = [
-        /^what\s+(is|was)\s+my\s+name/i,
-        /^who\s+am\s+i/i,
-        /^what\s+did\s+(i|we)\s+(say|tell|discuss|talk)/i,
-        /^what\s+(flights|forms|documents|emails|meetings)\s+did\s+i/i,
-        /^remind\s+me/i,
-        /^what\s+was\s+that/i,
-        /^tell\s+me\s+about\s+(our|the)\s+conversation/i
-      ];
-
-      // Check if query matches any conversational pattern
-      const isConversational = conversationalPatterns.some(pattern => pattern.test(query));
+      // Use LLM-based intent classifier instead of regex
+      const intentClassifier = new IntentClassifier();
+      const intentClassification = await intentClassifier.classify(query, conversationHistory);
       
-      if (isConversational) {
+      console.log(`[MainAgent] 🎯 Intent Classification:`, JSON.stringify(intentClassification, null, 2));
+
+      // Handle conversational queries
+      if (intentClassification.type === 'conversational') {
         console.log('[MainAgent] 🎯 Detected conversational query - skipping agents:', query);
         return {
           agents: [],
@@ -1231,41 +1224,18 @@ Language Detection Rules:
         };
       }
 
-      // Pre-check: Detect file generation requests (PDF/TXT) - these should NOT use agents
-      // Instead, get AI response directly and convert to file
-      const fileGenerationPatterns = [
-        /\b(generate|export|create|make|save|download|convert)\s+(a\s+)?(pdf|txt|text|document|file)/i,
-        /\b(in|as)\s+(a\s+)?(pdf|txt|text)\b/i,
-        /\bpdf\b.*\b(file|format|export|generate|create|download)/i,
-        /\bpdf\b/i, // Catch any mention of "pdf"
-        /\b(text|txt)\s+file\b/i
-      ];
-
-      const hasFileGenerationRequest = fileGenerationPatterns.some(pattern => pattern.test(query));
-      
-      if (hasFileGenerationRequest) {
-        console.log('[MainAgent] 📄 Detected file generation request (PDF/TXT) - skipping agents, will generate content and convert to file:', query);
-        // File generation requests get direct AI response (no agents)
-        // The content will be converted to PDF/TXT by the controller after streaming
+      // Handle file generation requests
+      if (intentClassification.type === 'file_generation') {
+        console.log('[MainAgent] 📄 Detected file generation request - skipping agents, will generate content and convert to file:', query);
         return {
           agents: [],
           reasoning: "User requested file generation (PDF/TXT). The AI-generated content will be automatically converted to the requested file format.",
-          skipAgents: true  // Flag to indicate this is a file generation request
+          skipAgents: true
         };
       }
 
-      // Pre-check: Detect planning/advisory queries vs actual action queries
-      // "planning to create", "thinking about", "want to know how", "help me make a plan" = ADVISORY, no agents
-      const advisoryPatterns = [
-        /\b(planning|thinking|wondering|considering|i want to know|how\s+should|help me|suggest|advise|give me|provide|explain)\b.*\b(how|what|way|approach|strategy|plan|steps|process)\b/i,
-        /\b(planning to create|planning to make|thinking about creating|considering creating|what.*to create)\b/i,
-        /\b(help me.*plan|give me.*plan|how.*to.*project|how.*should.*proceed|project.*plan|implementation.*plan)\b/i,
-        /\b(guide me|walk me through|tell me how|what is|what are|best practices|approach|methodology)\b/i
-      ];
-
-      const isAdvisory = advisoryPatterns.some(pattern => pattern.test(query));
-      
-      if (isAdvisory && !/(create|make|send|book|schedule|build)\s+(a|the|my)?\s*(form|document|email|calendar|event|meet|form|sheet|pdf|txt)/i.test(query)) {
+      // Handle advisory queries
+      if (intentClassification.type === 'advisory') {
         console.log('[MainAgent] 💡 Detected advisory/planning query - skipping agents:', query);
         return {
           agents: [],
@@ -1273,9 +1243,9 @@ Language Detection Rules:
         };
       }
 
-      // Pre-check: If files are attached, detect file-related queries that should NOT route to agents
-      // These queries should be answered using the file content already injected into context
+      // Handle file-related queries with attached files
       if (fileContext && fileContext.filesProcessed > 0) {
+        // Check if this is a query about the attached files
         const fileQueryPatterns = [
           /\b(read|summarize|summarise|analyze|analyse|explain|describe|review|look at|check|examine|inspect|parse|interpret|translate)\b.*\b(this|the|my|attached|uploaded)\b.*\b(file|document|pdf|image|photo|picture|attachment|code|text|content|data)/i,
           /\b(what|tell|show)\b.*\b(this|the|my|attached|uploaded)\b.*\b(file|document|pdf|image|photo|picture|attachment|code)\b.*\b(contain|about|say|have|include)/i,
@@ -1299,7 +1269,14 @@ Language Detection Rules:
         }
       }
 
-      // Build artifact context section for the prompt
+      // If we reach here, it's an actionable query - proceed with agent routing
+      if (intentClassification.type !== 'actionable') {
+        console.log('[MainAgent] ⚠️ Unexpected intent type:', intentClassification.type);
+        // Default to actionable if classification is unclear
+      }
+
+      // Define lowerQuery for use in the rest of the method
+      const lowerQuery = query.toLowerCase().trim();
       let artifactSection = '';
       if (artifactContext && artifactContext.allArtifacts && artifactContext.allArtifacts.length > 0) {
         artifactSection = `\n\nCONVERSATION ARTIFACTS (Previously created items in this conversation):
