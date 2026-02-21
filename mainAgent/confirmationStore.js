@@ -143,6 +143,34 @@ function removePendingAction(requestId) {
 }
 
 /**
+ * Update parameters and preview content for a pending action
+ * Used when enhancing email params with results from previous actions in a chain
+ * 
+ * @param {string} requestId - Request ID to update
+ * @param {object} newParams - New parameters to set
+ * @param {string} newPreviewContent - New preview content to set
+ * @returns {boolean} - True if updated, false if not found
+ */
+function updatePendingActionParams(requestId, newParams, newPreviewContent) {
+  const action = pendingActions.get(requestId);
+  
+  if (!action) {
+    console.log(`[ConfirmationStore] Cannot update - action not found: ${requestId}`);
+    return false;
+  }
+  
+  console.log(`[ConfirmationStore] 🔄 Updating pending action params: ${requestId}`);
+  console.log(`[ConfirmationStore]   Old subject: ${action.params.subject}`);
+  console.log(`[ConfirmationStore]   New subject: ${newParams.subject}`);
+  
+  action.params = newParams;
+  action.previewContent = newPreviewContent;
+  
+  console.log(`[ConfirmationStore] ✅ Pending action updated successfully`);
+  return true;
+}
+
+/**
  * Get the most recent pending action for a user
  * 
  * @param {string} userId - User ID
@@ -530,6 +558,7 @@ module.exports = {
   storePendingAction,
   getPendingAction,
   removePendingAction,
+  updatePendingActionParams,
   getUserPendingActions,
   getUserMostRecentPendingAction,
   updatePendingAction,

@@ -820,6 +820,59 @@ function parseInlineFormatting(text) {
   return { text: result, boldRanges };
 }
 
+/**
+ * Insert a table into a document
+ * @param {string} userId - User ID
+ * @param {string} documentId - Document ID
+ * @param {number} rows - Number of rows
+ * @param {number} columns - Number of columns
+ * @param {number} index - Position to insert table (default: end of document)
+ * @returns {Object} - { success, message }
+ */
+async function insertTable(userId, documentId, rows = 3, columns = 3, index = null) {
+  try {
+    const docs = await getDocsClient(userId);
+
+    // If no index provided, get the end of the document
+    if (index === null) {
+      const doc = await docs.documents.get({ documentId });
+      const content = doc.data.body.content;
+      index = content[content.length - 1].endIndex - 1;
+    }
+
+    // Insert the table using Google Docs API
+    await docs.documents.batchUpdate({
+      documentId,
+      requestBody: {
+        requests: [
+          {
+            insertTable: {
+              rows: rows,
+              columns: columns,
+              location: {
+                index: index
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    return {
+      success: true,
+      message: `Inserted ${rows}x${columns} table successfully`,
+      rows: rows,
+      columns: columns
+    };
+  } catch (error) {
+    console.error('Error inserting table:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
 module.exports = {
   createDocument,
   insertText,
@@ -833,5 +886,6 @@ module.exports = {
   getDocumentMetadata,
   shareDocument,
   deleteDocument,
-  replaceText
+  replaceText,
+  insertTable
 };

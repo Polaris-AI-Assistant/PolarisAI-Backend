@@ -521,6 +521,75 @@ async function deleteCalendar(userIdentifier, calendarId) {
 }
 
 /**
+ * Add attendees to an existing calendar event
+ */
+async function addAttendees(userIdentifier, eventId, attendeeEmails, options = {}) {
+  try {
+    const { calendar } = await getCalendarClient(userIdentifier);
+
+    if (!eventId) {
+      throw new Error("Event ID is required");
+    }
+
+    if (!attendeeEmails || !Array.isArray(attendeeEmails) || attendeeEmails.length === 0) {
+      throw new Error("At least one attendee email is required");
+    }
+
+    const { calendarId = 'primary', sendUpdates = 'all' } = options;
+
+    // Get the existing event
+    const existingEvent = await calendar.events.get({
+      calendarId: calendarId,
+      eventId: eventId
+    });
+
+    // Get current attendees or initialize empty array
+    const currentAttendees = existingEvent.data.attendees || [];
+    
+    // Add new attendees (avoid duplicates)
+    const currentEmails = new Set(currentAttendees.map(a => a.email.toLowerCase()));
+    const newAttendees = attendeeEmails
+      .filter(email => !currentEmails.has(email.toLowerCase()))
+      .map(email => ({ email }));
+
+    if (newAttendees.length === 0) {
+      return {
+        success: true,
+        event: existingEvent.data,
+        message: 'All attendees were already invited to this event'
+      };
+    }
+
+    // Combine existing and new attendees
+    const updatedAttendees = [...currentAttendees, ...newAttendees];
+
+    // Update the event with new attendees
+    const response = await calendar.events.patch({
+      calendarId: calendarId,
+      eventId: eventId,
+      resource: {
+        attendees: updatedAttendees
+      },
+      sendUpdates: sendUpdates
+    });
+
+    return {
+      success: true,
+      event: response.data,
+      attendeesAdded: newAttendees.length,
+      message: `Added ${newAttendees.length} attendee(s) to the event`
+    };
+
+  } catch (error) {
+    console.error('Error adding attendees:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
  * Update response status for an event
  */
 async function respondToEvent(userIdentifier, eventId, responseStatus, calendarId = 'primary') {
@@ -595,5 +664,6 @@ module.exports = {
   createCalendar,
   updateCalendar,
   deleteCalendar,
+  addAttendees,
   respondToEvent
 };

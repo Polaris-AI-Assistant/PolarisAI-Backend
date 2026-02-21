@@ -30,16 +30,16 @@
  */
 
 const OpenAI = require('openai');
-const CalendarAgent = require('../calendar/calendarAgent');
-const docsAgent = require('../docs/docsAgent'); // Note: This exports functions, not a class
-const FormsAgent = require('../forms/formsAgent');
-const GitHubAgent = require('../github/githubAgent');
-const GmailAgent = require('../gmail/gmailAgent');
-const MeetAgent = require('../meet/meetAgent');
-const SheetsAgent = require('../sheets/sheetsAgent');
-const FlightsAgent = require('../flights/flightsAgent');
-const MapsAgent = require('../maps/mapsAgent');
-const MicrosoftAgent = require('../microsoft/microsoftAgent');
+const CalendarAgentMultiStep = require('../calendar/calendarAgentMultiStep');
+const DocsAgentMultiStep = require('../docs/docsAgentMultiStep');
+const FormsAgentMultiStep = require('../forms/formsAgentMultiStep');
+const GitHubAgentMultiStep = require('../github/githubAgentMultiStep');
+const GmailAgentMultiStep = require('../gmail/gmailAgentMultiStep');
+const MeetAgentMultiStep = require('../meet/meetAgentMultiStep');
+const SheetsAgentMultiStep = require('../sheets/sheetsAgentMultiStep');
+const FlightsAgentMultiStep = require('../flights/flightsAgentMultiStep');
+const MapsAgentMultiStep = require('../maps/mapsAgentMultiStep');
+const MicrosoftAgentMultiStep = require('../microsoft/microsoftAgentMultiStep');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 const { TimelineEmitter, TimelineEventType, AGENT_NAMES } = require('./timelineEvents');
@@ -73,21 +73,18 @@ class MainAgent {
       apiKey: process.env.OPENAI_API_KEY,
     });
 
-    // Initialize all specialized agents
-    // Note: docsAgent exports functions, not a class, so we wrap it
+    // Initialize all specialized agents with multi-step execution
     this.agents = {
-      calendar: new CalendarAgent(),
-      docs: {
-        processQuery: (query, userId, options) => docsAgent.processQuery(query, userId, options)
-      },
-      forms: new FormsAgent(),
-      github: new GitHubAgent(),
-      gmail: new GmailAgent(),
-      meet: new MeetAgent(),
-      sheets: new SheetsAgent(),
-      flights: new FlightsAgent(),
-      maps: new MapsAgent(),
-      microsoft: new MicrosoftAgent()
+      calendar: new CalendarAgentMultiStep(),
+      docs: new DocsAgentMultiStep(),
+      forms: new FormsAgentMultiStep(),
+      github: new GitHubAgentMultiStep(),
+      gmail: new GmailAgentMultiStep(),
+      meet: new MeetAgentMultiStep(),
+      sheets: new SheetsAgentMultiStep(),
+      flights: new FlightsAgentMultiStep(),
+      maps: new MapsAgentMultiStep(),
+      microsoft: new MicrosoftAgentMultiStep()
     };
 
     // System prompt for the main coordinator
@@ -361,12 +358,18 @@ class MainAgent {
         throw new Error(`Agent '${agentName}' not found`);
       }
 
-      // Execute the tool through the agent's processQuery with a directive to execute
-      // We create a special query that forces the agent to execute the specific tool
-      const executionQuery = `Execute the following action: ${toolName} with parameters: ${JSON.stringify(params)}`;
+      // ✅ CRITICAL FIX: Pass the ORIGINAL user query, not a rewritten version
+      // The original query contains ALL requested actions, not just the first one
+      // This is essential for multi-step execution to work properly
+      if (!query) {
+        throw new Error('Original query is required for multi-step execution');
+      }
       
-      const result = await agent.processQuery(executionQuery, userId, { 
+      console.log(`[MainAgent] 📝 Passing original query to ${agentName}: "${query}"`);
+      
+      const result = await agent.processQuery(query, userId, { 
         conversationHistory,
+        conversationId,  // ✅ CRITICAL: Pass conversationId for context
         forceToolExecution: {
           toolName,
           params
@@ -430,7 +433,12 @@ class MainAgent {
           // If the next action is an email, try to enhance it with the form/doc link
           // Try to enhance even if artifact is null - we can extract link from raw result
           if (enhancedNextAction.toolName === 'sendEmail' || enhancedNextAction.toolName === 'microsoft_sendEmail') {
+            console.log(`[MainAgent] 📧 Enhancing email action with previous results...`);
             enhancedNextAction = await this.enhanceEmailWithPreviousResult(enhancedNextAction, completedResult, userId);
+            
+            // ✅ CRITICAL FIX: Update the pending action in the store with enhanced params
+            console.log(`[MainAgent] 💾 Updating pending action with enhanced params`);
+            confirmationStore.updatePendingActionParams(enhancedNextAction.requestId, enhancedNextAction.params, enhancedNextAction.previewContent);
           }
           
           nextConfirmation = {
@@ -493,6 +501,76 @@ class MainAgent {
       
       console.log(`[MainAgent] 📧 Enhancing email with previous result:`, { artifact, hasResult: !!result });
       
+      // ✅ CRITICAL: Check if this email was deferred and needs complete regeneration
+      if (emailAction.params._deferredGeneration) {
+        console.log(`[MainAgent] 🔄 Email was deferred - REGENERATING completely with actual details`);
+        
+        // Extract meeting/form/doc details from result
+        let itemDetails = null;
+        let itemType = null;
+        
+        if (artifact) {
+          const artifactType = artifact.type?.toLowerCase();
+          
+          if (artifactType === 'event' || artifactType === 'calendar_event') {
+            itemType = 'meeting';
+            // Extract from raw_results since artifact.data might be incomplete
+            if (result.raw_results && result.raw_results[0]) {
+              const eventData = result.raw_results[0];
+              itemDetails = {
+                eventId: eventData.eventId,
+                eventLink: eventData.eventLink,
+                meetLink: eventData.meetLink,
+                summary: eventData.summary,
+                startTime: eventData.startTime?.dateTime,
+                endTime: eventData.endTime?.dateTime
+              };
+            }
+          } else if (artifactType === 'form') {
+            itemType = 'form';
+            itemDetails = {
+              formId: artifact.id,
+              formLink: `https://docs.google.com/forms/d/${artifact.id}/viewform`,
+              title: artifact.title
+            };
+          } else if (artifactType === 'doc' || artifactType === 'document') {
+            itemType = 'document';
+            itemDetails = {
+              docId: artifact.id,
+              docLink: `https://docs.google.com/document/d/${artifact.id}/edit`,
+              title: artifact.title
+            };
+          }
+        }
+        
+        if (itemDetails && itemType) {
+          console.log(`[MainAgent] 📧 Regenerating ${itemType} email with details:`, itemDetails);
+          
+          const regeneratedEmail = await this.generateEmailFromScratch(
+            emailAction.params.to,
+            itemType,
+            itemDetails,
+            emailAction.params._originalQuery,
+            userId
+          );
+          
+          console.log(`[MainAgent] ✅ Email regenerated:`, {
+            subject: regeneratedEmail.subject,
+            bodyPreview: regeneratedEmail.body.substring(0, 100)
+          });
+          
+          emailAction.params = regeneratedEmail;
+          emailAction.previewContent = confirmationUtils.generatePreview(
+            emailAction.agentName || 'gmail',
+            emailAction.toolName || 'sendEmail',
+            regeneratedEmail
+          );
+          
+          return emailAction;
+        }
+      }
+      
+      // Original enhancement logic for non-deferred emails
       let linkToInclude = null;
       let itemDescription = '';
       let senderName = null;
@@ -620,6 +698,134 @@ class MainAgent {
   }
 
   /**
+   * Generate email from scratch with actual details from previous action
+   * Used when email generation was deferred until dependency completed
+   */
+  async generateEmailFromScratch(recipientEmail, itemType, itemDetails, originalQuery, userId) {
+    try {
+      // ✅ CRITICAL: Detect language from the original query using LLM
+      const languageDetection = require('../utils/languageDetection');
+      const detectedLanguage = await languageDetection.detectLanguage(originalQuery);
+      const languageInstruction = languageDetection.getLanguageInstruction(detectedLanguage);
+      const languageName = languageDetection.getLanguageName(detectedLanguage);
+      console.log(`[MainAgent] 🌐 generateEmailFromScratch using language: ${languageName} (${detectedLanguage})`);
+      
+      const recipientName = recipientEmail.split('@')[0].replace(/[0-9]/g, '');
+      const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
+      
+      // Get sender name
+      let senderName = 'the sender';
+      try {
+        const supabase = require('../supabase/supabaseConnect');
+        const { data: calendarData } = await supabase
+          .from('calendar_tokens')
+          .select('name')
+          .eq('user_id', userId)
+          .single();
+        if (calendarData?.name) {
+          senderName = calendarData.name;
+        }
+      } catch (err) {
+        // Use default
+      }
+      
+      let prompt;
+      if (itemType === 'meeting') {
+        const startDate = new Date(itemDetails.startTime);
+        const endDate = new Date(itemDetails.endTime);
+        const formattedDate = startDate.toLocaleDateString('en-US', {
+          weekday: 'long',
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        });
+        const formattedTime = `${startDate.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true
+        })} - ${endDate.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true
+        })}`;
+        
+        prompt = `Write a professional meeting invitation email.
+
+Recipient: ${capitalizedRecipient} (${recipientEmail})
+Meeting Title: ${itemDetails.summary}
+Date: ${formattedDate}
+Time: ${formattedTime}
+Google Meet Link: ${itemDetails.meetLink}
+Calendar Link: ${itemDetails.eventLink}
+Sender: ${senderName}
+
+Requirements:
+1. Subject MUST say "Meeting Invitation" NOT "Document"
+2. Body MUST invite to a meeting, NOT share a document
+3. Include both the Google Meet link and calendar link
+4. Professional and friendly tone
+5. Use actual sender name (${senderName}), not placeholders
+
+Return ONLY valid JSON:
+{
+  "subject": "Meeting Invitation: [brief title]",
+  "body": "Professional meeting invitation with both links"
+}`;
+      } else if (itemType === 'form') {
+        prompt = `Write a professional email to share a Google Form.
+
+Recipient: ${capitalizedRecipient} (${recipientEmail})
+Form Title: ${itemDetails.title}
+Form Link: ${itemDetails.formLink}
+Sender: ${senderName}
+
+Return ONLY valid JSON:
+{
+  "subject": "Form Shared: ${itemDetails.title}",
+  "body": "Professional email with form link"
+}`;
+      } else {
+        prompt = `Write a professional email to share a document.
+
+Recipient: ${capitalizedRecipient} (${recipientEmail})
+Document Title: ${itemDetails.title}
+Document Link: ${itemDetails.docLink}
+Sender: ${senderName}
+
+Return ONLY valid JSON:
+{
+  "subject": "Document Shared: ${itemDetails.title}",
+  "body": "Professional email with document link"
+}`;
+      }
+      
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'You are a professional email writer. Return only valid JSON. Use actual names, not placeholders.\n\n' + languageInstruction },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.3,
+        response_format: { type: "json_object" }
+      });
+      
+      const emailContent = JSON.parse(response.choices[0].message.content);
+      
+      return {
+        to: recipientEmail,
+        subject: emailContent.subject,
+        body: emailContent.body,
+        isAIGenerated: true,
+        userName: senderName
+      };
+    } catch (error) {
+      console.error('[MainAgent] Error generating email from scratch:', error);
+      // Fallback
+      return this.getMeetingInvitationFallback(recipientEmail, itemDetails.meetLink || itemDetails.formLink || itemDetails.docLink, itemDetails.summary || itemDetails.title, 'the sender');
+    }
+  }
+
+  /**
    * Regenerate email body to include the actual link from the previous action
    */
   async regenerateEmailWithLink(emailParams, link, itemDescription, userId, senderName = null) {
@@ -629,7 +835,57 @@ class MainAgent {
       const recipientName = recipientEmail.split('@')[0].split('.')[0];
       const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
       
-      const prompt = `Write a PROFESSIONAL business email to share ${itemDescription}.
+      // ✅ CRITICAL: Detect if this is a meeting invitation
+      const isMeetingInvitation = itemDescription.includes('Google Meet') || 
+                                  itemDescription.includes('calendar event') ||
+                                  link.includes('meet.google.com') ||
+                                  link.includes('calendar/event');
+      
+      console.log(`[MainAgent] 📧 Email type: ${isMeetingInvitation ? 'MEETING INVITATION' : 'DOCUMENT SHARING'}`);
+      
+      let prompt;
+      if (isMeetingInvitation) {
+        // ✅ Meeting invitation prompt
+        prompt = `Write a PROFESSIONAL meeting invitation email.
+
+Recipient Email: ${emailParams.to}
+Recipient Name: ${capitalizedRecipient}
+Meeting: ${itemDescription}
+Meeting Link: ${link}
+Sender's Name: ${senderName || 'the sender'}
+
+CRITICAL REQUIREMENTS:
+1. Subject MUST say "Meeting Invitation" NOT "Document Shared":
+   - GOOD: "Meeting Invitation: Tomorrow at 5 PM"
+   - GOOD: "Invitation to Meeting"
+   - BAD: "Document Shared" or "Sharing Document"
+
+2. Email body MUST be about a MEETING, NOT a document:
+   - Say "I'd like to invite you to a meeting"
+   - Include the meeting link
+   - Mention it's a meeting/video call
+   - DO NOT say "sharing a document" or "document attached"
+
+3. Email structure:
+   - Personalized greeting: "Hi ${capitalizedRecipient},"
+   - Opening: "I hope this message finds you well."
+   - Meeting invitation (2-3 sentences)
+   - The meeting link clearly displayed
+   - Call to action to join
+   - Professional closing
+   - Sign-off with ACTUAL sender name
+
+4. NEVER use placeholders like "[Your Name]" - use the actual sender name
+
+Return ONLY a JSON object:
+{
+  "to": "${emailParams.to}",
+  "subject": "Meeting Invitation: [brief title]",
+  "body": "Complete professional meeting invitation email"
+}`;
+      } else {
+        // Document sharing prompt
+        prompt = `Write a PROFESSIONAL business email to share ${itemDescription}.
 
 Recipient Email: ${emailParams.to}
 Recipient Name: ${capitalizedRecipient}
@@ -661,11 +917,17 @@ Return ONLY a JSON object:
   "subject": "Professional descriptive subject",
   "body": "Complete professional email body with proper formatting"
 }`;
+      }
 
       const response = await this.openai.chat.completions.create({
         model: 'gpt-4o-mini',
         messages: [
-          { role: 'system', content: 'You are a professional business email writer. Write polished, well-structured emails. Return only valid JSON. NEVER use placeholders like [Your Name] - use the actual sender name provided.' },
+          { 
+            role: 'system', 
+            content: isMeetingInvitation 
+              ? 'You are a professional meeting invitation email writer. Write polished meeting invitations. Return only valid JSON. NEVER mention "document" in meeting invitations. NEVER use placeholders like [Your Name].'
+              : 'You are a professional business email writer. Write polished, well-structured emails. Return only valid JSON. NEVER use placeholders like [Your Name] - use the actual sender name provided.'
+          },
           { role: 'user', content: prompt }
         ],
         temperature: 0.3,
@@ -673,23 +935,61 @@ Return ONLY a JSON object:
       });
 
       const updatedEmail = JSON.parse(response.choices[0].message.content);
+      
+      // ✅ Validate meeting invitation doesn't mention "document"
+      if (isMeetingInvitation) {
+        if (updatedEmail.subject && updatedEmail.subject.toLowerCase().includes('document')) {
+          console.log(`[MainAgent] ⚠️ LLM generated subject with "document", fixing...`);
+          updatedEmail.subject = `Meeting Invitation: ${itemDescription.replace('the Google Meet "', '').replace('"', '')}`;
+        }
+        if (updatedEmail.body && updatedEmail.body.toLowerCase().includes('sharing the document')) {
+          console.log(`[MainAgent] ⚠️ LLM generated body with "document", regenerating...`);
+          // Use fallback template
+          return this.getMeetingInvitationFallback(recipientEmail, link, itemDescription, senderName);
+        }
+      }
+      
       return {
         ...emailParams,
         ...updatedEmail
       };
     } catch (error) {
       console.error('[MainAgent] Error regenerating email with link:', error);
-      // If AI fails, create a professional fallback
+      
+      // Fallback based on type
       const recipientEmail = emailParams.to;
       const recipientName = recipientEmail.split('@')[0].split('.')[0];
       const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
       
-      return {
-        ...emailParams,
-        subject: `Sharing: ${itemDescription}`,
-        body: `Hi ${capitalizedRecipient},\n\nI hope this message finds you well.\n\nI'm sharing ${itemDescription} with you for your review.\n\n📎 Link: ${link}\n\nPlease feel free to reach out if you have any questions.\n\nBest regards,\n${senderName || 'Regards'}`
-      };
+      const isMeetingInvitation = itemDescription.includes('Google Meet') || 
+                                  itemDescription.includes('calendar event') ||
+                                  link.includes('meet.google.com') ||
+                                  link.includes('calendar/event');
+      
+      if (isMeetingInvitation) {
+        return this.getMeetingInvitationFallback(recipientEmail, link, itemDescription, senderName);
+      } else {
+        return {
+          ...emailParams,
+          subject: `Sharing: ${itemDescription}`,
+          body: `Hi ${capitalizedRecipient},\n\nI hope this message finds you well.\n\nI'm sharing ${itemDescription} with you for your review.\n\n📎 Link: ${link}\n\nPlease feel free to reach out if you have any questions.\n\nBest regards,\n${senderName || 'Regards'}`
+        };
+      }
     }
+  }
+
+  /**
+   * Fallback template for meeting invitations
+   */
+  getMeetingInvitationFallback(recipientEmail, meetingLink, itemDescription, senderName) {
+    const recipientName = recipientEmail.split('@')[0].split('.')[0];
+    const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
+    
+    return {
+      to: recipientEmail,
+      subject: `Meeting Invitation`,
+      body: `Hi ${capitalizedRecipient},\n\nI hope this message finds you well!\n\nI'd like to invite you to a meeting. Please join using the link below:\n\n🔗 Join Meeting: ${meetingLink}\n\nLooking forward to connecting with you!\n\nBest regards,\n${senderName || 'Regards'}`
+    };
   }
 
   /**
@@ -1207,8 +1507,16 @@ Language Detection Rules:
    * Uses OpenAI to intelligently route the request
    * Now includes artifact context and long-term memory for better query understanding
    */
-  async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '', fileContext = null) {
+  async analyzeQuery(query, conversationHistory = [], artifactContext = null, memoryContext = '', fileContext = null, detectedLanguage = 'en') {
     try {
+      const lowerQuery = query.toLowerCase();
+      
+      // Get language instruction for LLM
+      const languageDetection = require('../utils/languageDetection');
+      const languageInstruction = languageDetection.getLanguageInstruction(detectedLanguage);
+      const languageName = languageDetection.getLanguageName(detectedLanguage);
+      console.log(`[MainAgent] 🌐 analyzeQuery using language: ${languageName} (${detectedLanguage})`);
+      
       // Use LLM-based intent classifier instead of regex
       const intentClassifier = new IntentClassifier();
       const intentClassification = await intentClassifier.classify(query, conversationHistory);
@@ -1275,8 +1583,6 @@ Language Detection Rules:
         // Default to actionable if classification is unclear
       }
 
-      // Define lowerQuery for use in the rest of the method
-      const lowerQuery = query.toLowerCase().trim();
       let artifactSection = '';
       if (artifactContext && artifactContext.allArtifacts && artifactContext.allArtifacts.length > 0) {
         artifactSection = `\n\nCONVERSATION ARTIFACTS (Previously created items in this conversation):
@@ -1516,6 +1822,9 @@ Only route to agents if the user wants to DO SOMETHING EXTERNAL with the file (e
 
       const messages = [
         { role: 'system', content: `You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.
+
+${languageInstruction}
+
 ${fileContext && fileContext.filesProcessed > 0 ? `\nIMPORTANT: The user has attached ${fileContext.filesProcessed} file(s) to this message. If the user is asking to read, summarize, analyze, explain, review, or understand the attached file content, return {"agents": [], "reasoning": "..."} since file content is already in context. Do NOT route file-reading queries to gmail, docs, or any agent.\n` : ''}
 CRITICAL RULE FOR ACTION VERBS - These ALWAYS require agents:
 - "create", "make", "build" → Route to appropriate creation agent (forms, docs, sheets, etc.)
@@ -1547,7 +1856,6 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
       // ===== Heuristic routing overrides (post-LLM) =====
       // README.md (or other repo file) requests should use GitHub agent, not Docs.
-      const lq = lowerQuery;
       const mentionsRepoContext = /\b(repo|repository|github)\b/i.test(query);
       const mentionsReadme = /\breadme(\.md)?\b/i.test(query);
       const mentionsFileExt = /\b[\w\-\/]+\.(js|ts|tsx|jsx|py|java|cpp|c|rb|go|rs|php|html|css|json|md|txt|xml|yml|yaml)\b/i.test(query);
@@ -1609,6 +1917,7 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
             // Build options for the agent (sequential execution)
             const agentOptions = {
+              conversationId: conversationId,  // ✅ CRITICAL: Pass conversationId to agents
               conversationHistory: conversationHistory,
               ...(agentName === 'maps' && userLocation ? { userLocation } : {})
             };
@@ -1681,6 +1990,7 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
             // Build options for the agent (parallel execution)
             const agentOptions = {
+              conversationId: conversationId,  // ✅ CRITICAL: Pass conversationId to agents
               conversationHistory: conversationHistory,
               ...(agentName === 'maps' && userLocation ? { userLocation } : {})
             };
@@ -1758,8 +2068,14 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
   /**
    * Combine and structure responses from multiple agents
    */
-  async combineResponses(query, analysis, results, errors) {
+  async combineResponses(query, analysis, results, errors, detectedLanguage = 'en') {
     try {
+      // Get language instruction for LLM
+      const languageDetection = require('../utils/languageDetection');
+      const languageInstruction = languageDetection.getLanguageInstruction(detectedLanguage);
+      const languageName = languageDetection.getLanguageName(detectedLanguage);
+      console.log(`[MainAgent] 🌐 combineResponses using language: ${languageName} (${detectedLanguage})`);
+      
       // If only one agent and no errors, return its response directly
       if (Object.keys(results).length === 1 && Object.keys(errors).length === 0) {
         const agentName = Object.keys(results)[0];
@@ -1801,7 +2117,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
 - Markdown formatting should still be used`;
 
       const messages = [
-        { role: 'system', content: this.systemPrompt },
+        { role: 'system', content: this.systemPrompt + '\n\n' + languageInstruction },
         { role: 'user', content: combinePrompt }
       ];
 
@@ -1848,6 +2164,12 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
   async processQueryWithStreaming(query, userId, options = {}, onChunk) {
     const startTime = Date.now();
     const conversationId = options.conversationId;
+    
+    // ✅ CRITICAL: Detect language at the VERY START using LLM before any processing
+    const languageDetection = require('../utils/languageDetection');
+    const detectedLanguage = await languageDetection.detectLanguage(query);
+    const languageName = languageDetection.getLanguageName(detectedLanguage);
+    console.log(`[MainAgent] 🌐 Detected language at START: ${languageName} (${detectedLanguage})`);
     
     // Initialize timeline emitter for step-by-step progress updates
     const timeline = new TimelineEmitter(onChunk, userId, conversationId);
@@ -1962,8 +2284,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       onChunk({ type: 'status', message: 'Analyzing with AI...' });
       timeline.emitAnalyzingQuery();
       
-      // Pass artifact context, memory context, and file context to analysis for better routing
-      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext, memoryContext, options.fileContext);
+      // Pass artifact context, memory context, file context, and detected language to analysis for better routing
+      const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext, memoryContext, options.fileContext, detectedLanguage);
       
       console.log(`\n[MainAgent] 🤖 Query Analysis Result:`);
       console.log(`[MainAgent]   Agents: ${analysis.agents.join(', ')}`);
@@ -2062,7 +2384,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       timeline.emitGeneratingResponse();
 
       // Step 3: Stream the final response generation
-      // Pass memory context, conversation history, file context, and response language for inclusion in the response generation
+      // Pass memory context, conversation history, file context, detected language, and response language for inclusion in the response generation
       await this.streamCombinedResponse(
         enhancedQuery, 
         analysis, 
@@ -2073,7 +2395,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         memoryContext,
         options.conversationHistory || [],
         options.fileContext,  // Pass file context for LLM
-        options.responseLanguage  // Pass response language preference
+        detectedLanguage  // Pass detected language instead of responseLanguage
       );
 
       const processingTime = Date.now() - startTime;
@@ -2725,7 +3047,30 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
           keywords: ['email', 'mail', 'message'],
           toolName: 'sendEmail',
-          extractParams: (q, userId) => this.extractEmailParamsWithAI(q, userId),
+          extractParams: async (q, userId) => {
+            // ✅ Check if this email depends on another action (like calendar event)
+            const hasDependency = q.includes('meeting') || q.includes('event') || q.includes('calendar') || 
+                                 q.includes('form') || q.includes('document') || q.includes('sheet') ||
+                                 q.includes('link') || q.includes('with its') || q.includes('with the');
+            
+            if (hasDependency) {
+              // ✅ DON'T generate email yet - we don't have the dependency results!
+              console.log(`[Confirmation] 📧 Email has dependency - deferring generation`);
+              const emailMatch = q.match(/(?:to|send.*to|email.*to|mail.*to)\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i);
+              const recipientEmail = emailMatch ? emailMatch[1] : 'pending';
+              
+              return {
+                to: recipientEmail,
+                subject: '⏳ Will be generated after previous action completes',
+                body: 'Email content will be generated with actual details from the previous action.',
+                _deferredGeneration: true,  // ✅ Mark for later generation
+                _originalQuery: q
+              };
+            } else {
+              // No dependency - generate email now
+              return await this.extractEmailParamsWithAI(q, userId);
+            }
+          },
           isAsync: true,  // Changed to async for AI generation
           excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox']
         },
@@ -3517,6 +3862,17 @@ Respond with ONLY valid JSON, no markdown formatting.`
     try {
       console.log(`[MainAgent] Generating AI email content for preview...`);
       
+      // Detect if this is a meeting invitation email
+      const lowerQuery = query.toLowerCase();
+      const isMeetingEmail = lowerQuery.includes('meeting') || 
+                            lowerQuery.includes('meet') || 
+                            lowerQuery.includes('calendar') || 
+                            lowerQuery.includes('event') ||
+                            lowerQuery.includes('schedule') ||
+                            lowerQuery.includes('appointment');
+      
+      console.log(`[MainAgent] Email type detected: ${isMeetingEmail ? 'MEETING INVITATION' : 'GENERAL EMAIL'}`);
+      
       // Try to get user's display name from various sources
       let userName = '';
       try {
@@ -3559,29 +3915,58 @@ Respond with ONLY valid JSON, no markdown formatting.`
         console.log(`[MainAgent] Could not get user name: ${dbError.message}`);
       }
       
-      // Generate the AI email body
-      const generationResponse = await this.openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are an email writing assistant. Generate a complete, well-formatted email with:
+      // Generate the AI email body with context-aware instructions
+      const systemPrompt = isMeetingEmail 
+        ? `You are an email writing assistant specializing in MEETING INVITATIONS. Generate a complete, well-formatted meeting invitation email with:
+1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
+2. The main message body explaining the meeting purpose and inviting them to attend
+3. A note that the meeting link/details will be included (use placeholder like "[Meeting Link]" or "The meeting link is included below")
+4. A proper sign-off with the sender's name
+
+CRITICAL: This is a MEETING INVITATION email. Focus on:
+- Inviting the recipient to a meeting/event
+- Mentioning that meeting details/link will be provided
+- DO NOT talk about documents, files, or forms being shared
+- Keep it professional and clear about the meeting purpose
+
+Only output the email body text. Do not include "Subject:" line.
+Make the email feel natural and personal, not robotic.
+${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
+        : `You are an email writing assistant. Generate a complete, well-formatted email with:
 1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
 2. The main message body (friendly, professional tone as appropriate)
 3. A proper sign-off with the sender's name
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
-${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
-          },
-          {
-            role: "user",
-            content: `Write an email for:
+${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`;
+      
+      const userPrompt = isMeetingEmail
+        ? `Write a MEETING INVITATION email for:
 To: ${basicParams.to}
 Subject: ${basicParams.subject}
 Context/Intent from user: "${query}"
 
+This is a meeting invitation. Focus on inviting them to the meeting and mention that the meeting link will be included.
 Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') || query.toLowerCase().includes('party') || query.toLowerCase().includes('birthday') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`
+        : `Write an email for:
+To: ${basicParams.to}
+Subject: ${basicParams.subject}
+Context/Intent from user: "${query}"
+
+Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') || query.toLowerCase().includes('party') || query.toLowerCase().includes('birthday') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`;
+      
+      // Generate the AI email body
+      const generationResponse = await this.openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userPrompt
           }
         ],
         max_tokens: 600,
@@ -3640,6 +4025,17 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
     try {
       console.log(`[MainAgent] Generating AI email content for Microsoft Outlook...`);
       
+      // Detect if this is a meeting invitation email
+      const lowerQuery = query.toLowerCase();
+      const isMeetingEmail = lowerQuery.includes('meeting') || 
+                            lowerQuery.includes('meet') || 
+                            lowerQuery.includes('calendar') || 
+                            lowerQuery.includes('event') ||
+                            lowerQuery.includes('schedule') ||
+                            lowerQuery.includes('appointment');
+      
+      console.log(`[MainAgent] Microsoft email type detected: ${isMeetingEmail ? 'MEETING INVITATION' : 'GENERAL EMAIL'}`);
+      
       // Try to get user's display name from Microsoft tokens
       let userName = '';
       try {
@@ -3678,29 +4074,58 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
         console.log(`[MainAgent] Could not get Microsoft user name: ${dbError.message}`);
       }
       
-      // Generate the AI email body
-      const generationResponse = await this.openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are an email writing assistant. Generate a complete, well-formatted email with:
+      // Generate the AI email body with context-aware instructions
+      const systemPrompt = isMeetingEmail 
+        ? `You are an email writing assistant specializing in MEETING INVITATIONS. Generate a complete, well-formatted meeting invitation email with:
+1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
+2. The main message body explaining the meeting purpose and inviting them to attend
+3. A note that the meeting link/details will be included (use placeholder like "[Meeting Link]" or "The meeting link is included below")
+4. A proper sign-off with the sender's name
+
+CRITICAL: This is a MEETING INVITATION email. Focus on:
+- Inviting the recipient to a meeting/event
+- Mentioning that meeting details/link will be provided
+- DO NOT talk about documents, files, or forms being shared
+- Keep it professional and clear about the meeting purpose
+
+Only output the email body text. Do not include "Subject:" line.
+Make the email feel natural and personal, not robotic.
+${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
+        : `You are an email writing assistant. Generate a complete, well-formatted email with:
 1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
 2. The main message body (friendly, professional tone as appropriate)
 3. A proper sign-off with the sender's name
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
-${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
-          },
-          {
-            role: "user",
-            content: `Write an email for:
+${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`;
+      
+      const userPrompt = isMeetingEmail
+        ? `Write a MEETING INVITATION email for:
 To: ${basicParams.to}
 Subject: ${basicParams.subject}
 Context/Intent from user: "${query}"
 
+This is a meeting invitation. Focus on inviting them to the meeting and mention that the meeting link will be included.
 Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') || query.toLowerCase().includes('party') || query.toLowerCase().includes('birthday') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`
+        : `Write an email for:
+To: ${basicParams.to}
+Subject: ${basicParams.subject}
+Context/Intent from user: "${query}"
+
+Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes('exciting') || query.toLowerCase().includes('friendly') || query.toLowerCase().includes('party') || query.toLowerCase().includes('birthday') ? 'warm, lovely, and exciting' : 'professional and friendly'}.`;
+      
+      // Generate the AI email body
+      const generationResponse = await this.openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: userPrompt
           }
         ],
         max_tokens: 600,
@@ -3813,6 +4238,13 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
 
       const { result, query, toolName, agentName, nextConfirmation } = executionResult;
 
+      // ✅ CRITICAL: Detect language from the original query using LLM
+      const languageDetection = require('../utils/languageDetection');
+      const detectedLanguage = await languageDetection.detectLanguage(query);
+      const languageInstruction = languageDetection.getLanguageInstruction(detectedLanguage);
+      const languageName = languageDetection.getLanguageName(detectedLanguage);
+      console.log(`[MainAgent] 🌐 streamConfirmedActionResponse using language: ${languageName} (${detectedLanguage})`);
+
       // Build context about chain status
       let chainContext = '';
       if (nextConfirmation) {
@@ -3906,7 +4338,7 @@ If a form was created, include the form title and a link to view/edit it.
 If an email was sent, confirm it was sent successfully with the content that was specified.`;
 
       const messages = [
-        { role: 'system', content: this.systemPrompt },
+        { role: 'system', content: this.systemPrompt + '\n\n' + languageInstruction },
         { role: 'user', content: responsePrompt }
       ];
 
@@ -3952,8 +4384,14 @@ If an email was sent, confirm it was sent successfully with the content that was
    * Stream the combined response using OpenAI's streaming API
    * Now includes artifact context, long-term memory, file context, full conversation history, and multi-language support
    */
-  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = [], fileContext = null, responseLanguage = null) {
+  async streamCombinedResponse(query, analysis, results, errors, onChunk, conversationId = null, memoryContext = '', conversationHistory = [], fileContext = null, detectedLanguage = 'en') {
     try {
+      // Get language instruction for LLM
+      const languageDetection = require('../utils/languageDetection');
+      const languageInstruction = languageDetection.getLanguageInstruction(detectedLanguage);
+      const languageName = languageDetection.getLanguageName(detectedLanguage);
+      console.log(`[MainAgent] 🌐 streamCombinedResponse using language: ${languageName} (${detectedLanguage})`);
+      
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
         return `${agent.toUpperCase()} Agent Result:\n${JSON.stringify(result, null, 2)}`;
@@ -4033,8 +4471,6 @@ Respond ENTIRELY in the language of the current query - if they asked in English
 - Technical terms, product names (Google Docs), URLs, and identifiers can remain in English
 - Markdown formatting should still be used
 - IGNORE any stored language preferences - ONLY respond in the language of this current query
-
-${responseLanguage ? `\n**LANGUAGE OVERRIDE (STRICT)**: The UI indicates the user's current message language is **${responseLanguage}**.\nYou MUST respond entirely in **${responseLanguage}**. Do not use any other language.\n` : ''}
 `;
 
       // Get dynamic system prompt with artifact context
@@ -4044,7 +4480,7 @@ ${responseLanguage ? `\n**LANGUAGE OVERRIDE (STRICT)**: The UI indicates the use
 
       // Build messages array with conversation history for context
       const messages = [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: systemPrompt + '\n\n' + languageInstruction },
       ];
 
       // Add file context if provided
@@ -4145,8 +4581,14 @@ ${responseLanguage ? `\n**LANGUAGE OVERRIDE (STRICT)**: The UI indicates the use
     try {
       console.log(`[MainAgent] Processing query for user ${userId}: "${query}"`);
 
+      // ✅ CRITICAL: Detect language at the VERY START using LLM
+      const languageDetection = require('../utils/languageDetection');
+      const detectedLanguage = await languageDetection.detectLanguage(query);
+      const languageName = languageDetection.getLanguageName(detectedLanguage);
+      console.log(`[MainAgent] 🌐 Detected language: ${languageName} (${detectedLanguage})`);
+
       // Step 1: Analyze the query to determine which agents are needed
-      const analysis = await this.analyzeQuery(query, options.conversationHistory);
+      const analysis = await this.analyzeQuery(query, options.conversationHistory, null, '', null, detectedLanguage);
 
       // Step 2: Execute queries on the appropriate agents
       // Pass conversationHistory so agents receive context (e.g. scheduled action instructions)
@@ -4155,7 +4597,7 @@ ${responseLanguage ? `\n**LANGUAGE OVERRIDE (STRICT)**: The UI indicates the use
       );
 
       // Step 3: Combine responses into a coherent final response
-      const finalResponse = await this.combineResponses(query, analysis, results, errors);
+      const finalResponse = await this.combineResponses(query, analysis, results, errors, detectedLanguage);
 
       const processingTime = Date.now() - startTime;
 
