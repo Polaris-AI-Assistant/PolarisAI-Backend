@@ -392,6 +392,13 @@ async function processQuery(query, userId, options = {}) {
         role: 'system',
         content: `You are an AI assistant specialized in managing Google Docs. You help users create, edit, read, search, and organize documents using natural language.
 
+**CRITICAL LANGUAGE REQUIREMENT:**
+- ALWAYS respond in the SAME LANGUAGE as the user's query
+- If user writes in English, respond in English
+- If user writes in Hindi, respond in Hindi
+- If user writes in Spanish, respond in Spanish
+- Match the user's language EXACTLY - do not translate or switch languages
+
 **Your Capabilities:**
 1. **Create Documents** - Make new docs with specific titles
 2. **Write & Edit** - Insert, append, or replace text in documents
