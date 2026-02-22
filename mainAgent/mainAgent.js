@@ -39,6 +39,7 @@ const MeetAgentMultiStep = require('../meet/meetAgentMultiStep');
 const SheetsAgentMultiStep = require('../sheets/sheetsAgentMultiStep');
 const FlightsAgentMultiStep = require('../flights/flightsAgentMultiStep');
 const MapsAgentMultiStep = require('../maps/mapsAgentMultiStep');
+const WebSearchAgentMultiStep = require('../websearch/webSearchAgentMultiStep');
 const MicrosoftAgentMultiStep = require('../microsoft/microsoftAgentMultiStep');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
@@ -84,6 +85,7 @@ class MainAgent {
       sheets: new SheetsAgentMultiStep(),
       flights: new FlightsAgentMultiStep(),
       maps: new MapsAgentMultiStep(),
+      websearch: new WebSearchAgentMultiStep(),
       microsoft: new MicrosoftAgentMultiStep()
     };
 
@@ -1006,9 +1008,40 @@ Return ONLY a JSON object:
 
       // Collect links and data from all previous results
       const collectedData = [];
+      let websearchResults = null;
 
       for (const [prevAgent, prevResult] of Object.entries(previousResults)) {
         if (!prevResult || !prevResult.success) continue;
+
+        // ✅ NEW: Handle websearch results
+        if (prevAgent === 'websearch') {
+          console.log(`[MainAgent] 📰 Found websearch results to include in email`);
+          
+          // Extract the summary from websearch agent
+          if (prevResult.summary) {
+            websearchResults = {
+              type: 'websearch',
+              summary: prevResult.summary,
+              executedActions: prevResult.executedActions || []
+            };
+          }
+          
+          // Also try to extract news articles from raw results
+          if (prevResult.results) {
+            const toolResults = Object.values(prevResult.results);
+            for (const toolResult of toolResults) {
+              if (toolResult.topNews && Array.isArray(toolResult.topNews)) {
+                websearchResults = websearchResults || { type: 'websearch' };
+                websearchResults.articles = toolResult.topNews.slice(0, 3); // Top 3 articles
+              } else if (toolResult.topResults && Array.isArray(toolResult.topResults)) {
+                websearchResults = websearchResults || { type: 'websearch' };
+                websearchResults.articles = toolResult.topResults.slice(0, 3); // Top 3 results
+              }
+            }
+          }
+          
+          continue; // Don't try to extract links from websearch
+        }
 
         // Extract links from raw_results
         if (prevResult.raw_results && Array.isArray(prevResult.raw_results)) {
@@ -1060,7 +1093,8 @@ Return ONLY a JSON object:
         }
       }
 
-      if (collectedData.length === 0) {
+      // If no links and no websearch results, return original query
+      if (collectedData.length === 0 && !websearchResults) {
         return agentQuery;
       }
 
@@ -1088,18 +1122,44 @@ Return ONLY a JSON object:
       }
 
       // Build enrichment context
-      const linksText = collectedData.map(d => `- ${d.type}: ${d.link}${d.title ? ` (${d.title})` : ''}`).join('\n');
+      let enrichmentText = '';
+      
+      // Add links if any
+      if (collectedData.length > 0) {
+        const linksText = collectedData.map(d => `- ${d.type}: ${d.link}${d.title ? ` (${d.title})` : ''}`).join('\n');
+        enrichmentText += `The following items were just created and their links MUST be included in the email:\n${linksText}\n\n`;
+      }
+      
+      // Add websearch results if any
+      if (websearchResults) {
+        enrichmentText += `WEB SEARCH RESULTS TO INCLUDE IN EMAIL:\n`;
+        
+        if (websearchResults.summary) {
+          enrichmentText += `Summary: ${websearchResults.summary}\n\n`;
+        }
+        
+        if (websearchResults.articles && websearchResults.articles.length > 0) {
+          enrichmentText += `Top Articles:\n`;
+          websearchResults.articles.forEach((article, index) => {
+            enrichmentText += `${index + 1}. ${article.title}\n`;
+            if (article.snippet) enrichmentText += `   ${article.snippet}\n`;
+            if (article.link) enrichmentText += `   Link: ${article.link}\n`;
+            if (article.source) enrichmentText += `   Source: ${article.source}\n`;
+            if (article.date) enrichmentText += `   Date: ${article.date}\n`;
+            enrichmentText += `\n`;
+          });
+        }
+      }
 
       const enrichedQuery = `${agentQuery}
 
 IMPORTANT CONTEXT FROM PREVIOUS ACTION:
-The following items were just created and their links MUST be included in the email:
-${linksText}
-
-Include the actual link(s) above in the email body — do NOT use placeholders like "[Google Meet Link]".
+${enrichmentText}
+Include the information above in the email body with proper formatting.
+${collectedData.length > 0 ? 'Include the actual link(s) — do NOT use placeholders like "[Link]".' : ''}
 ${senderName ? `The sender's name is "${senderName}" — use it in the sign-off instead of "[Your Name]".` : ''}`;
 
-      console.log(`[MainAgent] ✅ Enriched ${agentName} query with ${collectedData.length} link(s) from previous results`);
+      console.log(`[MainAgent] ✅ Enriched ${agentName} query with ${collectedData.length} link(s) and ${websearchResults ? 'websearch results' : 'no websearch results'}`);
       return enrichedQuery;
 
     } catch (error) {
@@ -1391,6 +1451,14 @@ Available specialized agents and their capabilities:
 - Geocode addresses to coordinates and vice versa
 - Support for multiple travel modes (driving, walking, bicycling, transit)
 
+**WebSearchAgent**: Web search operations (via Serper API)
+- Search the web for information, websites, and articles
+- Search for recent news articles and current events
+- Search for images and visual content
+- Get answer boxes and knowledge graphs
+- Find related searches and "People Also Ask" questions
+- Support for localized and multi-language searches
+
 **MicrosoftAgent**: Microsoft 365 operations (Outlook, Calendar, OneDrive, Excel)
 - Outlook: Send, read, reply to, and forward emails via Microsoft/Outlook
 - Microsoft Calendar: Create, list, update, and delete calendar events with Teams meeting support
@@ -1523,6 +1591,26 @@ Language Detection Rules:
       
       console.log(`[MainAgent] 🎯 Intent Classification:`, JSON.stringify(intentClassification, null, 2));
 
+      // Handle web search queries - BUT check if it's part of a multi-step request
+      if (intentClassification.type === 'web_search' || intentClassification.requiresWebSearch) {
+        // Check if query also contains other actions (e.g., "search for X and email it")
+        const hasAdditionalActions = /\b(and|then)\s+(send|email|share|create|schedule|add|make|put)/i.test(query);
+        
+        if (hasAdditionalActions) {
+          console.log('[MainAgent] 🔗 Web search query with additional actions - using full LLM analysis');
+          // Don't return early - let LLM analyze the full multi-step query below
+        } else {
+          console.log('[MainAgent] 🌐 Detected standalone web search query - routing to websearch agent:', query);
+          return {
+            agents: ['websearch'],
+            reasoning: "User is asking for current/real-time information that requires web search",
+            queries: {
+              websearch: query
+            }
+          };
+        }
+      }
+
       // Handle conversational queries
       if (intentClassification.type === 'conversational') {
         console.log('[MainAgent] 🎯 Detected conversational query - skipping agents:', query);
@@ -1542,7 +1630,7 @@ Language Detection Rules:
         };
       }
 
-      // Handle advisory queries
+      // Handle advisory queries (general knowledge, not time-sensitive)
       if (intentClassification.type === 'advisory') {
         console.log('[MainAgent] 💡 Detected advisory/planning query - skipping agents:', query);
         return {
@@ -1682,7 +1770,23 @@ Available agents:
 - sheets: Google Sheets operations (create/edit spreadsheets, data management)
 - flights: Flight search operations (search flights, compare prices, price insights, airlines, tickets)
 - maps: Google Maps operations (search places, directions, distance, geocoding, nearby search)
+- websearch: Web search operations (search for current information, news, events, real-time data from the internet). Use when user asks about CURRENT/LATEST/RECENT information, events, news, or anything requiring up-to-date data from the web.
 - microsoft: Microsoft 365 operations (Outlook Mail, Microsoft Calendar, OneDrive, Excel, Microsoft Teams chats/channels, Microsoft Word documents). Use this agent when user mentions "Outlook", "Microsoft", "OneDrive", "Excel", "Teams", "Microsoft Teams", "Word", "Microsoft Word", "Microsoft Calendar", or wants to send email "through Outlook" or "via Outlook". ALSO use for "show my outlook emails", "list my outlook mails", "check my outlook inbox", "list my teams", "show my teams chats", "list word documents".
+
+CRITICAL RULES for Web Search:
+1. "Do you know about [current event]" → Use websearch agent
+2. "What's the latest [news/update/information]" → Use websearch agent
+3. "Tell me about recent [developments/events]" → Use websearch agent
+4. "Is there an [event/summit/conference] happening" → Use websearch agent
+5. Any query requiring CURRENT, REAL-TIME, or UP-TO-DATE information → Use websearch agent
+
+CRITICAL RULES for Multi-Intent Queries (web search + another action):
+1. "Search for X and email it" → Use BOTH websearch AND gmail agents, requiresSequential: true
+2. "Find X and add to calendar" → Use BOTH websearch AND calendar agents, requiresSequential: true
+3. "Look up X and create a document" → Use BOTH websearch AND docs agents, requiresSequential: true
+4. Pattern: "[search/find/look up] X [and/then] [send/email/create/add/share]" → ALWAYS multi-agent sequential
+5. The websearch agent will find the information, then the second agent will use that information
+6. NEVER route multi-intent queries to ONLY websearch - you MUST include both agents
 
 CRITICAL RULES for Email Routing:
 1. "send email through outlook" or "send email via outlook" or "outlook email" → Use ONLY microsoft agent
@@ -1752,6 +1856,22 @@ Examples:
 - "how far is it from Mumbai to Pune" -> {"agents": ["maps"], ...}
 - "restaurants near Times Square" -> {"agents": ["maps"], ...}
 - "what are the coordinates of Taj Mahal" -> {"agents": ["maps"], ...}
+
+CRITICAL - Web Search Examples (use websearch agent for current/real-time information):
+- "do you know about the AI summit happening in Delhi" -> {"agents": ["websearch"], "queries": {"websearch": "AI summit happening in Delhi India"}}
+- "what's the latest news about Tesla" -> {"agents": ["websearch"], "queries": {"websearch": "latest news about Tesla"}}
+- "tell me about recent AI developments" -> {"agents": ["websearch"], "queries": {"websearch": "recent AI developments"}}
+- "is there a tech conference happening this week" -> {"agents": ["websearch"], "queries": {"websearch": "tech conference happening this week"}}
+- "what's the weather in Mumbai today" -> {"agents": ["websearch"], "queries": {"websearch": "weather in Mumbai today"}}
+- "find information about upcoming events in Bangalore" -> {"agents": ["websearch"], "queries": {"websearch": "upcoming events in Bangalore"}}
+- "what are the current Bitcoin prices" -> {"agents": ["websearch"], "queries": {"websearch": "current Bitcoin prices"}}
+
+CRITICAL - Multi-Intent Examples (web search + another action):
+- "search for the latest AI news and email the top 3 articles to john@example.com" -> {"agents": ["websearch", "gmail"], "requiresSequential": true, "queries": {"websearch": "latest AI news", "gmail": "email the top 3 AI news articles to john@example.com"}}
+- "find recent tech conferences and add them to my calendar" -> {"agents": ["websearch", "calendar"], "requiresSequential": true, "queries": {"websearch": "recent tech conferences", "calendar": "add tech conferences to calendar"}}
+- "search for Python tutorials and create a document with the best ones" -> {"agents": ["websearch", "docs"], "requiresSequential": true, "queries": {"websearch": "Python tutorials", "docs": "create document with best Python tutorials"}}
+- "look up the latest AI summit and send details via outlook" -> {"agents": ["websearch", "microsoft"], "requiresSequential": true, "queries": {"websearch": "latest AI summit", "microsoft": "send AI summit details via outlook email"}}
+- "find top 5 restaurants near me and share the list" -> {"agents": ["maps", "gmail"], "requiresSequential": true, "queries": {"maps": "find top 5 restaurants near me", "gmail": "share restaurant list"}}
 
 CRITICAL - Microsoft 365 / Outlook Examples (use microsoft agent, NOT gmail):
 - "send email through outlook" -> {"agents": ["microsoft"], "queries": {"microsoft": "send email through outlook"}}

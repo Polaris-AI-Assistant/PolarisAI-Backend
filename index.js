@@ -46,6 +46,9 @@ const flightsAgentRoutes = require('./flights/flightsAgentController');
 // Maps routes
 const mapsAgentRoutes = require('./maps/mapsAgentController');
 
+// Web Search routes
+const webSearchAgentRoutes = require('./websearch/webSearchAgentController');
+
 // Main Coordinator Agent routes
 const mainAgentRoutes = require('./mainAgent/mainAgentController');
 
@@ -149,6 +152,9 @@ app.use('/api/flights', flightsAgentRoutes);
 
 // Use Maps AI Agent routes
 app.use('/api/maps', mapsAgentRoutes);
+
+// Use Web Search AI Agent routes
+app.use('/api/websearch', webSearchAgentRoutes);
 
 // Use GitHub authentication routes
 app.use('/api/auth/github', githubRoutes);
@@ -256,7 +262,11 @@ app.get('/api', (req, res) => {
         'GET /api/maps/agent/examples': 'Get Maps agent example queries',
         'GET /api/maps/agent/capabilities': 'Get Maps agent capabilities',
         'GET /api/maps/agent/place-types': 'Get list of supported place types',
-        'GET /api/maps/agent/status': 'Check Maps agent status'
+        'GET /api/maps/agent/status': 'Check Maps agent status',
+        'POST /api/websearch/agent/query': 'Web Search AI Agent (Serper API - web, news, images)',
+        'GET /api/websearch/agent/examples': 'Get web search agent example queries',
+        'GET /api/websearch/agent/capabilities': 'Get web search agent capabilities',
+        'GET /api/websearch/agent/status': 'Check web search agent status'
       },
       auth: {
         'POST /api/auth/signup': 'Create new user account',

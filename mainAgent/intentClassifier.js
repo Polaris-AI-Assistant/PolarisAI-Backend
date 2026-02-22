@@ -33,11 +33,12 @@ class IntentClassifier {
    * 
    * Returns:
    * {
-   *   type: 'actionable' | 'advisory' | 'conversational' | 'file_generation',
+   *   type: 'actionable' | 'advisory' | 'conversational' | 'file_generation' | 'web_search',
    *   confidence: 0.0-1.0,
    *   reasoning: string,
    *   actionType: string (if actionable), // 'create', 'send', 'schedule', 'search', etc.
-   *   shouldUseAgents: boolean
+   *   shouldUseAgents: boolean,
+   *   requiresWebSearch: boolean // NEW: indicates if web search is needed
    * }
    */
   async classifyIntent(query, conversationHistory = []) {
@@ -66,32 +67,46 @@ Classify the following user query into ONE of these categories:
    - IMPORTANT: "Help me create X" is ACTIONABLE (user wants action, not tutorial)
    - IMPORTANT: "Guide me through sending an email" is ACTIONABLE (user wants to perform the action)
 
-2. **ADVISORY**: User wants ADVICE, GUIDANCE, or INFORMATION
+2. **WEB_SEARCH**: User wants CURRENT/REAL-TIME information from the internet
+   - Examples: "Do you know about the AI summit happening in Delhi?"
+   - Examples: "What's the latest news about Tesla?"
+   - Examples: "Find information about upcoming tech conferences"
+   - Examples: "What's the weather like in Mumbai today?"
+   - Examples: "Tell me about recent AI developments"
+   - Examples: "What are the current flight prices to NYC?"
+   - Key indicators: "latest", "current", "recent", "happening", "today", "now", "upcoming", "news", "do you know about"
+   - IMPORTANT: Questions about CURRENT EVENTS, REAL-TIME DATA, or RECENT INFORMATION need web search
+   - IMPORTANT: "Do you know about X" where X is a current event → WEB_SEARCH
+
+3. **ADVISORY**: User wants ADVICE, GUIDANCE, or GENERAL INFORMATION (not time-sensitive)
    - Examples: "How do I create a google docs?"
    - Examples: "What's the best way to send emails?"
    - Examples: "Should I schedule the meeting now or later?"
    - Examples: "What are best practices for project planning?"
    - Key indicators: Question patterns, "how to", "best way", "should I", "what's the best", "advice", "suggest"
    - IMPORTANT: These are QUESTIONS about HOW TO DO something, not requests to DO it
+   - IMPORTANT: General knowledge questions that don't require current information
 
-3. **CONVERSATIONAL**: User is asking about PAST interactions or information
+4. **CONVERSATIONAL**: User is asking about PAST interactions or information
    - Examples: "What is my name?"
    - Examples: "What did I tell you about the project?"
    - Examples: "What flights did I search for?"
    - Examples: "Remind me what we discussed"
    - Key indicators: Past tense, "what did", "remind me", "tell me about", "what was"
 
-4. **FILE_GENERATION**: User wants to GENERATE a file (PDF/TXT)
+5. **FILE_GENERATION**: User wants to GENERATE a file (PDF/TXT)
    - Examples: "Generate a PDF of the project plan"
    - Examples: "Create a text file with the summary"
    - Examples: "Export this as a PDF"
    - Key indicators: "generate", "export", "create", "save" + "pdf" or "txt" or "text file"
 
 CRITICAL RULES:
+- If query asks about CURRENT/RECENT/LATEST/HAPPENING events or information → WEB_SEARCH
 - If query contains action verbs (create, make, send, schedule, book, search, find, show, list, get) → ACTIONABLE
-- If query is a question asking HOW TO DO something → ADVISORY
+- If query is a question asking HOW TO DO something (general knowledge) → ADVISORY
 - If query asks about past actions or information → CONVERSATIONAL
 - If query mentions file formats (PDF, TXT) → FILE_GENERATION
+- "Do you know about [current event]" → WEB_SEARCH
 - Ambiguous cases: Lean towards ACTIONABLE if user seems to want something done
 
 ${conversationContext ? `\nRECENT CONVERSATION:\n${conversationContext}\n` : ''}
@@ -100,11 +115,12 @@ User Query: "${query}"
 
 Respond with ONLY a JSON object (no markdown, no code blocks):
 {
-  "type": "actionable" | "advisory" | "conversational" | "file_generation",
+  "type": "actionable" | "web_search" | "advisory" | "conversational" | "file_generation",
   "confidence": 0.0-1.0,
   "reasoning": "Brief explanation of why this is classified as [type]",
-  "actionType": "create" | "send" | "schedule" | "search" | "find" | "show" | "list" | "get" | null,
-  "shouldUseAgents": true | false
+  "actionType": "create" | "send" | "schedule" | "search" | "find" | "show" | "list" | "get" | "web_search" | null,
+  "shouldUseAgents": true | false,
+  "requiresWebSearch": true | false
 }`;
 
       const response = await this.client.chat.completions.create({
@@ -132,8 +148,14 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
           confidence: 0.5,
           reasoning: 'Fallback classification due to parse error',
           actionType: null,
-          shouldUseAgents: true
+          shouldUseAgents: true,
+          requiresWebSearch: false
         };
+      }
+
+      // Ensure requiresWebSearch flag is set
+      if (!classification.hasOwnProperty('requiresWebSearch')) {
+        classification.requiresWebSearch = classification.type === 'web_search';
       }
 
       console.log(`[IntentClassifier] ✅ Classification result:`, JSON.stringify(classification, null, 2));
@@ -147,9 +169,46 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
         confidence: 0.3,
         reasoning: 'Error during classification - defaulting to actionable',
         actionType: null,
-        shouldUseAgents: true
+        shouldUseAgents: true,
+        requiresWebSearch: false
       };
     }
+  }
+
+  /**
+   * Quick check for obvious web search queries (no LLM needed)
+   * These are patterns that ALWAYS require web search
+   * 
+   * @param {string} query - User's query
+   * @returns {Object|null} - Classification if obvious, null otherwise
+   */
+  quickCheckWebSearch(query) {
+    const lowerQuery = query.toLowerCase().trim();
+    
+    // Obvious web search patterns
+    const webSearchPatterns = [
+      /\b(latest|current|recent|today|now|this week|this month|upcoming|happening)\b.*\b(news|event|summit|conference|update|development|price|weather|information)/i,
+      /\bdo you know (about|if|when|where)\b/i,
+      /\b(what|tell me|find)\b.*\b(latest|current|recent|today|now|happening)\b/i,
+      /\b(is there|are there)\b.*\b(any|a)\b.*\b(event|summit|conference|meeting|happening)/i,
+      /\b(when is|where is)\b.*\b(happening|scheduled|taking place)/i,
+      /\b(search|find|look up|google)\b.*\b(information|details|about)/i
+    ];
+
+    for (const pattern of webSearchPatterns) {
+      if (pattern.test(query)) {
+        return {
+          type: 'web_search',
+          confidence: 0.95,
+          reasoning: 'Obvious web search query pattern - requires current information',
+          actionType: 'web_search',
+          shouldUseAgents: true,
+          requiresWebSearch: true
+        };
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -221,6 +280,22 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   }
 
   /**
+   * Check if query contains multiple intents (e.g., "search for X and email it")
+   * 
+   * @param {string} query - User's query
+   * @returns {boolean} - True if query likely has multiple intents
+   */
+  hasMultipleIntents(query) {
+    const multiIntentPatterns = [
+      /\b(and|then)\s+(send|email|share|create|schedule|add|make)/i,
+      /\b(search|find|get|look up)\b.*\b(and|then)\b.*\b(send|email|share)/i,
+      /\b(create|make|generate)\b.*\b(and|then)\b.*\b(send|email|share)/i,
+    ];
+
+    return multiIntentPatterns.some(pattern => pattern.test(query));
+  }
+
+  /**
    * Classify intent with quick checks first, then LLM if needed
    * 
    * @param {string} query - User's query
@@ -228,7 +303,19 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
    * @returns {Promise<Object>} - Intent classification
    */
   async classify(query, conversationHistory = []) {
-    // Quick checks for obvious patterns
+    // Check if query has multiple intents - if so, skip quick checks and use LLM
+    if (this.hasMultipleIntents(query)) {
+      console.log(`[IntentClassifier] 🔗 Multi-intent query detected - using LLM for full analysis`);
+      return await this.classifyIntent(query, conversationHistory);
+    }
+
+    // Quick checks for obvious patterns (in priority order)
+    const webSearchCheck = this.quickCheckWebSearch(query);
+    if (webSearchCheck) {
+      console.log(`[IntentClassifier] ⚡ Quick check: Web Search`);
+      return webSearchCheck;
+    }
+
     const conversationalCheck = this.quickCheckConversational(query);
     if (conversationalCheck) {
       console.log(`[IntentClassifier] ⚡ Quick check: Conversational`);

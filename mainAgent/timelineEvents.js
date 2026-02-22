@@ -62,6 +62,7 @@ const AGENT_ICONS = {
   sheets: '/icons/sheets.svg',
   flights: '/icons/flights.svg',
   maps: '/icons/maps.svg',
+  websearch: '/icons/websearch.svg',
   microsoft: '/icons/microsoft.svg'
 };
 
@@ -78,6 +79,7 @@ const AGENT_NAMES = {
   sheets: 'Google Sheets',
   flights: 'Flights',
   maps: 'Google Maps',
+  websearch: 'Web Search',
   microsoft: 'Microsoft 365'
 };
 
@@ -129,6 +131,11 @@ const TOOL_NAMES = {
   // Flights
   searchFlights: 'Search Flights',
   getFlightsPriceInsights: 'Get Price Insights',
+  
+  // Web Search
+  searchWeb: 'Search Web',
+  searchNews: 'Search News',
+  searchImages: 'Search Images',
   
   // Microsoft
   microsoft_sendEmail: 'Send Outlook Email',
