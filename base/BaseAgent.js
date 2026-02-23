@@ -74,6 +74,8 @@ class BaseAgent {
       forceToolExecution: context.forceToolExecution || null,  // ✅ CRITICAL: Copy forceToolExecution to executionContext
       detectedLanguage: detectedLanguage,  // ✅ Store detected language
       languageName: languageName,  // ✅ Store language name
+      language: detectedLanguage,  // ✅ Pass language for sub-agent calls
+      llmClient: this.llm,  // ✅ Pass LLM client for sub-agent calls
       results: {}, // Store results from each step
       iteration: 0,
       maxIterations: context.maxIterations || 15,

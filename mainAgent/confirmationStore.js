@@ -66,9 +66,11 @@ function generateRequestId() {
  * @param {string} conversationId - Conversation ID for artifact memory
  * @param {number} ttlMs - Time to live in milliseconds (optional)
  * @param {array} timelineEvents - Timeline events from initial query (optional)
+ * @param {object} originalAnalysis - Original query analysis with all agents and queries (optional)
+ * @param {object} initialResults - Results from non-confirmation agents executed before confirmation (optional)
  * @returns {string} - Request ID for this pending action
  */
-function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = []) {
+function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = [], originalAnalysis = null, initialResults = {}) {
   const requestId = generateRequestId();
   const now = Date.now();
   
@@ -83,6 +85,8 @@ function storePendingAction(userId, toolName, agentName, params, previewContent,
     conversationHistory,
     conversationId,  // Store conversationId for artifact memory
     timelineEvents,  // Store timeline events from initial query
+    originalAnalysis,  // Store original analysis for sequential multi-agent execution
+    initialResults,  // ✅ NEW: Store results from non-confirmation agents
     createdAt: now,
     expiresAt: now + ttlMs
   };
@@ -90,6 +94,12 @@ function storePendingAction(userId, toolName, agentName, params, previewContent,
   pendingActions.set(requestId, pendingAction);
   
   console.log(`[ConfirmationStore] Stored pending action: ${requestId} for tool: ${toolName} (conversation: ${conversationId || 'none'}, timeline events: ${timelineEvents.length})`);
+  if (originalAnalysis && originalAnalysis.requiresSequential) {
+    console.log(`[ConfirmationStore]   Sequential multi-agent task: ${originalAnalysis.agents.join(', ')}`);
+  }
+  if (Object.keys(initialResults).length > 0) {
+    console.log(`[ConfirmationStore]   Initial results from: ${Object.keys(initialResults).join(', ')}`);
+  }
   
   return requestId;
 }
@@ -361,9 +371,10 @@ function getStoreStats() {
  * @param {string} conversationId - Conversation ID for artifact memory
  * @param {number} ttlMs - Time to live in milliseconds
  * @param {array} timelineEvents - Timeline events from initial query
+ * @param {object} originalAnalysis - Original query analysis with all agents and queries (optional)
  * @returns {object} - { chainId, firstAction } containing chain ID and first action to confirm
  */
-function storeActionChain(userId, actions, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = []) {
+function storeActionChain(userId, actions, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = [], originalAnalysis = null) {
   if (!actions || actions.length === 0) {
     return null;
   }
@@ -379,6 +390,7 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
     conversationHistory,
     conversationId,
     timelineEvents,  // Store timeline events from initial query
+    originalAnalysis,  // Store original analysis for sequential multi-agent execution
     currentIndex: 0,
     completedResults: [],
     createdAt: now,
@@ -400,6 +412,7 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
     conversationHistory,
     conversationId,
     timelineEvents,  // Store timeline events in pending action too
+    originalAnalysis,  // Store original analysis in pending action too
     chainId,
     chainIndex: 0,
     totalInChain: actions.length,
@@ -411,6 +424,9 @@ function storeActionChain(userId, actions, query, conversationHistory = [], conv
 
   console.log(`[ConfirmationStore] Stored action chain: ${chainId} with ${actions.length} actions (timeline events: ${timelineEvents.length})`);
   console.log(`[ConfirmationStore] First action: ${firstAction.toolName} (requestId: ${requestId})`);
+  if (originalAnalysis && originalAnalysis.requiresSequential) {
+    console.log(`[ConfirmationStore]   Sequential multi-agent task: ${originalAnalysis.agents.join(', ')}`);
+  }
 
   return {
     chainId,
@@ -495,6 +511,7 @@ function getNextChainAction(chainId, userId, completedResult = null, completedTi
     conversationHistory: chain.conversationHistory,
     conversationId: chain.conversationId,
     timelineEvents: chain.timelineEvents || [],  // Preserve accumulated timeline events
+    originalAnalysis: chain.originalAnalysis,  // Preserve original analysis
     chainId,
     chainIndex: chain.currentIndex,
     totalInChain: chain.actions.length,

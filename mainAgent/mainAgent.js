@@ -41,6 +41,7 @@ const FlightsAgentMultiStep = require('../flights/flightsAgentMultiStep');
 const MapsAgentMultiStep = require('../maps/mapsAgentMultiStep');
 const WebSearchAgentMultiStep = require('../websearch/webSearchAgentMultiStep');
 const MicrosoftAgentMultiStep = require('../microsoft/microsoftAgentMultiStep');
+const WeatherAgentMultiStep = require('../weather/weatherAgentMultiStep');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 const { TimelineEmitter, TimelineEventType, AGENT_NAMES } = require('./timelineEvents');
@@ -86,7 +87,8 @@ class MainAgent {
       flights: new FlightsAgentMultiStep(),
       maps: new MapsAgentMultiStep(),
       websearch: new WebSearchAgentMultiStep(),
-      microsoft: new MicrosoftAgentMultiStep()
+      microsoft: new MicrosoftAgentMultiStep(),
+      weather: new WeatherAgentMultiStep(this.openai)
     };
 
     // System prompt for the main coordinator
@@ -325,6 +327,7 @@ class MainAgent {
    * Execute a confirmed action
    * This is called after user confirms the pending action
    * Now supports action chains - returns next action if part of a chain
+   * ALSO handles sequential execution of non-confirmation agents after confirmation
    * 
    * @param {string} requestId - The pending action request ID
    * @param {string} userId - User ID for validation
@@ -341,14 +344,150 @@ class MainAgent {
     }
 
     try {
-      const { agentName, toolName, params, query, conversationHistory, conversationId, chainId, chainIndex, totalInChain } = pendingAction;
+      const { agentName, toolName, params, query, conversationHistory, conversationId, chainId, chainIndex, totalInChain, originalAnalysis, initialResults } = pendingAction;
       
       console.log(`\n[MainAgent] 🚀 Executing confirmed action: ${toolName} on ${agentName}`);
       console.log(`[MainAgent]   ConversationId: ${conversationId || 'NOT SET'}`);
       if (chainId) {
         console.log(`[MainAgent]   Chain: ${chainId} (step ${chainIndex + 1}/${totalInChain})`);
       }
+      if (initialResults && Object.keys(initialResults).length > 0) {
+        console.log(`[MainAgent]   Initial results available from: ${Object.keys(initialResults).join(', ')}`);
+      }
       
+      // ✅ CRITICAL FIX: Check if this is a sequential multi-agent task
+      // If originalAnalysis exists and requiresSequential is true, we need to execute ALL agents in sequence
+      // not just the confirmed one
+      if (originalAnalysis && originalAnalysis.requiresSequential && originalAnalysis.agents && originalAnalysis.agents.length > 1) {
+        console.log(`[MainAgent] 🔄 Sequential multi-agent task detected`);
+        console.log(`[MainAgent]   Agents: ${originalAnalysis.agents.join(', ')}`);
+        console.log(`[MainAgent]   Current agent: ${agentName}`);
+        console.log(`[MainAgent]   userId type: ${typeof userId}, value: ${JSON.stringify(userId).substring(0, 100)}`);
+        
+        // Execute all agents in sequence, starting with the confirmed one
+        const results = {};
+        const errors = {};
+        const storedArtifacts = [];
+        
+        for (const currentAgentName of originalAnalysis.agents) {
+          try {
+            let agentQuery = originalAnalysis.queries[currentAgentName];
+            console.log(`[MainAgent] 🔄 Executing ${currentAgentName} sequentially with query: "${agentQuery}"`);
+            
+            // Emit timeline event for agent execution
+            if (timeline) {
+              timeline.emitAgentExecuting(currentAgentName, agentQuery);
+            }
+            
+            // Get the specialized agent
+            const agent = this.agents[currentAgentName];
+            if (!agent) {
+              throw new Error(`Agent '${currentAgentName}' not found`);
+            }
+            
+            // Build options for the agent
+            const agentOptions = {
+              userId: userId,  // Explicitly use the userId parameter
+              conversationHistory: conversationHistory,
+              conversationId: conversationId,
+              ...(currentAgentName === 'maps' && pendingAction.userLocation ? { userLocation: pendingAction.userLocation } : {})
+            };
+            
+            // Enrich query with previous results (for sequential execution)
+            if (Object.keys(results).length > 0) {
+              const enrichmentResult = await this._enrichQueryWithPreviousResults(agentQuery, currentAgentName, results, userId);
+              
+              // ✅ CRITICAL FIX: Check if enrichment returned structured data
+              if (typeof enrichmentResult === 'object' && enrichmentResult.researchContent) {
+                console.log(`[MainAgent] 📦 Passing structured research content to ${currentAgentName}`);
+                agentQuery = enrichmentResult.query;
+                agentOptions.researchContent = enrichmentResult.researchContent;
+              } else if (typeof enrichmentResult === 'string') {
+                // String enrichment (old behavior for email agents)
+                agentQuery = enrichmentResult;
+              } else {
+                // Fallback: use original query
+                console.warn(`[MainAgent] ⚠️ Unexpected enrichment result type:`, typeof enrichmentResult);
+              }
+            }
+            
+            // If this is the confirmed agent, force the specific tool execution
+            if (currentAgentName === agentName) {
+              agentOptions.forceToolExecution = {
+                toolName,
+                params
+              };
+            }
+            
+            console.log(`[MainAgent] 🔍 agentOptions for ${currentAgentName}:`, { 
+              userId: typeof agentOptions.userId, 
+              conversationId: agentOptions.conversationId,
+              hasForceToolExecution: !!agentOptions.forceToolExecution,
+              hasResearchContent: !!agentOptions.researchContent
+            });
+            
+            const result = await agent.processQuery(agentQuery, agentOptions);
+            results[currentAgentName] = result;
+            
+            // Emit timeline event for agent completion
+            if (timeline) {
+              timeline.emitAgentCompleted(currentAgentName, result);
+            }
+            
+            // Store artifacts from successful tool executions
+            if (conversationId && result.success && result.tools_used) {
+              for (let i = 0; i < result.tools_used.length; i++) {
+                const tool = result.tools_used[i];
+                try {
+                  const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
+                  const artifact = await extractAndStoreArtifact(
+                    conversationId,
+                    currentAgentName,
+                    tool.name || tool,
+                    rawResult
+                  );
+                  if (artifact) {
+                    storedArtifacts.push(artifact);
+                    console.log(`[MainAgent] ✅ Artifact stored: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+                  }
+                } catch (artifactError) {
+                  console.error(`[MainAgent] ⚠️ Error storing artifact:`, artifactError);
+                }
+              }
+            }
+            
+          } catch (error) {
+            console.error(`[MainAgent] Error executing ${currentAgentName}:`, error);
+            const friendly = this._sanitizeErrorForUser(currentAgentName, error.message);
+            errors[currentAgentName] = {
+              error: friendly,
+              query: originalAnalysis.queries[currentAgentName]
+            };
+            // Emit failed event
+            if (timeline) {
+              timeline.emitAgentFailed(currentAgentName, friendly);
+            }
+          }
+        }
+        
+        // Remove the pending action after successful execution
+        confirmationStore.removePendingAction(requestId);
+        
+        // Return combined results from all agents
+        return {
+          success: Object.keys(errors).length === 0,
+          results: results,
+          errors: errors,
+          query: query,
+          toolName: toolName,
+          agentName: agentName,
+          storedArtifacts: storedArtifacts,
+          conversationId: conversationId,
+          nextConfirmation: null  // No chain for sequential multi-agent tasks
+        };
+      }
+      
+      // Original single-agent confirmation flow
       // Emit timeline event for agent execution
       if (timeline) {
         timeline.emitAgentExecuting(agentName, `Executing ${toolName}...`);
@@ -369,7 +508,8 @@ class MainAgent {
       
       console.log(`[MainAgent] 📝 Passing original query to ${agentName}: "${query}"`);
       
-      const result = await agent.processQuery(query, userId, { 
+      const result = await agent.processQuery(query, { 
+        userId,
         conversationHistory,
         conversationId,  // ✅ CRITICAL: Pass conversationId for context
         forceToolExecution: {
@@ -467,6 +607,7 @@ class MainAgent {
       return {
         success: true,
         result: result,
+        initialResults: initialResults || {},  // ✅ NEW: Include results from non-confirmation agents
         query: query,
         toolName: toolName,
         agentName: agentName,
@@ -1001,8 +1142,13 @@ Return ONLY a JSON object:
    */
   async _enrichQueryWithPreviousResults(agentQuery, agentName, previousResults, userId) {
     try {
-      // Only enrich email-sending agents (gmail, microsoft)
-      if (agentName !== 'gmail' && agentName !== 'microsoft') {
+      // Enrich queries for agents that can use previous results
+      // Email agents: gmail, microsoft
+      // Document agents: docs, forms, sheets
+      // Calendar agents: calendar
+      const enrichableAgents = ['gmail', 'microsoft', 'docs', 'forms', 'sheets', 'calendar'];
+      
+      if (!enrichableAgents.includes(agentName)) {
         return agentQuery;
       }
 
@@ -1013,30 +1159,64 @@ Return ONLY a JSON object:
       for (const [prevAgent, prevResult] of Object.entries(previousResults)) {
         if (!prevResult || !prevResult.success) continue;
 
-        // ✅ NEW: Handle websearch results
+        // ✅ CRITICAL FIX: Handle websearch results as STRUCTURED DATA
         if (prevAgent === 'websearch') {
-          console.log(`[MainAgent] 📰 Found websearch results to include in email`);
+          console.log(`[MainAgent] 📰 Found websearch results for ${agentName}`);
+          console.log(`[MainAgent] 🔍 Websearch result structure:`, JSON.stringify(prevResult, null, 2).substring(0, 500));
           
-          // Extract the summary from websearch agent
-          if (prevResult.summary) {
-            websearchResults = {
-              type: 'websearch',
-              summary: prevResult.summary,
-              executedActions: prevResult.executedActions || []
-            };
+          // ✅ FIX: Check both raw_results (old format) and executedActions (new format)
+          let rawResults = prevResult.raw_results || [];
+          
+          // If raw_results is empty, check executedActions
+          if (rawResults.length === 0 && prevResult.executedActions && Array.isArray(prevResult.executedActions)) {
+            console.log(`[MainAgent] � raw_results empty, checking executedActions...`);
+            rawResults = prevResult.executedActions.map(action => action.result);
           }
           
-          // Also try to extract news articles from raw results
-          if (prevResult.results) {
-            const toolResults = Object.values(prevResult.results);
-            for (const toolResult of toolResults) {
-              if (toolResult.topNews && Array.isArray(toolResult.topNews)) {
-                websearchResults = websearchResults || { type: 'websearch' };
-                websearchResults.articles = toolResult.topNews.slice(0, 3); // Top 3 articles
-              } else if (toolResult.topResults && Array.isArray(toolResult.topResults)) {
-                websearchResults = websearchResults || { type: 'websearch' };
-                websearchResults.articles = toolResult.topResults.slice(0, 3); // Top 3 results
-              }
+          console.log(`[MainAgent] 📦 Raw results count: ${rawResults.length}`);
+          
+          for (const rawResult of rawResults) {
+            console.log(`[MainAgent] 🔍 Checking raw result keys:`, Object.keys(rawResult));
+            
+            // Check if this is synthesized research content
+            if (rawResult.synthesizedContent) {
+              console.log(`[MainAgent] 🧠 Found synthesized research content (${rawResult.synthesizedContent.length} chars)`);
+              websearchResults = {
+                type: 'research_result',
+                content: rawResult.synthesizedContent,
+                sources: rawResult.sources || [],
+                sourcesUsed: rawResult.sourcesUsed || 0
+              };
+              break;
+            }
+            // Fallback: check for topResults (old format)
+            else if (rawResult.topResults) {
+              console.log(`[MainAgent] 📋 Found search results (old format)`);
+              websearchResults = {
+                type: 'search_results',
+                results: rawResult.topResults.slice(0, 5)
+              };
+            }
+          }
+          
+          console.log(`[MainAgent] 🎯 Websearch results extracted:`, websearchResults ? 'YES' : 'NO');
+          
+          // ✅ CRITICAL: For docs/forms/sheets, pass STRUCTURED DATA not text instructions
+          if (['docs', 'forms', 'sheets'].includes(agentName) && websearchResults) {
+            if (websearchResults.type === 'research_result') {
+              // Pass synthesized content as structured data
+              console.log(`[MainAgent] 📄 Passing synthesized research to ${agentName} as structured data`);
+              console.log(`[MainAgent] 📄 Content length: ${websearchResults.content.length} chars`);
+              console.log(`[MainAgent] 📄 Content preview: ${websearchResults.content.substring(0, 200)}...`);
+              return {
+                query: agentQuery,
+                researchContent: {
+                  type: 'research_result',
+                  content: websearchResults.content,
+                  sources: websearchResults.sources,
+                  contentProvided: true  // Signal to agent: render mode, don't regenerate
+                }
+              };
             }
           }
           
@@ -1121,7 +1301,7 @@ Return ONLY a JSON object:
         console.log(`[MainAgent] Could not fetch sender name: ${e.message}`);
       }
 
-      // Build enrichment context
+      // Build enrichment context for email agents
       let enrichmentText = '';
       
       // Add links if any
@@ -1130,22 +1310,24 @@ Return ONLY a JSON object:
         enrichmentText += `The following items were just created and their links MUST be included in the email:\n${linksText}\n\n`;
       }
       
-      // Add websearch results if any
-      if (websearchResults) {
+      // Add websearch results for email agents (not docs)
+      if (websearchResults && ['gmail', 'microsoft'].includes(agentName)) {
         enrichmentText += `WEB SEARCH RESULTS TO INCLUDE IN EMAIL:\n`;
         
-        if (websearchResults.summary) {
-          enrichmentText += `Summary: ${websearchResults.summary}\n\n`;
-        }
-        
-        if (websearchResults.articles && websearchResults.articles.length > 0) {
-          enrichmentText += `Top Articles:\n`;
-          websearchResults.articles.forEach((article, index) => {
-            enrichmentText += `${index + 1}. ${article.title}\n`;
-            if (article.snippet) enrichmentText += `   ${article.snippet}\n`;
-            if (article.link) enrichmentText += `   Link: ${article.link}\n`;
-            if (article.source) enrichmentText += `   Source: ${article.source}\n`;
-            if (article.date) enrichmentText += `   Date: ${article.date}\n`;
+        if (websearchResults.type === 'research_result') {
+          enrichmentText += `Summary: ${websearchResults.content}\n\n`;
+          if (websearchResults.sources && websearchResults.sources.length > 0) {
+            enrichmentText += `Sources:\n`;
+            websearchResults.sources.forEach((source, index) => {
+              enrichmentText += `${index + 1}. ${source.title} - ${source.url}\n`;
+            });
+          }
+        } else if (websearchResults.results) {
+          enrichmentText += `Top Results:\n`;
+          websearchResults.results.forEach((result, index) => {
+            enrichmentText += `${index + 1}. ${result.title}\n`;
+            if (result.snippet) enrichmentText += `   ${result.snippet}\n`;
+            if (result.link) enrichmentText += `   Link: ${result.link}\n`;
             enrichmentText += `\n`;
           });
         }
@@ -1772,6 +1954,7 @@ Available agents:
 - maps: Google Maps operations (search places, directions, distance, geocoding, nearby search)
 - websearch: Web search operations (search for current information, news, events, real-time data from the internet). Use when user asks about CURRENT/LATEST/RECENT information, events, news, or anything requiring up-to-date data from the web.
 - microsoft: Microsoft 365 operations (Outlook Mail, Microsoft Calendar, OneDrive, Excel, Microsoft Teams chats/channels, Microsoft Word documents). Use this agent when user mentions "Outlook", "Microsoft", "OneDrive", "Excel", "Teams", "Microsoft Teams", "Word", "Microsoft Word", "Microsoft Calendar", or wants to send email "through Outlook" or "via Outlook". ALSO use for "show my outlook emails", "list my outlook mails", "check my outlook inbox", "list my teams", "show my teams chats", "list word documents".
+- weather: Weather and air quality operations (current weather, forecasts, temperature, precipitation, air quality, weather conditions). Use when user asks about weather, temperature, rain, snow, air quality, or outdoor conditions.
 
 CRITICAL RULES for Web Search:
 1. "Do you know about [current event]" → Use websearch agent
@@ -1779,6 +1962,14 @@ CRITICAL RULES for Web Search:
 3. "Tell me about recent [developments/events]" → Use websearch agent
 4. "Is there an [event/summit/conference] happening" → Use websearch agent
 5. Any query requiring CURRENT, REAL-TIME, or UP-TO-DATE information → Use websearch agent
+
+CRITICAL RULES for Weather Queries:
+1. "What's the weather" → Use weather agent
+2. "Will it rain" → Use weather agent
+3. "Temperature in [location]" → Use weather agent
+4. "Air quality in [location]" → Use weather agent
+5. "Weather forecast" → Use weather agent
+6. DO NOT use websearch for weather queries - use the dedicated weather agent
 
 CRITICAL RULES for Multi-Intent Queries (web search + another action):
 1. "Search for X and email it" → Use BOTH websearch AND gmail agents, requiresSequential: true
@@ -1862,9 +2053,20 @@ CRITICAL - Web Search Examples (use websearch agent for current/real-time inform
 - "what's the latest news about Tesla" -> {"agents": ["websearch"], "queries": {"websearch": "latest news about Tesla"}}
 - "tell me about recent AI developments" -> {"agents": ["websearch"], "queries": {"websearch": "recent AI developments"}}
 - "is there a tech conference happening this week" -> {"agents": ["websearch"], "queries": {"websearch": "tech conference happening this week"}}
-- "what's the weather in Mumbai today" -> {"agents": ["websearch"], "queries": {"websearch": "weather in Mumbai today"}}
 - "find information about upcoming events in Bangalore" -> {"agents": ["websearch"], "queries": {"websearch": "upcoming events in Bangalore"}}
 - "what are the current Bitcoin prices" -> {"agents": ["websearch"], "queries": {"websearch": "current Bitcoin prices"}}
+
+CRITICAL - Weather Examples (use weather agent, NOT websearch):
+- "what's the weather in Mumbai today" -> {"agents": ["weather"], "queries": {"weather": "what's the weather in Mumbai today"}}
+- "what is the current weather in Ujjain" -> {"agents": ["weather"], "queries": {"weather": "current weather in Ujjain"}}
+- "will it rain tomorrow" -> {"agents": ["weather"], "queries": {"weather": "will it rain tomorrow"}}
+- "temperature in Dubai" -> {"agents": ["weather"], "queries": {"weather": "temperature in Dubai"}}
+- "weather forecast for next 3 days in Tokyo" -> {"agents": ["weather"], "queries": {"weather": "weather forecast for next 3 days in Tokyo"}}
+- "air quality in Delhi" -> {"agents": ["weather"], "queries": {"weather": "air quality in Delhi"}}
+- "is it safe to exercise outside" -> {"agents": ["weather"], "queries": {"weather": "is it safe to exercise outside - check air quality"}}
+- "should I bring an umbrella today" -> {"agents": ["weather"], "queries": {"weather": "should I bring an umbrella today"}}
+- "how hot is it in London" -> {"agents": ["weather"], "queries": {"weather": "how hot is it in London"}}
+- "weather in Paris" -> {"agents": ["weather"], "queries": {"weather": "weather in Paris"}}
 
 CRITICAL - Multi-Intent Examples (web search + another action):
 - "search for the latest AI news and email the top 3 articles to john@example.com" -> {"agents": ["websearch", "gmail"], "requiresSequential": true, "queries": {"websearch": "latest AI news", "gmail": "email the top 3 AI news articles to john@example.com"}}
@@ -2022,7 +2224,20 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
             // When executing sequentially, inject concrete data from prior agents
             // into the current agent's query (e.g. real Meet link, doc URL, form link).
             if (Object.keys(results).length > 0) {
-              agentQuery = await this._enrichQueryWithPreviousResults(agentQuery, agentName, results, userId);
+              const enrichmentResult = await this._enrichQueryWithPreviousResults(agentQuery, agentName, results, userId);
+              
+              // ✅ CRITICAL FIX: Check if enrichment returned structured data
+              if (typeof enrichmentResult === 'object' && enrichmentResult.researchContent) {
+                console.log(`[MainAgent] 📦 Passing structured research content to ${agentName} (direct execution)`);
+                agentQuery = enrichmentResult.query;
+                // Will be added to agentOptions below
+              } else if (typeof enrichmentResult === 'string') {
+                // String enrichment (old behavior for email agents)
+                agentQuery = enrichmentResult;
+              } else {
+                // Fallback: use original query
+                console.warn(`[MainAgent] ⚠️ Unexpected enrichment result type:`, typeof enrichmentResult);
+              }
             }
             
             // Emit executing event BEFORE agent starts
@@ -2037,12 +2252,26 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
             // Build options for the agent (sequential execution)
             const agentOptions = {
+              userId,
               conversationId: conversationId,  // ✅ CRITICAL: Pass conversationId to agents
               conversationHistory: conversationHistory,
               ...(agentName === 'maps' && userLocation ? { userLocation } : {})
             };
+            
+            // ✅ CRITICAL FIX: Add researchContent to options if it was returned
+            if (Object.keys(results).length > 0) {
+              const enrichmentResult = await this._enrichQueryWithPreviousResults(analysis.queries[agentName], agentName, results, userId);
+              if (typeof enrichmentResult === 'object' && enrichmentResult.researchContent) {
+                agentOptions.researchContent = enrichmentResult.researchContent;
+                console.log(`[MainAgent] 🔍 agentOptions for ${agentName}:`, { 
+                  userId: typeof agentOptions.userId, 
+                  conversationId: agentOptions.conversationId,
+                  hasResearchContent: true
+                });
+              }
+            }
 
-            const result = await agent.processQuery(agentQuery, userId, agentOptions);
+            const result = await agent.processQuery(agentQuery, agentOptions);
             results[agentName] = result;
             
             // Emit completed event AFTER agent finishes
@@ -2110,12 +2339,13 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
 
             // Build options for the agent (parallel execution)
             const agentOptions = {
+              userId,
               conversationId: conversationId,  // ✅ CRITICAL: Pass conversationId to agents
               conversationHistory: conversationHistory,
               ...(agentName === 'maps' && userLocation ? { userLocation } : {})
             };
 
-            const result = await agent.processQuery(agentQuery, userId, agentOptions);
+            const result = await agent.processQuery(agentQuery, agentOptions);
             
             // Emit completed event AFTER agent finishes
             if (timeline) {
@@ -2778,7 +3008,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           conversationHistory,
           conversationId,
           undefined,  // ttlMs - use default
-          timeline ? timeline.getEvents() : []  // Pass timeline events from initial query
+          timeline ? timeline.getEvents() : [],  // Pass timeline events from initial query
+          analysis  // Pass original analysis for sequential multi-agent execution
         );
         
         if (chainResult) {
@@ -2817,7 +3048,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           conversationHistory,
           conversationId,
           undefined,  // ttlMs - use default
-          timeline ? timeline.getEvents() : []  // Pass timeline events from initial query
+          timeline ? timeline.getEvents() : [],  // Pass timeline events from initial query
+          analysis  // Pass original analysis for sequential multi-agent execution
         );
         
         return {
@@ -2893,6 +3125,40 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
     if (confirmationRequiredActions.length > 1) {
       console.log(`[Confirmation] Creating action chain with ${confirmationRequiredActions.length} actions`);
       
+      // ✅ CRITICAL FIX: Execute non-confirmation agents BEFORE storing confirmation chain
+      let nonConfirmationResults = {};
+      let nonConfirmationErrors = {};
+      let nonConfirmationArtifacts = [];
+      
+      if (nonConfirmationAgents.length > 0) {
+        console.log(`[Confirmation] 🚀 Executing ${nonConfirmationAgents.length} non-confirmation agents in parallel: ${nonConfirmationAgents.join(', ')}`);
+        
+        // Create a modified analysis with only non-confirmation agents
+        const nonConfirmationAnalysis = {
+          ...analysis,
+          agents: nonConfirmationAgents,
+          queries: Object.fromEntries(
+            nonConfirmationAgents.map(agent => [agent, analysis.queries[agent]])
+          )
+        };
+        
+        // Execute non-confirmation agents
+        const executionResult = await this.executeAgentQueries(
+          nonConfirmationAnalysis, 
+          userId, 
+          conversationId, 
+          userLocation, 
+          timeline, 
+          conversationHistory
+        );
+        
+        nonConfirmationResults = executionResult.results;
+        nonConfirmationErrors = executionResult.errors;
+        nonConfirmationArtifacts = executionResult.storedArtifacts;
+        
+        console.log(`[Confirmation] ✅ Non-confirmation agents completed. Results: ${Object.keys(nonConfirmationResults).length}, Errors: ${Object.keys(nonConfirmationErrors).length}`);
+      }
+      
       // Debug: Log timeline events being stored
       const timelineEventsToStore = timeline ? timeline.getEvents() : [];
       console.log(`[Confirmation] 📊 Storing ${timelineEventsToStore.length} initial timeline events with action chain`);
@@ -2907,15 +3173,16 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         conversationHistory,
         conversationId,
         undefined,  // ttlMs - use default
-        timelineEventsToStore  // Pass timeline events from initial query
+        timelineEventsToStore,  // Pass timeline events from initial query
+        analysis  // Pass original analysis for sequential multi-agent execution
       );
 
       if (chainResult) {
         const firstAction = confirmationRequiredActions[0];
         return {
-          results: {},
-          errors: {},
-          storedArtifacts: [],
+          results: nonConfirmationResults,  // ✅ Include results from non-confirmation agents
+          errors: nonConfirmationErrors,    // ✅ Include errors from non-confirmation agents
+          storedArtifacts: nonConfirmationArtifacts,  // ✅ Include artifacts from non-confirmation agents
           confirmationRequest: {
             requestId: chainResult.firstRequestId,
             toolName: firstAction.toolName,
@@ -2941,6 +3208,40 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       const action = confirmationRequiredActions[0];
       console.log(`[Confirmation] Single action requires confirmation:`, action.toolName);
       
+      // ✅ CRITICAL FIX: Execute non-confirmation agents BEFORE storing confirmation
+      let nonConfirmationResults = {};
+      let nonConfirmationErrors = {};
+      let nonConfirmationArtifacts = [];
+      
+      if (nonConfirmationAgents.length > 0) {
+        console.log(`[Confirmation] 🚀 Executing ${nonConfirmationAgents.length} non-confirmation agents in parallel: ${nonConfirmationAgents.join(', ')}`);
+        
+        // Create a modified analysis with only non-confirmation agents
+        const nonConfirmationAnalysis = {
+          ...analysis,
+          agents: nonConfirmationAgents,
+          queries: Object.fromEntries(
+            nonConfirmationAgents.map(agent => [agent, analysis.queries[agent]])
+          )
+        };
+        
+        // Execute non-confirmation agents
+        const executionResult = await this.executeAgentQueries(
+          nonConfirmationAnalysis, 
+          userId, 
+          conversationId, 
+          userLocation, 
+          timeline, 
+          conversationHistory
+        );
+        
+        nonConfirmationResults = executionResult.results;
+        nonConfirmationErrors = executionResult.errors;
+        nonConfirmationArtifacts = executionResult.storedArtifacts;
+        
+        console.log(`[Confirmation] ✅ Non-confirmation agents completed. Results: ${Object.keys(nonConfirmationResults).length}, Errors: ${Object.keys(nonConfirmationErrors).length}`);
+      }
+      
       const requestId = confirmationStore.storePendingAction(
         userId,
         action.toolName,
@@ -2951,13 +3252,15 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         conversationHistory,
         conversationId,
         undefined,  // ttlMs - use default
-        timeline ? timeline.getEvents() : []  // Pass timeline events from initial query
+        timeline ? timeline.getEvents() : [],  // Pass timeline events from initial query
+        analysis,  // Pass original analysis for sequential multi-agent execution
+        nonConfirmationResults  // ✅ NEW: Pass results from non-confirmation agents
       );
 
       return {
-        results: {},
-        errors: {},
-        storedArtifacts: [],
+        results: nonConfirmationResults,  // ✅ Include results from non-confirmation agents
+        errors: nonConfirmationErrors,    // ✅ Include errors from non-confirmation agents
+        storedArtifacts: nonConfirmationArtifacts,  // ✅ Include artifacts from non-confirmation agents
         confirmationRequest: {
           requestId: requestId,
           toolName: action.toolName,
@@ -4356,7 +4659,7 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
       onChunk({ type: 'status', message: 'Processing your confirmed action...' });
       if (timeline) timeline.emitGeneratingResponse();
 
-      const { result, query, toolName, agentName, nextConfirmation } = executionResult;
+      const { result, results, initialResults, query, toolName, agentName, nextConfirmation } = executionResult;
 
       // ✅ CRITICAL: Detect language from the original query using LLM
       const languageDetection = require('../utils/languageDetection');
@@ -4364,6 +4667,14 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
       const languageInstruction = languageDetection.getLanguageInstruction(detectedLanguage);
       const languageName = languageDetection.getLanguageName(detectedLanguage);
       console.log(`[MainAgent] 🌐 streamConfirmedActionResponse using language: ${languageName} (${detectedLanguage})`);
+      
+      // ✅ NEW: Combine initialResults with the confirmed action result
+      const allResults = {
+        ...initialResults,  // Results from non-confirmation agents (e.g., weather)
+        [agentName]: result  // Result from confirmed agent (e.g., calendar)
+      };
+      
+      console.log(`[MainAgent] 📊 Combined results from agents: ${Object.keys(allResults).join(', ')}`);
 
       // Build context about chain status
       let chainContext = '';
@@ -4377,70 +4688,112 @@ Do NOT say "let me know if you need anything else" - there's still more to do.`;
       // Safely stringify result, handling circular references
       let resultString;
       try {
-        // Extract only the relevant parts to avoid circular references
-        const rawResult = result?.raw_results?.[0] || {};
-        const safeResult = {
-          success: result?.success,
-          response: result?.response,
-          message: result?.message,
-          // For forms
-          formId: rawResult.formId || result?.formId,
-          formTitle: rawResult.form?.info?.title || result?.form?.info?.title,
-          formUrl: rawResult.formId ? 
-            `https://docs.google.com/forms/d/${rawResult.formId}/viewform` : null,
-          // For emails (Google)
-          emailSent: rawResult.success && (toolName === 'sendEmail' || toolName === 'microsoft_sendEmail'),
-          messageId: rawResult.messageId,
-          // For Google docs
-          documentId: rawResult.documentId || result?.documentId,
-          documentUrl: rawResult.documentId && agentName !== 'microsoft' ? 
-            `https://docs.google.com/document/d/${rawResult.documentId}/edit` : null,
-          // For events
-          eventId: rawResult.eventId || result?.eventId,
-          // Microsoft-specific fields
-          msDocumentId: rawResult.documentId || rawResult.id || rawResult.itemId,
-          msDocumentName: rawResult.name,
-          msWebUrl: rawResult.webUrl,
-          msWorkbookId: rawResult.workbookId,
-          // Excel sample data
-          sampleDataAdded: rawResult.sampleDataAdded || result?.sampleDataAdded,
-          sampleDataRows: rawResult.sampleDataRows || result?.sampleDataRows,
-          // Generic error
-          error: result?.error
-        };
-        
-        // Build a more informative result string for Microsoft
-        if (agentName === 'microsoft' && rawResult.webUrl) {
-          safeResult.microsoftLink = rawResult.webUrl;
-          safeResult.microsoftFileName = rawResult.name;
+        // ✅ CRITICAL: Handle sequential multi-agent execution results
+        if (results && typeof results === 'object' && !result) {
+          // Sequential multi-agent execution: results = { websearch: {...}, docs: {...}, ... }
+          const safeResults = {};
+          for (const [agentKey, agentResult] of Object.entries(results)) {
+            const rawResult = agentResult?.raw_results?.[0] || {};
+            safeResults[agentKey] = {
+              success: agentResult?.success,
+              response: agentResult?.response,
+              summary: agentResult?.summary,
+              // Extract URLs and IDs from each agent
+              documentId: rawResult.documentId || agentResult?.documentId,
+              documentUrl: rawResult.url || agentResult?.url,
+              formId: rawResult.formId || agentResult?.formId,
+              eventId: rawResult.eventId || agentResult?.eventId,
+              messageId: rawResult.messageId || agentResult?.messageId,
+            };
+          }
+          resultString = JSON.stringify(safeResults, null, 2);
+        } else {
+          // Single agent execution
+          const rawResult = result?.raw_results?.[0] || {};
+          const safeResult = {
+            success: result?.success,
+            response: result?.response,
+            message: result?.message,
+            // For forms
+            formId: rawResult.formId || result?.formId,
+            formTitle: rawResult.form?.info?.title || result?.form?.info?.title,
+            formUrl: rawResult.formId ? 
+              `https://docs.google.com/forms/d/${rawResult.formId}/viewform` : null,
+            // For emails (Google)
+            emailSent: rawResult.success && (toolName === 'sendEmail' || toolName === 'microsoft_sendEmail'),
+            messageId: rawResult.messageId,
+            // For Google docs
+            documentId: rawResult.documentId || result?.documentId,
+            documentUrl: rawResult.documentId && agentName !== 'microsoft' ? 
+              `https://docs.google.com/document/d/${rawResult.documentId}/edit` : null,
+            // For events
+            eventId: rawResult.eventId || result?.eventId,
+            // Microsoft-specific fields
+            msDocumentId: rawResult.documentId || rawResult.id || rawResult.itemId,
+            msDocumentName: rawResult.name,
+            msWebUrl: rawResult.webUrl,
+            msWorkbookId: rawResult.workbookId,
+            // Excel sample data
+            sampleDataAdded: rawResult.sampleDataAdded || result?.sampleDataAdded,
+            sampleDataRows: rawResult.sampleDataRows || result?.sampleDataRows,
+            // Generic error
+            error: result?.error
+          };
+          
+          // Build a more informative result string for Microsoft
+          if (agentName === 'microsoft' && rawResult.webUrl) {
+            safeResult.microsoftLink = rawResult.webUrl;
+            safeResult.microsoftFileName = rawResult.name;
+          }
+          
+          resultString = JSON.stringify(safeResult, null, 2);
         }
-        
-        resultString = JSON.stringify(safeResult, null, 2);
       } catch (e) {
         console.error('[MainAgent] Error stringifying result:', e.message);
-        resultString = `Action completed: ${result?.success ? 'Successfully' : 'With issues'}. ${result?.response || result?.message || ''}`;
+        resultString = `Action completed: ${result?.success || executionResult?.success ? 'Successfully' : 'With issues'}. ${result?.response || result?.message || ''}`;
       }
 
-      const responsePrompt = `The user confirmed and executed the following action:
+      const responsePrompt = `The user's original request was: "${query}"
 
-Action: ${toolName} on ${agentName}
-Original Query: "${query}"
+Multiple actions were performed:
 
-Execution Result:
-${resultString}
+${Object.entries(allResults).map(([agent, agentResult]) => {
+  const rawResult = agentResult?.raw_results?.[0] || agentResult || {};
+  return `${agent.toUpperCase()} Agent:
+${JSON.stringify({
+  success: agentResult?.success,
+  response: agentResult?.response,
+  summary: agentResult?.summary,
+  // Weather-specific
+  temperature: rawResult.current_weather?.temperature,
+  weather_description: rawResult.current_weather?.description,
+  location: rawResult.location?.found,
+  // Calendar-specific
+  eventId: rawResult.eventId,
+  eventLink: rawResult.eventLink,
+  // Other fields
+  documentId: rawResult.documentId,
+  formId: rawResult.formId,
+  messageId: rawResult.messageId
+}, null, 2)}`;
+}).join('\n\n')}
 ${chainContext}
 
-Please provide a natural, conversational confirmation response that:
-1. Confirms the action was completed SUCCESSFULLY (if success=true, it definitely worked - do NOT express uncertainty)
-2. Summarizes what was accomplished with specific details
-3. Includes any relevant links or references from the result (use msWebUrl or microsoftLink for Microsoft files)
-4. Is friendly and helpful in tone
-5. If there were any issues, mention them helpfully
-${nextConfirmation ? '6. Briefly mention that you will now proceed with the next action' : ''}
+Please provide a natural, conversational response that:
+1. Addresses ALL parts of the user's original request
+2. Presents information from ALL agents that executed
+3. For weather: Include temperature, conditions, and location
+4. For calendar: Confirm event creation with details (title, date, time) and link
+5. For other actions: Include relevant details and links
+6. Is friendly and helpful in tone
+7. Combines all information naturally without repetition
+${nextConfirmation ? '8. Briefly mention that you will now proceed with the next action' : ''}
 
-IMPORTANT: If the result shows success=true, the action DID complete successfully. Do not say things like "it seems like" or "wasn't included" - be confident about what was accomplished.
-If emailSent=true, the email WAS sent successfully with all the content that was specified.
-If msWebUrl or microsoftLink is present, that link WAS included in any emails that referenced it.
+IMPORTANT: 
+- Present ALL information from all agents in a cohesive response
+- Don't just focus on the confirmed action - include weather, maps, or other data too
+- If success=true, the action DID complete successfully
+- Include clickable links where available
 
 **CRITICAL - LANGUAGE MATCHING**:
 Detect the EXACT language of the "Original Query" above and respond ENTIRELY in that SAME language.
@@ -4450,12 +4803,7 @@ Detect the EXACT language of the "Original Query" above and respond ENTIRELY in 
 - All explanations, confirmations, and conversational text must be in the user's detected language
 - Technical terms, product names (Google Docs, Google Meet), URLs, and identifiers can remain in English
 - Markdown formatting should still be used
-- Keep the same helpful, friendly tone
-
-Format the response clearly. If an event was created, include the event details like title, date, time.
-If a document was created, include the title and link if available.
-If a form was created, include the form title and a link to view/edit it.
-If an email was sent, confirm it was sent successfully with the content that was specified.`;
+- Keep the same helpful, friendly tone`;
 
       const messages = [
         { role: 'system', content: this.systemPrompt + '\n\n' + languageInstruction },

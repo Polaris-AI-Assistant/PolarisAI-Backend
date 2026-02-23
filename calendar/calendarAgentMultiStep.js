@@ -476,16 +476,27 @@ GOOGLE CALENDAR SPECIFIC GUIDELINES:
    * Wrapper to maintain compatibility with old processQuery interface
    * Converts old interface to new BaseAgent interface
    */
-  async processQuery(query, userId, options = {}) {
+  async processQuery(query, userIdOrContext, options = {}) {
     console.log(`[CalendarAgent] 🚀 Processing query (multi-step): "${query}"`);
     
-    // Call BaseAgent's multi-step execution with userId in context
-    const result = await super.processQuery(query, {
-      userId: userId,
-      conversationId: options.conversationId,
-      maxIterations: options.maxIterations || 15,
-      forceToolExecution: options.forceToolExecution  // ✅ CRITICAL: Pass forceToolExecution to BaseAgent
-    });
+    // Detect which signature is being used
+    let context;
+    if (typeof userIdOrContext === 'string') {
+      context = {
+        userId: userIdOrContext,
+        conversationId: options.conversationId,
+        maxIterations: options.maxIterations || 15,
+        forceToolExecution: options.forceToolExecution,
+        conversationHistory: options.conversationHistory
+      };
+    } else if (typeof userIdOrContext === 'object') {
+      context = userIdOrContext;
+    } else {
+      throw new Error(`Invalid processQuery signature`);
+    }
+    
+    // Call BaseAgent's multi-step execution with proper context
+    const result = await super.processQuery(query, context);
 
     // Convert BaseAgent result to old format for backward compatibility
     return {
@@ -493,7 +504,7 @@ GOOGLE CALENDAR SPECIFIC GUIDELINES:
       response: result.summary,
       tools_used: result.executedActions.map(a => ({ name: a.tool })),
       raw_results: result.executedActions.map(a => a.result),
-      conversationHistory: options.conversationHistory || [],
+      conversationHistory: context.conversationHistory || [],
       totalSteps: result.totalSteps,
       errors: result.errors
     };

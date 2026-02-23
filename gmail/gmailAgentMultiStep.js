@@ -23,7 +23,7 @@ class GmailAgentMultiStep extends BaseAgent {
           type: 'function',
           function: {
             name: 'sendEmail',
-            description: 'Send a new email to one or more recipients. Use when user wants to send, compose, or write a new email.',
+            description: 'Send a new email to one or more recipients. Automatically converts Markdown formatting (##, ###, **, etc.) to HTML for better readability. Use when user wants to send, compose, or write a new email.',
             parameters: {
               type: 'object',
               properties: {
@@ -37,7 +37,7 @@ class GmailAgentMultiStep extends BaseAgent {
                 },
                 body: {
                   type: 'string',
-                  description: 'Email body content (required)'
+                  description: 'Email body content. Can include Markdown formatting which will be automatically converted to HTML (required)'
                 },
                 cc: {
                   type: 'string',
@@ -49,7 +49,7 @@ class GmailAgentMultiStep extends BaseAgent {
                 },
                 isHtml: {
                   type: 'boolean',
-                  description: 'Whether the body is HTML content (default: false)'
+                  description: 'Whether the body is already HTML content (default: false). If false and Markdown is detected, it will be auto-converted to HTML'
                 }
               },
               required: ['to', 'subject', 'body']
@@ -60,6 +60,11 @@ class GmailAgentMultiStep extends BaseAgent {
           console.log(`[GmailAgent] 📧 Sending email to: ${params.to}`);
           
           try {
+            // Auto-detect Markdown content
+            const hasMarkdownSyntax = params.body.includes('##') || params.body.includes('**') || 
+                                      params.body.includes('###') || params.body.includes('- **') ||
+                                      params.body.includes('\n- ') || params.body.includes('\n* ');
+            
             const result = await gmailService.sendEmailForUser(
               context.userId,
               params.to,
@@ -68,7 +73,8 @@ class GmailAgentMultiStep extends BaseAgent {
               {
                 cc: params.cc,
                 bcc: params.bcc,
-                isHtml: params.isHtml || false
+                isHtml: params.isHtml || false,
+                isMarkdown: hasMarkdownSyntax && !params.isHtml
               }
             );
 
@@ -486,16 +492,27 @@ GMAIL SPECIFIC GUIDELINES:
    * Wrapper to maintain compatibility with old processQuery interface
    * Converts old interface to new BaseAgent interface
    */
-  async processQuery(query, userId, options = {}) {
+  async processQuery(query, userIdOrContext, options = {}) {
     console.log(`[GmailAgent] 🚀 Processing query (multi-step): "${query}"`);
     
-    // Call BaseAgent's multi-step execution with userId in context
-    const result = await super.processQuery(query, {
-      userId: userId,
-      conversationId: options.conversationId,
-      maxIterations: options.maxIterations || 15,
-      forceToolExecution: options.forceToolExecution  // ✅ CRITICAL: Pass forceToolExecution to BaseAgent
-    });
+    // Detect which signature is being used
+    let context;
+    if (typeof userIdOrContext === 'string') {
+      context = {
+        userId: userIdOrContext,
+        conversationId: options.conversationId,
+        maxIterations: options.maxIterations || 15,
+        forceToolExecution: options.forceToolExecution,
+        conversationHistory: options.conversationHistory
+      };
+    } else if (typeof userIdOrContext === 'object') {
+      context = userIdOrContext;
+    } else {
+      throw new Error(`Invalid processQuery signature`);
+    }
+    
+    // Call BaseAgent's multi-step execution with proper context
+    const result = await super.processQuery(query, context);
 
     // Convert BaseAgent result to old format for backward compatibility
     return {
@@ -503,7 +520,7 @@ GMAIL SPECIFIC GUIDELINES:
       response: result.summary,
       tools_used: result.executedActions.map(a => ({ name: a.tool })),
       raw_results: result.executedActions.map(a => a.result),
-      conversationHistory: options.conversationHistory || [],
+      conversationHistory: context.conversationHistory || [],
       totalSteps: result.totalSteps,
       errors: result.errors
     };

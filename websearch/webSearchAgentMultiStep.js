@@ -1,21 +1,34 @@
 /**
- * Web Search Agent - Multi-Step Execution Version
- * Extends BaseAgent to support sequential multi-step operations.
+ * Web Search Agent - Research & Synthesis Pipeline
+ * 
+ * This is a TRUE research agent, not a search-results dumper.
+ * 
+ * 4-STAGE RESEARCH PIPELINE:
+ * ===========================
+ * Stage 1: Search (Discovery) - Find relevant URLs using Serper API
+ * Stage 2: Fetch & Extract - Get actual page content, clean it
+ * Stage 3: Synthesize - LLM combines sources into structured knowledge
+ * Stage 4: Act - Pass synthesized content to other agents (docs, email, etc.)
+ * 
+ * CRITICAL PRINCIPLE:
+ * Search results are REFERENCES. Only synthesized knowledge reaches the user.
  */
 
 const BaseAgent = require('../base/BaseAgent');
 const webSearchService = require('./webSearchService');
+const contentExtractor = require('./contentExtractor');
 const OpenAI = require('openai');
 
 class WebSearchAgentMultiStep extends BaseAgent {
   constructor(llmClient) {
     const tools = {
+      // ========== STAGE 1: SEARCH (DISCOVERY) ==========
       searchWeb: {
         definition: {
           type: 'function',
           function: {
             name: 'searchWeb',
-            description: 'Search the web for information, websites, and articles using Serper API. After calling this, you MUST synthesize the results into a conversational response for the user.',
+            description: 'STAGE 1: Search the web to discover relevant URLs. This returns search metadata ONLY - not final content. Always follow with fetchAndSynthesize to get actual information.',
             parameters: {
               type: 'object',
               properties: {
@@ -25,20 +38,8 @@ class WebSearchAgentMultiStep extends BaseAgent {
                 },
                 num: { 
                   type: 'number', 
-                  description: 'Number of search results to return (1-100)', 
-                  default: 10 
-                },
-                location: { 
-                  type: 'string', 
-                  description: 'Location for localized results (e.g., "United States", "India")' 
-                },
-                gl: { 
-                  type: 'string', 
-                  description: 'Country code for results (e.g., "us", "in")' 
-                },
-                hl: { 
-                  type: 'string', 
-                  description: 'Language code for results (e.g., "en", "hi")' 
+                  description: 'Number of search results to return (1-10, default: 5)', 
+                  default: 5 
                 }
               },
               required: ['query']
@@ -46,108 +47,159 @@ class WebSearchAgentMultiStep extends BaseAgent {
           }
         },
         execute: async (params, context) => {
-          console.log(`[WebSearchAgent] 🔍 Searching web for: "${params.query}"`);
+          console.log(`\n[WebSearchAgent] ========== STAGE 1: SEARCH (DISCOVERY) ==========`);
+          console.log(`[WebSearchAgent] 🔍 Query: "${params.query}"`);
+          
           try {
-            const results = await webSearchService.searchWeb(params);
-            console.log(`[WebSearchAgent] ✅ Found ${results.organic?.length || 0} results`);
+            const results = await webSearchService.searchWeb({
+              ...params,
+              num: Math.min(params.num || 5, 10)  // Limit to max 10
+            });
             
-            // Format results in a way that's easy for LLM to synthesize
-            const formattedResults = {
+            const topResults = (results.organic || []).slice(0, 5);
+            console.log(`[WebSearchAgent] ✅ Found ${topResults.length} relevant URLs`);
+            
+            // Return ONLY metadata - not final content
+            return {
               success: true,
+              stage: 'discovery',
               query: params.query,
-              totalResults: results.organic?.length || 0,
-              answerBox: results.answerBox || null,
-              knowledgeGraph: results.knowledgeGraph || null,
-              topResults: (results.organic || []).slice(0, 5).map(r => ({
+              totalResults: topResults.length,
+              urls: topResults.map(r => r.link),
+              metadata: topResults.map(r => ({
                 title: r.title,
-                snippet: r.snippet,
-                link: r.link,
-                date: r.date || null
+                url: r.link,
+                snippet: r.snippet
               })),
-              instruction: 'IMPORTANT: Synthesize these search results into a conversational, user-friendly response. Do NOT return raw bullet points. Answer the user\'s question naturally using information from these results.'
+              instruction: 'CRITICAL: These are search results (metadata only). You MUST call fetchAndSynthesize next to get actual content and synthesize it. Do NOT return these search results as final output.'
             };
-            
-            return formattedResults;
           } catch (error) {
-            console.error(`[WebSearchAgent] ❌ Error searching web:`, error.message);
+            console.error(`[WebSearchAgent] ❌ Search error:`, error.message);
             throw error;
           }
         }
       },
 
-      searchNews: {
+      // ========== STAGES 2 & 3: FETCH + SYNTHESIZE ==========
+      fetchAndSynthesize: {
         definition: {
           type: 'function',
           function: {
-            name: 'searchNews',
-            description: 'Search for news articles and current events using Serper API. After calling this, you MUST synthesize the results into a conversational response for the user.',
+            name: 'fetchAndSynthesize',
+            description: 'STAGES 2 & 3: Fetch actual web page content from URLs, extract clean text, and synthesize into structured knowledge. This is the REQUIRED second step after searchWeb.',
             parameters: {
               type: 'object',
               properties: {
-                query: { 
-                  type: 'string', 
-                  description: 'The news search query' 
+                urls: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Array of URLs to fetch and synthesize (max 5)'
                 },
-                num: { 
-                  type: 'number', 
-                  description: 'Number of news results to return', 
-                  default: 10 
+                query: {
+                  type: 'string',
+                  description: 'Original user query to guide synthesis'
                 },
-                location: { 
-                  type: 'string', 
-                  description: 'Location for localized news (e.g., "United States", "India")' 
+                synthesisGoal: {
+                  type: 'string',
+                  description: 'What to extract/synthesize (e.g., "restaurant information", "research paper summaries", "news highlights")'
                 }
               },
-              required: ['query']
+              required: ['urls', 'query']
             }
           }
         },
         execute: async (params, context) => {
-          console.log(`[WebSearchAgent] 📰 Searching news for: "${params.query}"`);
+          console.log(`\n[WebSearchAgent] ========== STAGES 2 & 3: FETCH + SYNTHESIZE ==========`);
+          console.log(`[WebSearchAgent] 📚 Fetching ${params.urls.length} URLs...`);
+          
           try {
-            const results = await webSearchService.searchNews(params);
-            console.log(`[WebSearchAgent] ✅ Found ${results.news?.length || 0} news articles`);
+            // STAGE 2: Fetch & Extract
+            const urls = params.urls.slice(0, 5);  // Limit to 5 sources
+            const extractedPages = await contentExtractor.extractMultiple(urls, 8000);
             
-            // Format results for LLM synthesis
-            const formattedResults = {
+            const successfulPages = extractedPages.filter(p => p.success && p.content);
+            console.log(`[WebSearchAgent] ✅ Successfully extracted ${successfulPages.length}/${urls.length} pages`);
+            
+            if (successfulPages.length === 0) {
+              return {
+                success: false,
+                error: 'Could not extract content from any URLs',
+                stage: 'extraction_failed'
+              };
+            }
+
+            // STAGE 3: Synthesize with LLM
+            console.log(`[WebSearchAgent] 🧠 Synthesizing content...`);
+            
+            const synthesisPrompt = this.buildSynthesisPrompt(
+              params.query,
+              params.synthesisGoal || 'relevant information',
+              successfulPages
+            );
+
+            const llm = context.llm || this.llm;
+            const synthesisResponse = await llm.chat.completions.create({
+              model: 'gpt-4o-mini',
+              messages: [
+                {
+                  role: 'system',
+                  content: 'You are a research synthesis expert. Your job is to read multiple web sources and synthesize them into structured, coherent knowledge. Extract key information, remove duplicates, and organize clearly.'
+                },
+                {
+                  role: 'user',
+                  content: synthesisPrompt
+                }
+              ],
+              temperature: 0.3,
+              max_tokens: 2000
+            });
+
+            const synthesizedContent = synthesisResponse.choices[0].message.content;
+            
+            console.log(`[WebSearchAgent] ✅ Synthesis complete (${synthesizedContent.length} chars)`);
+
+            return {
               success: true,
+              stage: 'synthesized',
               query: params.query,
-              totalResults: results.news?.length || 0,
-              topNews: (results.news || []).slice(0, 5).map(n => ({
-                title: n.title,
-                snippet: n.snippet,
-                link: n.link,
-                source: n.source,
-                date: n.date || null
+              synthesizedContent: synthesizedContent,
+              sourcesUsed: successfulPages.length,
+              sources: successfulPages.map(p => ({
+                title: p.title,
+                url: p.url
               })),
-              instruction: 'IMPORTANT: Synthesize these news results into a conversational, user-friendly response. Do NOT return raw bullet points. Present the news naturally.'
+              instruction: 'This is synthesized knowledge from multiple sources. Use this as your final output or pass to document creation.'
             };
-            
-            return formattedResults;
+
           } catch (error) {
-            console.error(`[WebSearchAgent] ❌ Error searching news:`, error.message);
+            console.error(`[WebSearchAgent] ❌ Fetch/Synthesis error:`, error.message);
             throw error;
           }
         }
       },
 
-      searchImages: {
+      // ========== CONVENIENCE: ALL-IN-ONE RESEARCH ==========
+      researchAndSynthesize: {
         definition: {
           type: 'function',
           function: {
-            name: 'searchImages',
-            description: 'Search for images and visual content using Serper API',
+            name: 'researchAndSynthesize',
+            description: 'ALL-IN-ONE: Search, fetch, and synthesize in one step. Use this for complete research tasks.',
             parameters: {
               type: 'object',
               properties: {
-                query: { 
-                  type: 'string', 
-                  description: 'The image search query' 
+                query: {
+                  type: 'string',
+                  description: 'The research query'
                 },
-                num: { 
-                  type: 'number', 
-                  description: 'Number of image results to return', 
-                  default: 10 
+                synthesisGoal: {
+                  type: 'string',
+                  description: 'What to extract/synthesize from sources'
+                },
+                numSources: {
+                  type: 'number',
+                  description: 'Number of sources to use (1-5, default: 3)',
+                  default: 3
                 }
               },
               required: ['query']
@@ -155,18 +207,77 @@ class WebSearchAgentMultiStep extends BaseAgent {
           }
         },
         execute: async (params, context) => {
-          console.log(`[WebSearchAgent] 🖼️ Searching images for: "${params.query}"`);
+          console.log(`\n[WebSearchAgent] ========== ALL-IN-ONE RESEARCH ==========`);
+          console.log(`[WebSearchAgent] 🔬 Research query: "${params.query}"`);
+          
           try {
-            const results = await webSearchService.searchImages(params);
-            console.log(`[WebSearchAgent] ✅ Found ${results.images?.length || 0} images`);
-            return { 
-              success: true, 
-              results: results,
-              images: results.images || [],
-              count: results.images?.length || 0
+            // Stage 1: Search
+            const searchResults = await webSearchService.searchWeb({
+              query: params.query,
+              num: 10
+            });
+            
+            const topUrls = (searchResults.organic || [])
+              .slice(0, params.numSources || 3)
+              .map(r => r.link);
+            
+            console.log(`[WebSearchAgent] 📍 Selected ${topUrls.length} sources`);
+
+            // Stages 2 & 3: Fetch + Synthesize
+            const extractedPages = await contentExtractor.extractMultiple(topUrls, 8000);
+            const successfulPages = extractedPages.filter(p => p.success && p.content);
+            
+            if (successfulPages.length === 0) {
+              return {
+                success: false,
+                error: 'Could not extract content from any sources',
+                stage: 'extraction_failed'
+              };
+            }
+
+            console.log(`[WebSearchAgent] 🧠 Synthesizing from ${successfulPages.length} sources...`);
+            
+            const synthesisPrompt = this.buildSynthesisPrompt(
+              params.query,
+              params.synthesisGoal || 'relevant information',
+              successfulPages
+            );
+
+            const llm = context.llm || this.llm;
+            const synthesisResponse = await llm.chat.completions.create({
+              model: 'gpt-4o-mini',
+              messages: [
+                {
+                  role: 'system',
+                  content: 'You are a research synthesis expert. Extract key information from multiple sources, remove duplicates, and organize into clear, structured content.'
+                },
+                {
+                  role: 'user',
+                  content: synthesisPrompt
+                }
+              ],
+              temperature: 0.3,
+              max_tokens: 2000
+            });
+
+            const synthesizedContent = synthesisResponse.choices[0].message.content;
+            
+            console.log(`[WebSearchAgent] ✅ Research complete!`);
+
+            return {
+              success: true,
+              stage: 'complete',
+              query: params.query,
+              synthesizedContent: synthesizedContent,
+              sourcesUsed: successfulPages.length,
+              sources: successfulPages.map(p => ({
+                title: p.title,
+                url: p.url
+              }))
             };
+
           } catch (error) {
-            console.error(`[WebSearchAgent] ❌ Error searching images:`, error.message);
+            console.error(`[WebSearchAgent] ❌ Research error:`, error.message);
             throw error;
           }
         }
@@ -179,101 +290,103 @@ class WebSearchAgentMultiStep extends BaseAgent {
   }
 
   /**
+   * Build synthesis prompt for LLM
+   */
+  buildSynthesisPrompt(query, goal, pages) {
+    let prompt = `User Query: "${query}"\n`;
+    prompt += `Synthesis Goal: Extract and organize ${goal}\n\n`;
+    prompt += `I have fetched content from ${pages.length} web sources. Please:\n`;
+    prompt += `1. Read all sources carefully\n`;
+    prompt += `2. Extract key information relevant to the query\n`;
+    prompt += `3. Remove duplicate information\n`;
+    prompt += `4. Synthesize into clear, structured content\n`;
+    prompt += `5. Organize with headers and sections\n`;
+    prompt += `6. Do NOT just list the sources - synthesize the knowledge\n\n`;
+    prompt += `Sources:\n\n`;
+
+    pages.forEach((page, index) => {
+      prompt += `--- SOURCE ${index + 1}: ${page.title} ---\n`;
+      prompt += `URL: ${page.url}\n`;
+      prompt += `Content:\n${page.content.substring(0, 3000)}\n\n`;
+    });
+
+    prompt += `\nNow synthesize this information into structured, coherent content that directly answers the user's query.`;
+    prompt += `\nFormat with markdown (headers, bullet points, etc.) for readability.`;
+    prompt += `\nOptionally cite sources at the end if relevant.`;
+
+    return prompt;
+  }
+
+  /**
    * Get system prompt for the web search agent
    */
   getSystemPrompt() {
-    const now = new Date();
-    const currentDateStr = now.toLocaleDateString('en-US', { 
-      weekday: 'long',
-      month: 'long', 
-      day: 'numeric', 
-      year: 'numeric' 
-    });
+    return `You are a Web Research & Synthesis Agent.
 
-    return `You are a Web Search AI Assistant specialized in finding information on the internet and presenting it in a conversational, user-friendly way.
+**CRITICAL ARCHITECTURE:**
 
-**CRITICAL LANGUAGE REQUIREMENT:**
-- ALWAYS respond in the SAME LANGUAGE as the user's query
-- If user writes in English, respond in English
-- If user writes in Hindi, respond in Hindi
-- Match the user's language EXACTLY
+You operate as a 4-STAGE RESEARCH PIPELINE:
 
-**Current date: ${currentDateStr}**
+STAGE 1: SEARCH (Discovery)
+- Use searchWeb to find relevant URLs
+- This returns metadata ONLY (titles, snippets, links)
+- This is NOT final output
 
-Your capabilities:
-- **searchWeb**: Find websites, articles, and general information
-- **searchNews**: Find recent news articles and current events
-- **searchImages**: Find images and visual content
+STAGE 2: FETCH (Content Extraction)
+- Automatically happens in fetchAndSynthesize
+- Fetches actual web page content
+- Cleans HTML, removes ads/navigation
 
-**CRITICAL RESPONSE FORMATTING RULES:**
+STAGE 3: SYNTHESIZE (Knowledge Creation)
+- LLM reads all sources
+- Extracts relevant information
+- Removes duplicates
+- Creates structured, coherent output
+- This IS the final content
 
-1. **NEVER return raw search results as bullet points**
-   - ❌ BAD: "Title: X, Source: Y, Date: Z, Snippet: ..."
-   - ✅ GOOD: "Yes! The India AI Impact Summit 2026 was the most recent major AI summit in Delhi. Here are the key details: ..."
+STAGE 4: ACT (Delivery)
+- Pass synthesized content to user or other agents
+- Never pass raw search results
 
-2. **Synthesize information into conversational responses**
-   - Read through ALL search results
-   - Extract the most relevant information
-   - Combine information from multiple sources
-   - Present it as a natural, flowing response
-   - Answer the user's question directly
+**EXECUTION RULES:**
 
-3. **Structure your response like a human would:**
-   - Start with a direct answer to the question
-   - Provide key details in organized sections
-   - Use headers, bullet points, and formatting for readability
-   - Include specific facts, dates, numbers, and names
-   - End with additional context or related information if helpful
+1. For ANY research query, you MUST:
+   - Call searchWeb first (Stage 1)
+   - Then call fetchAndSynthesize (Stages 2 & 3)
+   - Return synthesized content (Stage 4)
 
-4. **After calling searchWeb/searchNews:**
-   - DO NOT call any more tools
-   - Immediately synthesize the results into a conversational response
-   - Present the information in a user-friendly format
-   - Stop execution (don't call tools again)
+2. NEVER return search results as final output
+   - Search results are references, not answers
+   - Always synthesize before responding
 
-**Example of GOOD response format:**
+3. Use researchAndSynthesize for convenience
+   - Does all stages in one call
+   - Recommended for most queries
 
-User: "do you know about the AI summit happening in Delhi?"
+**EXAMPLE FLOW:**
 
-After searchWeb returns results, you should respond:
+User: "Find information about machine learning papers"
 
-"Yes! The **India AI Impact Summit 2026** was the most recent major AI summit in Delhi. Here are the key details:
+WRONG:
+- searchWeb → return titles/links ❌
 
-## Event Overview
-- **Dates:** February 16-21, 2026 (extended to 6 days due to high demand)
-- **Venue:** Bharat Mandapam, Delhi
-- **Inaugurated by:** PM Narendra Modi
+CORRECT:
+- researchAndSynthesize → return synthesized knowledge ✅
 
-## Scale & Attendance
-- Over **100 countries** participated
-- **20+ heads of state**
-- **40+ tech CEOs**
-- **250,000+ guests**
+OR:
+- searchWeb → get URLs
+- fetchAndSynthesize → get synthesized content ✅
 
-## Key Highlights
-- Focus on AI governance and ethical AI development
-- Major announcements from tech companies about AI investments in India
-- Discussions on AI's role in solving global challenges
+**OUTPUT FORMAT:**
 
-This was a landmark event showcasing India's growing role in the global AI ecosystem."
+Your synthesized content should be:
+- Structured with headers
+- Organized by topic/category
+- Free of duplicate information
+- Directly answering the query
+- Optionally citing sources at end
 
-**Guidelines:**
-1. Use clear and specific search queries
-2. Present the most relevant results first
-3. Synthesize key information from search results into natural language
-4. Highlight answer boxes and knowledge graphs when available
-5. Be helpful, conversational, and proactive
-6. Format responses with headers, bullet points, and emphasis for readability
-7. Include sources at the end if user might want to verify information
-
-**Format elements you can use:**
-- Headers (##) for sections
-- Bullet points for lists
-- **Bold** for emphasis
-- Specific facts, dates, and numbers
-- Natural, flowing sentences
-
-Remember: You are a conversational AI assistant, not a search results aggregator. Transform raw search data into helpful, human-friendly responses!`;
+Remember: You are a RESEARCH agent, not a search engine. Synthesize knowledge, don't dump links.`;
   }
 }
 

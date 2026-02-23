@@ -2,6 +2,7 @@ const { google } = require('googleapis');
 const supabase = require('../supabase/supabaseConnect');
 const OpenAI = require('openai');
 const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
+const MarkdownIt = require('markdown-it');
 
 // Define OAuth scopes - Extended for full Gmail agent functionality
 const SCOPES = [
@@ -202,12 +203,20 @@ async function sendEmail(auth, to, subject, body, options = {}) {
       cc,
       bcc,
       isHtml = false,
-      replyTo
+      replyTo,
+      isMarkdown = false
     } = options;
 
-    // Convert newlines to HTML line breaks if sending as HTML
+    // Convert Markdown to HTML if needed
     let emailBody = body;
-    if (isHtml && body) {
+    let shouldSendAsHtml = isHtml;
+    
+    if (isMarkdown && body) {
+      // Convert Markdown to HTML
+      const md = new MarkdownIt();
+      emailBody = md.render(body);
+      shouldSendAsHtml = true;
+    } else if (isHtml && body) {
       // Convert \n to <br> for HTML emails, but preserve existing HTML
       if (!body.includes('<br>') && !body.includes('<p>') && !body.includes('<div>')) {
         emailBody = body.replace(/\n/g, '<br>');
@@ -247,7 +256,7 @@ async function sendEmail(auth, to, subject, body, options = {}) {
     messageParts.push(`Subject: ${subject}`);
     messageParts.push('MIME-Version: 1.0');
     
-    if (isHtml) {
+    if (shouldSendAsHtml) {
       messageParts.push('Content-Type: text/html; charset=utf-8');
     } else {
       messageParts.push('Content-Type: text/plain; charset=utf-8');
@@ -292,7 +301,7 @@ async function sendEmail(auth, to, subject, body, options = {}) {
  * @param {string} to - Recipient email address
  * @param {string} subject - Email subject
  * @param {string} body - Email body
- * @param {Object} [options] - Additional options (from, cc, bcc, isHtml, replyTo)
+ * @param {Object} [options] - Additional options (from, cc, bcc, isHtml, isMarkdown, replyTo)
  * @returns {Promise<Object>} Result object with success/error status
  */
 async function sendEmailForUser(userIdentifier, to, subject, body, options = {}) {
@@ -700,7 +709,17 @@ async function sendEmailForAgent(userId, params) {
     throw new Error("Missing required fields: to, subject, and body are required");
   }
   
-  const result = await sendEmailForUser(userId, to, subject, body, { cc, bcc, isHtml });
+  // Auto-detect Markdown content
+  const hasMarkdownSyntax = body.includes('##') || body.includes('**') || 
+                            body.includes('###') || body.includes('- **') ||
+                            body.includes('\n- ') || body.includes('\n* ');
+  
+  const result = await sendEmailForUser(userId, to, subject, body, { 
+    cc, 
+    bcc, 
+    isHtml: isHtml || false,
+    isMarkdown: hasMarkdownSyntax && !isHtml // Use Markdown if detected and not explicitly HTML
+  });
   return result;
 }
 

@@ -8,7 +8,6 @@
     "test": "node test-api.js",
     "dev": "nodemon index.js"
   },
-  "devDependencies": {},
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -17,6 +16,7 @@
     "@supabase/supabase-js": "^2.56.1",
     "axios": "^1.7.8",
     "bull": "^4.16.5",
+    "cheerio": "^1.0.0-rc.12",
     "cors": "^2.8.6",
     "cron-parser": "^5.5.0",
     "docx": "^9.5.1",
@@ -24,6 +24,7 @@
     "express": "^4.21.1",
     "fluent-ffmpeg": "^2.1.2",
     "googleapis": "^159.0.0",
+    "markdown-it": "^14.1.1",
     "nodemailer": "^8.0.1",
     "nodemon": "^3.1.10",
     "openai": "^5.16.0",

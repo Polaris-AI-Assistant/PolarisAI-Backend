@@ -49,6 +49,9 @@ const mapsAgentRoutes = require('./maps/mapsAgentController');
 // Web Search routes
 const webSearchAgentRoutes = require('./websearch/webSearchAgentController');
 
+// Weather routes
+const weatherAgentRoutes = require('./weather/weatherRoutes');
+
 // Main Coordinator Agent routes
 const mainAgentRoutes = require('./mainAgent/mainAgentController');
 
@@ -155,6 +158,9 @@ app.use('/api/maps', mapsAgentRoutes);
 
 // Use Web Search AI Agent routes
 app.use('/api/websearch', webSearchAgentRoutes);
+
+// Use Weather AI Agent routes
+app.use('/api/weather', weatherAgentRoutes);
 
 // Use GitHub authentication routes
 app.use('/api/auth/github', githubRoutes);

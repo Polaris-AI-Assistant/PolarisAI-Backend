@@ -58,25 +58,28 @@ class IntentClassifier {
 
 Classify the following user query into ONE of these categories:
 
-1. **ACTIONABLE**: User wants to PERFORM an action
+1. **ACTIONABLE**: User wants to PERFORM an action or GET information
    - Examples: "Create a google docs titled Project Plan"
    - Examples: "Send an email to john@example.com"
    - Examples: "Schedule a meeting for tomorrow"
    - Examples: "Search for flights to NYC"
+   - Examples: "What's the weather in London?" (getting weather data)
+   - Examples: "Show me my emails" (fetching data)
    - Key indicators: Action verbs like create, make, send, schedule, book, search, find, show, list, get
+   - IMPORTANT: Weather queries are ACTIONABLE (fetching weather data from API)
    - IMPORTANT: "Help me create X" is ACTIONABLE (user wants action, not tutorial)
    - IMPORTANT: "Guide me through sending an email" is ACTIONABLE (user wants to perform the action)
 
-2. **WEB_SEARCH**: User wants CURRENT/REAL-TIME information from the internet
+2. **WEB_SEARCH**: User wants CURRENT/REAL-TIME information from the internet (NEWS, EVENTS, ARTICLES)
    - Examples: "Do you know about the AI summit happening in Delhi?"
    - Examples: "What's the latest news about Tesla?"
    - Examples: "Find information about upcoming tech conferences"
-   - Examples: "What's the weather like in Mumbai today?"
    - Examples: "Tell me about recent AI developments"
-   - Examples: "What are the current flight prices to NYC?"
+   - Examples: "What are the current Bitcoin prices?"
    - Key indicators: "latest", "current", "recent", "happening", "today", "now", "upcoming", "news", "do you know about"
-   - IMPORTANT: Questions about CURRENT EVENTS, REAL-TIME DATA, or RECENT INFORMATION need web search
+   - IMPORTANT: Questions about CURRENT EVENTS, NEWS, or ARTICLES need web search
    - IMPORTANT: "Do you know about X" where X is a current event → WEB_SEARCH
+   - IMPORTANT: Weather queries are NOT web search - they use dedicated weather API (classify as ACTIONABLE)
 
 3. **ADVISORY**: User wants ADVICE, GUIDANCE, or GENERAL INFORMATION (not time-sensitive)
    - Examples: "How do I create a google docs?"
@@ -101,7 +104,8 @@ Classify the following user query into ONE of these categories:
    - Key indicators: "generate", "export", "create", "save" + "pdf" or "txt" or "text file"
 
 CRITICAL RULES:
-- If query asks about CURRENT/RECENT/LATEST/HAPPENING events or information → WEB_SEARCH
+- Weather queries (temperature, forecast, rain, air quality) → ACTIONABLE (uses weather API, not web search)
+- If query asks about CURRENT NEWS/EVENTS/ARTICLES → WEB_SEARCH
 - If query contains action verbs (create, make, send, schedule, book, search, find, show, list, get) → ACTIONABLE
 - If query is a question asking HOW TO DO something (general knowledge) → ADVISORY
 - If query asks about past actions or information → CONVERSATIONAL
@@ -185,9 +189,24 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   quickCheckWebSearch(query) {
     const lowerQuery = query.toLowerCase().trim();
     
-    // Obvious web search patterns
+    // EXCLUDE weather queries - they should use the dedicated weather agent
+    const weatherPatterns = [
+      /\b(weather|temperature|forecast|rain|snow|sunny|cloudy|wind|humidity|air quality|aqi)\b/i,
+      /\b(hot|cold|warm|cool)\s+(is it|in|today|tomorrow)/i,
+      /\b(will it|is it)\s+(rain|snow)/i,
+      /\b(what's|what is|how's|how is)\s+the\s+(weather|temperature)/i
+    ];
+    
+    for (const pattern of weatherPatterns) {
+      if (pattern.test(query)) {
+        // This is a weather query - don't classify as web_search
+        return null;
+      }
+    }
+    
+    // Obvious web search patterns (excluding weather)
     const webSearchPatterns = [
-      /\b(latest|current|recent|today|now|this week|this month|upcoming|happening)\b.*\b(news|event|summit|conference|update|development|price|weather|information)/i,
+      /\b(latest|current|recent|today|now|this week|this month|upcoming|happening)\b.*\b(news|event|summit|conference|update|development|price|information)/i,
       /\bdo you know (about|if|when|where)\b/i,
       /\b(what|tell me|find)\b.*\b(latest|current|recent|today|now|happening)\b/i,
       /\b(is there|are there)\b.*\b(any|a)\b.*\b(event|summit|conference|meeting|happening)/i,
@@ -296,39 +315,15 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   }
 
   /**
-   * Classify intent with quick checks first, then LLM if needed
+   * Classify intent using LLM only (no pattern matching)
    * 
    * @param {string} query - User's query
    * @param {Array} conversationHistory - Recent conversation history
    * @returns {Promise<Object>} - Intent classification
    */
   async classify(query, conversationHistory = []) {
-    // Check if query has multiple intents - if so, skip quick checks and use LLM
-    if (this.hasMultipleIntents(query)) {
-      console.log(`[IntentClassifier] 🔗 Multi-intent query detected - using LLM for full analysis`);
-      return await this.classifyIntent(query, conversationHistory);
-    }
-
-    // Quick checks for obvious patterns (in priority order)
-    const webSearchCheck = this.quickCheckWebSearch(query);
-    if (webSearchCheck) {
-      console.log(`[IntentClassifier] ⚡ Quick check: Web Search`);
-      return webSearchCheck;
-    }
-
-    const conversationalCheck = this.quickCheckConversational(query);
-    if (conversationalCheck) {
-      console.log(`[IntentClassifier] ⚡ Quick check: Conversational`);
-      return conversationalCheck;
-    }
-
-    const fileGenerationCheck = this.quickCheckFileGeneration(query);
-    if (fileGenerationCheck) {
-      console.log(`[IntentClassifier] ⚡ Quick check: File Generation`);
-      return fileGenerationCheck;
-    }
-
-    // Use LLM for nuanced classification
+    // Always use LLM for classification - no pattern matching
+    console.log(`[IntentClassifier] 🤖 Using LLM for intent classification`);
     return await this.classifyIntent(query, conversationHistory);
   }
 }

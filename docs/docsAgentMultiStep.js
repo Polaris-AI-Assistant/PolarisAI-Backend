@@ -55,7 +55,7 @@ class DocsAgentMultiStep extends BaseAgent {
             return {
               success: true,
               documentId: doc.documentId,
-              url: doc.url,
+              url: doc.documentUrl,  // Fixed: was doc.url, should be doc.documentUrl
               title: doc.title,
               createdAt: new Date().toISOString()
             };
@@ -546,23 +546,85 @@ GOOGLE DOCS SPECIFIC GUIDELINES:
 
 7. **For Introduction Sections**
    - Use markdown formatting with # for heading
-   - Example: "# Introduction\\n\\nThis document outlines..."`;
+   - Example: "# Introduction\\n\\nThis document outlines..."
+
+8. **CRITICAL: Smart Content Formatting Based on Search Results**
+   
+   When you receive search results from a previous action, AUTOMATICALLY detect the content type and format appropriately:
+   
+   **For ACADEMIC PAPERS** (when URLs contain arxiv.org, semanticscholar.org, scholar.google.com, doi.org, etc.):
+   - Title: Use a descriptive title like "Machine Learning Research Papers" or "Top Papers on [Topic]"
+   - Format each result as:
+     ## [Number]. [Paper Title]
+     **Link:** [URL]
+     **Summary:** [Snippet/Description]
+     ---
+   
+   **For NEWS ARTICLES** (when URLs contain news sites, dates are recent):
+   - Title: "Latest News: [Topic]" or "News Summary: [Topic]"
+   - Format: Headline, Date, Source, Summary
+   
+   **For GENERAL RESULTS** (mixed content):
+   - Title: "Search Results: [Topic]" or "[Topic] Resources"
+   - Format: Title, Description, Link
+   
+   **IMPORTANT:**
+   - Detect the content type from the URLs and snippets automatically
+   - Use appropriate formatting without asking the user
+   - Include all relevant information from search results
+   - Make the document well-structured and easy to read
+   - Use markdown formatting (headers, bold, links, etc.)
+   - This is a DOCUMENT, not an email - do NOT add email signatures, greetings, or "Best Regards"
+   - Focus on clean, professional document formatting`;
   }
 
   /**
    * Wrapper to maintain compatibility with old processQuery interface
-   * Converts old interface to new BaseAgent interface
+   * Supports both old (query, userId, options) and new (query, context) signatures
+   * 
+   * ✅ RENDER-ONLY MODE: If context.researchContent is provided with contentProvided: true,
+   * this will skip LLM generation and directly render the content into a document.
    */
-  async processQuery(query, userId, options = {}) {
+  async processQuery(query, userIdOrContext, options = {}) {
     console.log(`[DocsAgent] 🚀 Processing query (multi-step): "${query}"`);
     
-    // Call BaseAgent's multi-step execution with userId in context
-    const result = await super.processQuery(query, {
-      userId: userId,
-      conversationId: options.conversationId,
-      maxIterations: options.maxIterations || 15,
-      forceToolExecution: options.forceToolExecution  // ✅ CRITICAL: Pass forceToolExecution to BaseAgent
-    });
+    // Detect which signature is being used
+    let context;
+    if (typeof userIdOrContext === 'string') {
+      // Old signature: (query, userId, options)
+      context = {
+        userId: userIdOrContext,
+        conversationId: options.conversationId,
+        maxIterations: options.maxIterations || 15,
+        forceToolExecution: options.forceToolExecution,
+        conversationHistory: options.conversationHistory,
+        researchContent: options.researchContent  // ✅ Pass through research content
+      };
+    } else if (typeof userIdOrContext === 'object') {
+      // New signature: (query, context)
+      context = userIdOrContext;
+    } else {
+      throw new Error(`Invalid processQuery signature: second parameter must be string (userId) or object (context)`);
+    }
+    
+    // ✅ DEBUG: Log context to see if researchContent is present
+    console.log(`[DocsAgent] 🔍 Context keys:`, Object.keys(context));
+    console.log(`[DocsAgent] 🔍 Has researchContent:`, !!context.researchContent);
+    if (context.researchContent) {
+      console.log(`[DocsAgent] 🔍 researchContent.contentProvided:`, context.researchContent.contentProvided);
+      console.log(`[DocsAgent] 🔍 researchContent.content length:`, context.researchContent.content?.length);
+    }
+    
+    // ✅ RENDER-ONLY MODE: Check if research content is provided
+    if (context.researchContent && context.researchContent.contentProvided) {
+      console.log(`[DocsAgent] 📄 RENDER-ONLY MODE: Research content provided, skipping LLM generation`);
+      return await this.renderResearchContent(query, context);
+    }
+    
+    console.log(`[DocsAgent] 🤖 GENERATE MODE: Using LLM to generate content`);
+    
+    // Normal mode: Call BaseAgent's multi-step execution with proper context
+    const result = await super.processQuery(query, context);
 
     // Convert BaseAgent result to old format for backward compatibility
     return {
@@ -570,10 +632,103 @@ GOOGLE DOCS SPECIFIC GUIDELINES:
       response: result.summary,
       tools_used: result.executedActions.map(a => ({ name: a.tool })),
       raw_results: result.executedActions.map(a => a.result),
-      conversationHistory: options.conversationHistory || [],
+      conversationHistory: context.conversationHistory || [],
       totalSteps: result.totalSteps,
       errors: result.errors
     };
+  }
+
+  /**
+   * RENDER-ONLY MODE: Directly render research content into a document
+   * without LLM generation. This prevents content degradation.
+   * 
+   * @param {string} query - Original user query (for extracting title)
+   * @param {object} context - Execution context with researchContent
+   * @returns {Promise<object>} - Result in old format
+   */
+  async renderResearchContent(query, context) {
+    console.log(`[DocsAgent] 🎨 Rendering research content directly...`);
+    
+    try {
+      const { researchContent, userId, conversationId } = context;
+      
+      // Extract document title from query
+      let docTitle = 'Research Results';
+      const titleMatch = query.match(/(?:create|make|generate).*?(?:doc|document).*?(?:titled|called|named)\s+["']([^"']+)["']/i);
+      if (titleMatch) {
+        docTitle = titleMatch[1];
+      } else {
+        // Try to extract topic from query
+        const topicMatch = query.match(/(?:about|on|for)\s+["']?([^"']+?)["']?(?:\s+and|\s*$)/i);
+        if (topicMatch) {
+          docTitle = topicMatch[1];
+        }
+      }
+      
+      console.log(`[DocsAgent] 📝 Creating document: "${docTitle}"`);
+      
+      // Step 1: Create document
+      const doc = await docsService.createDocument(userId, docTitle, '');
+      
+      console.log(`[DocsAgent] ✅ Document created: ${doc.documentId}`);
+      
+      // Step 2: Add research content
+      let contentToAdd = researchContent.content;
+      
+      // Add sources at the end if provided
+      if (researchContent.sources && researchContent.sources.length > 0) {
+        contentToAdd += '\n\n---\n\n## Sources\n\n';
+        researchContent.sources.forEach((source, index) => {
+          contentToAdd += `${index + 1}. [${source.title}](${source.url})\n`;
+        });
+      }
+      
+      console.log(`[DocsAgent] 📄 Adding content (${contentToAdd.length} chars)...`);
+      
+      await docsService.appendFormattedText(userId, doc.documentId, contentToAdd);
+      
+      console.log(`[DocsAgent] ✅ Content added successfully`);
+      
+      // Return in old format for compatibility
+      return {
+        success: true,
+        response: `Document "${docTitle}" created successfully with research content. URL: ${doc.documentUrl}`,
+        tools_used: [
+          { name: 'createDocument' },
+          { name: 'appendFormattedText' }
+        ],
+        raw_results: [
+          {
+            success: true,
+            documentId: doc.documentId,
+            url: doc.documentUrl,
+            title: doc.title,
+            createdAt: new Date().toISOString()
+          },
+          {
+            success: true,
+            documentId: doc.documentId,
+            message: 'Formatted content appended successfully'
+          }
+        ],
+        conversationHistory: context.conversationHistory || [],
+        totalSteps: 2,
+        errors: [],
+        renderMode: true  // Flag to indicate this was render-only mode
+      };
+      
+    } catch (error) {
+      console.error(`[DocsAgent] ❌ Error in render-only mode:`, error.message);
+      return {
+        success: false,
+        response: `Failed to create document: ${error.message}`,
+        tools_used: [],
+        raw_results: [],
+        conversationHistory: context.conversationHistory || [],
+        totalSteps: 0,
+        errors: [{ error: error.message }]
+      };
+    }
   }
 }
 
