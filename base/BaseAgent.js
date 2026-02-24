@@ -304,6 +304,25 @@ class BaseAgent {
    * @throws {Error} - If validation fails
    */
   validateParameters(params, toolName) {
+    // ✅ STEP 1: Pre-execution validation (validate BEFORE tool execution)
+    const { validateToolParameters, getValidationErrorMessage } = require('../utils/toolParameterValidator');
+    
+    try {
+      validateToolParameters(toolName, params);
+    } catch (error) {
+      // Validation failed - throw user-friendly error
+      const userMessage = getValidationErrorMessage(toolName, error);
+      console.error(`[${this.agentName}] ❌ Pre-execution validation failed for ${toolName}:`, error.message);
+      
+      // Throw error with user-friendly message
+      const validationError = new Error(userMessage);
+      validationError.code = error.code || 'VALIDATION_ERROR';
+      validationError.userMessage = userMessage;
+      validationError.isValidationError = true;
+      throw validationError;
+    }
+    
+    // ✅ STEP 2: Check for placeholders (existing validation)
     const paramString = JSON.stringify(params);
 
     // Check for common placeholder patterns

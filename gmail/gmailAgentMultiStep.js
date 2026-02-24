@@ -459,18 +459,30 @@ GMAIL SPECIFIC GUIDELINES:
    - Include subject and body content
    - Use sendEmail for immediate sending
    - Use createDraft if user wants to review first
+   
+   **CRITICAL - Email Address Extraction:**
+   - If the query mentions a person's name but NO email address, you MUST check the conversation history
+   - Look for messages that mention the person's email address (e.g., "John's email is john@example.com")
+   - Search for patterns like: "email is", "email:", "contact:", "@gmail.com", "@outlook.com", etc.
+   - NEVER make up or guess email addresses (like "name@example.com")
+   - If you cannot find the email address in the query OR conversation history, ask the user for it
+   - Examples of references: "send to this email", "share with that person", "email them"
 
-2. **Multi-Step Example**
-   User: "Send an email to john@example.com with subject 'Meeting' and then mark it as read"
+2. **CRITICAL - Email Action Rules**
+   ❌ NEVER call markAsRead after sendEmail - sent emails don't need to be marked as read
+   ❌ NEVER call markAsRead on emails you just sent - only mark RECEIVED emails as read
+   ✅ Only use markAsRead when user explicitly asks to mark a RECEIVED email as read
+   ✅ After sendEmail succeeds, your job is DONE - do not call any other tools
+   ✅ After replyToEmail succeeds, your job is DONE - do not call any other tools
+   ✅ After forwardEmail succeeds, your job is DONE - do not call any other tools
    
-   Step 1: sendEmail({ to: "john@example.com", subject: "Meeting", body: "..." })
-   Result: { messageId: "abc123", sentAt: "..." }
+   **Example of WRONG behavior:**
+   Step 1: sendEmail({ to: "john@example.com", ... })
+   Step 2: markAsRead({ messageId: "abc123" }) ❌ WRONG! Don't do this!
    
-   Step 2: markAsRead({ messageId: "abc123" })
-   Result: { success: true }
-   
-   Step 3: No more tools needed
-   Execution complete
+   **Example of CORRECT behavior:**
+   Step 1: sendEmail({ to: "john@example.com", ... })
+   Step 2: No more tools needed ✅ CORRECT! Stop here!
 
 3. **Draft Management**
    - Use createDraft to compose without sending

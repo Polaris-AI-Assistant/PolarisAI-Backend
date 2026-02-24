@@ -29,8 +29,15 @@ class SheetsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[SheetsAgent] 📊 Creating spreadsheet: "${params.title}"`);
           try {
-            const sheet = await sheetsService.createSpreadsheet(context.userId, params.title, params.locale);
+            const result = await sheetsService.createSpreadsheet(context.userId, params.title, params.locale);
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to create spreadsheet');
+            }
+            
+            const sheet = result.spreadsheet;
             console.log(`[SheetsAgent] ✅ Spreadsheet created: ${sheet.spreadsheetId}`);
+            
             return {
               success: true,
               spreadsheetId: sheet.spreadsheetId,
@@ -64,9 +71,20 @@ class SheetsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[SheetsAgent] 📄 Adding sheet: "${params.sheetTitle}"`);
           try {
-            const sheet = await sheetsService.addSheet(context.userId, params.spreadsheetId, params.sheetTitle);
+            const result = await sheetsService.addSheet(context.userId, params.spreadsheetId, params.sheetTitle);
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to add sheet');
+            }
+            
+            const sheet = result.sheet;
             console.log(`[SheetsAgent] ✅ Sheet added successfully`);
-            return { success: true, sheetId: sheet.properties.sheetId, title: sheet.properties.title };
+            
+            return { 
+              success: true, 
+              sheetId: sheet.properties.sheetId, 
+              title: sheet.properties.title 
+            };
           } catch (error) {
             console.error(`[SheetsAgent] ❌ Error adding sheet:`, error.message);
             throw error;
@@ -85,7 +103,16 @@ class SheetsAgentMultiStep extends BaseAgent {
               properties: {
                 spreadsheetId: { type: 'string', description: 'Spreadsheet ID' },
                 range: { type: 'string', description: 'Range (e.g., "Sheet1!A1:C3")', default: 'Sheet1!A1' },
-                values: { type: 'array', description: 'Array of rows with data' }
+                values: { 
+                  type: 'array', 
+                  description: 'Array of rows with data (each row is an array of cell values)',
+                  items: {
+                    type: 'array',
+                    items: {
+                      type: 'string'
+                    }
+                  }
+                }
               },
               required: ['spreadsheetId', 'values']
             }
@@ -94,9 +121,25 @@ class SheetsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[SheetsAgent] 📝 Adding data to spreadsheet`);
           try {
-            await sheetsService.addData(context.userId, params.spreadsheetId, params.range, params.values);
+            const result = await sheetsService.updateValues(
+              context.userId, 
+              params.spreadsheetId, 
+              params.range || 'Sheet1!A1', 
+              params.values
+            );
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to add data');
+            }
+            
             console.log(`[SheetsAgent] ✅ Data added successfully`);
-            return { success: true, spreadsheetId: params.spreadsheetId, rowsAdded: params.values.length };
+            return { 
+              success: true, 
+              spreadsheetId: params.spreadsheetId, 
+              rowsAdded: params.values.length,
+              updatedCells: result.updatedCells,
+              updatedRange: result.updatedRange
+            };
           } catch (error) {
             console.error(`[SheetsAgent] ❌ Error adding data:`, error.message);
             throw error;
@@ -115,7 +158,16 @@ class SheetsAgentMultiStep extends BaseAgent {
               properties: {
                 spreadsheetId: { type: 'string', description: 'Spreadsheet ID' },
                 range: { type: 'string', description: 'Range to update' },
-                values: { type: 'array', description: 'New values' }
+                values: { 
+                  type: 'array', 
+                  description: 'New values (array of rows, each row is an array of cell values)',
+                  items: {
+                    type: 'array',
+                    items: {
+                      type: 'string'
+                    }
+                  }
+                }
               },
               required: ['spreadsheetId', 'range', 'values']
             }
@@ -124,9 +176,24 @@ class SheetsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[SheetsAgent] 🔄 Updating data in spreadsheet`);
           try {
-            await sheetsService.updateData(context.userId, params.spreadsheetId, params.range, params.values);
+            const result = await sheetsService.updateValues(
+              context.userId, 
+              params.spreadsheetId, 
+              params.range, 
+              params.values
+            );
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to update data');
+            }
+            
             console.log(`[SheetsAgent] ✅ Data updated successfully`);
-            return { success: true, spreadsheetId: params.spreadsheetId };
+            return { 
+              success: true, 
+              spreadsheetId: params.spreadsheetId,
+              updatedCells: result.updatedCells,
+              updatedRange: result.updatedRange
+            };
           } catch (error) {
             console.error(`[SheetsAgent] ❌ Error updating data:`, error.message);
             throw error;
@@ -153,9 +220,24 @@ class SheetsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[SheetsAgent] 🗑️ Deleting data from spreadsheet`);
           try {
-            await sheetsService.deleteData(context.userId, params.spreadsheetId, params.range);
+            // To delete data, we update the range with empty values
+            const result = await sheetsService.updateValues(
+              context.userId, 
+              params.spreadsheetId, 
+              params.range, 
+              [[]]  // Empty array to clear the range
+            );
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to delete data');
+            }
+            
             console.log(`[SheetsAgent] ✅ Data deleted successfully`);
-            return { success: true, spreadsheetId: params.spreadsheetId };
+            return { 
+              success: true, 
+              spreadsheetId: params.spreadsheetId,
+              clearedRange: result.updatedRange
+            };
           } catch (error) {
             console.error(`[SheetsAgent] ❌ Error deleting data:`, error.message);
             throw error;

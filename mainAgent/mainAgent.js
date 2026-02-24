@@ -42,6 +42,7 @@ const MapsAgentMultiStep = require('../maps/mapsAgentMultiStep');
 const WebSearchAgentMultiStep = require('../websearch/webSearchAgentMultiStep');
 const MicrosoftAgentMultiStep = require('../microsoft/microsoftAgentMultiStep');
 const WeatherAgentMultiStep = require('../weather/weatherAgentMultiStep');
+const SchedulesAgentMultiStep = require('../schedules/schedulesAgentMultiStep');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 const { TimelineEmitter, TimelineEventType, AGENT_NAMES } = require('./timelineEvents');
@@ -68,6 +69,9 @@ const {
     MEMORY_CONFIG
 } = require('../memory/memoryService');
 
+// Timezone detection
+const { getUserTimezone } = require('../utils/timezoneDetection');
+
 class MainAgent {
   constructor() {
     // Initialize OpenAI client
@@ -88,7 +92,8 @@ class MainAgent {
       maps: new MapsAgentMultiStep(),
       websearch: new WebSearchAgentMultiStep(),
       microsoft: new MicrosoftAgentMultiStep(),
-      weather: new WeatherAgentMultiStep(this.openai)
+      weather: new WeatherAgentMultiStep(this.openai),
+      schedules: new SchedulesAgentMultiStep(this.openai)
     };
 
     // System prompt for the main coordinator
@@ -250,6 +255,16 @@ class MainAgent {
     return `${cfg.label} is not connected. Please connect it first (${cfg.connectHint}) and try again.`;
   }
 
+  _detectUserTimezone(userLocation = null) {
+    // Try to detect timezone from user location or use a sensible default
+    const timezone = getUserTimezone({
+      userLocation: userLocation,
+      defaultTimezone: 'Asia/Kolkata' // Default to IST since your users seem to be in India
+    });
+    console.log(`[MainAgent] 🌍 Detected user timezone: ${timezone}`);
+    return timezone;
+  }
+
   _sanitizeErrorForUser(agentName, rawMessage) {
     const msg = String(rawMessage || '');
     const lower = msg.toLowerCase();
@@ -369,7 +384,43 @@ class MainAgent {
         const errors = {};
         const storedArtifacts = [];
         
+        // ✅ CRITICAL: Use initial results from non-confirmation agents that were already executed
+        if (initialResults && Object.keys(initialResults).length > 0) {
+          console.log(`[MainAgent] 📦 Using initial results from: ${Object.keys(initialResults).join(', ')}`);
+          Object.assign(results, initialResults);
+          
+          // Also extract artifacts from initial results
+          for (const [agentName, agentResult] of Object.entries(initialResults)) {
+            if (agentResult.success && agentResult.tools_used) {
+              for (let i = 0; i < agentResult.tools_used.length; i++) {
+                const tool = agentResult.tools_used[i];
+                try {
+                  const rawResult = agentResult.raw_results?.[i] || agentResult.raw_results?.find(r => r.success !== false) || agentResult;
+                  const artifact = await extractAndStoreArtifact(
+                    conversationId,
+                    agentName,
+                    tool.name || tool,
+                    rawResult
+                  );
+                  if (artifact) {
+                    storedArtifacts.push(artifact);
+                    console.log(`[MainAgent] ✅ Artifact from initial results: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+                  }
+                } catch (artifactError) {
+                  console.error(`[MainAgent] ⚠️ Error extracting artifact from initial results:`, artifactError);
+                }
+              }
+            }
+          }
+        }
+        
         for (const currentAgentName of originalAnalysis.agents) {
+          // ✅ CRITICAL: Skip agents that were already executed in initial phase
+          if (initialResults && initialResults[currentAgentName]) {
+            console.log(`[MainAgent] ⏭️ Skipping ${currentAgentName} - already executed in initial phase`);
+            continue;
+          }
+          
           try {
             let agentQuery = originalAnalysis.queries[currentAgentName];
             console.log(`[MainAgent] 🔄 Executing ${currentAgentName} sequentially with query: "${agentQuery}"`);
@@ -390,7 +441,11 @@ class MainAgent {
               userId: userId,  // Explicitly use the userId parameter
               conversationHistory: conversationHistory,
               conversationId: conversationId,
-              ...(currentAgentName === 'maps' && pendingAction.userLocation ? { userLocation: pendingAction.userLocation } : {})
+              ...(currentAgentName === 'maps' && pendingAction.userLocation ? { userLocation: pendingAction.userLocation } : {}),
+              // Add timezone for schedules agent
+              ...(currentAgentName === 'schedules' ? { 
+                timezone: pendingAction.userTimezone || this._detectUserTimezone(pendingAction.userLocation) 
+              } : {})
             };
             
             // Enrich query with previous results (for sequential execution)
@@ -413,10 +468,67 @@ class MainAgent {
             
             // If this is the confirmed agent, force the specific tool execution
             if (currentAgentName === agentName) {
-              agentOptions.forceToolExecution = {
-                toolName,
-                params
-              };
+              // ✅ CRITICAL: Check if this is a deferred email that needs regeneration
+              if ((toolName === 'sendEmail' || toolName === 'microsoft_sendEmail') && params._deferredGeneration) {
+                console.log(`[MainAgent] 🔄 Deferred email detected - regenerating with actual details before execution`);
+                
+                // Find the previous agent's result to extract artifact details
+                const previousAgentNames = originalAnalysis.agents.slice(0, originalAnalysis.agents.indexOf(currentAgentName));
+                let previousArtifact = null;
+                let previousResult = null;
+                
+                // Get the most recent artifact from previous agents
+                for (const prevAgentName of previousAgentNames.reverse()) {
+                  if (results[prevAgentName] && storedArtifacts.length > 0) {
+                    previousArtifact = storedArtifacts[storedArtifacts.length - 1];
+                    previousResult = results[prevAgentName];
+                    break;
+                  }
+                }
+                
+                if (previousArtifact || previousResult) {
+                  console.log(`[MainAgent] 📧 Enhancing email with previous result from ${previousAgentNames[previousAgentNames.length - 1]}`);
+                  
+                  // Create a mock email action to pass to enhanceEmailWithPreviousResult
+                  const emailAction = {
+                    agentName: currentAgentName,
+                    toolName: toolName,
+                    params: params
+                  };
+                  
+                  const completedResult = {
+                    agentName: previousAgentNames[previousAgentNames.length - 1],
+                    toolName: null,
+                    result: previousResult,
+                    artifact: previousArtifact
+                  };
+                  
+                  const enhancedEmailAction = await this.enhanceEmailWithPreviousResult(emailAction, completedResult, userId);
+                  
+                  // Use the enhanced params instead of the placeholder params
+                  agentOptions.forceToolExecution = {
+                    toolName,
+                    params: enhancedEmailAction.params
+                  };
+                  
+                  console.log(`[MainAgent] ✅ Email enhanced with actual details:`, {
+                    subject: enhancedEmailAction.params.subject,
+                    bodyPreview: enhancedEmailAction.params.body.substring(0, 100)
+                  });
+                } else {
+                  console.warn(`[MainAgent] ⚠️ No previous artifact found for email enhancement`);
+                  agentOptions.forceToolExecution = {
+                    toolName,
+                    params
+                  };
+                }
+              } else {
+                // Normal forced execution (not a deferred email)
+                agentOptions.forceToolExecution = {
+                  toolName,
+                  params
+                };
+              }
             }
             
             console.log(`[MainAgent] 🔍 agentOptions for ${currentAgentName}:`, { 
@@ -1433,7 +1545,7 @@ ${senderName ? `The sender's name is "${senderName}" — use it in the sign-off 
         
         // If body content is mentioned, regenerate with AI
         if (lowerQuery.includes('body') || lowerQuery.includes('message') || lowerQuery.includes('content')) {
-          const updatedParams = await this.extractEmailParamsWithAI(query, userId);
+          const updatedParams = await this.extractEmailParamsWithAI(query, userId, conversationHistory);
           newParams.body = updatedParams.body;
           if (updatedParams.subject && newParams.subject === pendingAction.params.subject) {
             newParams.subject = updatedParams.subject;
@@ -1955,6 +2067,7 @@ Available agents:
 - websearch: Web search operations (search for current information, news, events, real-time data from the internet). Use when user asks about CURRENT/LATEST/RECENT information, events, news, or anything requiring up-to-date data from the web.
 - microsoft: Microsoft 365 operations (Outlook Mail, Microsoft Calendar, OneDrive, Excel, Microsoft Teams chats/channels, Microsoft Word documents). Use this agent when user mentions "Outlook", "Microsoft", "OneDrive", "Excel", "Teams", "Microsoft Teams", "Word", "Microsoft Word", "Microsoft Calendar", or wants to send email "through Outlook" or "via Outlook". ALSO use for "show my outlook emails", "list my outlook mails", "check my outlook inbox", "list my teams", "show my teams chats", "list word documents".
 - weather: Weather and air quality operations (current weather, forecasts, temperature, precipitation, air quality, weather conditions). Use when user asks about weather, temperature, rain, snow, air quality, or outdoor conditions.
+- schedules: Reminders and scheduled actions (create reminders, schedule future actions, list/delete schedules). Use when user wants to "remind me to...", "set a reminder for...", "schedule a reminder...", or "check it again later". IMPORTANT: Use schedules agent for REMINDERS, use calendar agent for MEETINGS/EVENTS.
 
 CRITICAL RULES for Web Search:
 1. "Do you know about [current event]" → Use websearch agent
@@ -2067,6 +2180,21 @@ CRITICAL - Weather Examples (use weather agent, NOT websearch):
 - "should I bring an umbrella today" -> {"agents": ["weather"], "queries": {"weather": "should I bring an umbrella today"}}
 - "how hot is it in London" -> {"agents": ["weather"], "queries": {"weather": "how hot is it in London"}}
 - "weather in Paris" -> {"agents": ["weather"], "queries": {"weather": "weather in Paris"}}
+
+CRITICAL - Schedules/Reminders Examples (use schedules agent for reminders, NOT calendar):
+- "remind me to check Bitcoin price tomorrow at 2 PM" -> {"agents": ["schedules"], "queries": {"schedules": "remind me to check Bitcoin price tomorrow at 2 PM"}}
+- "set a reminder to call mom on Friday" -> {"agents": ["schedules"], "queries": {"schedules": "set a reminder to call mom on Friday"}}
+- "schedule a reminder to submit report next Monday at 9 AM" -> {"agents": ["schedules"], "queries": {"schedules": "schedule a reminder to submit report next Monday at 9 AM"}}
+- "remind me about the presentation in 2 hours" -> {"agents": ["schedules"], "queries": {"schedules": "remind me about the presentation in 2 hours"}}
+- "check it again tomorrow at 2 PM" -> {"agents": ["schedules"], "queries": {"schedules": "remind me to check it again tomorrow at 2 PM"}}
+- "show my reminders" -> {"agents": ["schedules"], "queries": {"schedules": "show my reminders"}}
+- "list my scheduled reminders" -> {"agents": ["schedules"], "queries": {"schedules": "list my scheduled reminders"}}
+- "cancel my reminder about Bitcoin" -> {"agents": ["schedules"], "queries": {"schedules": "cancel my reminder about Bitcoin"}}
+IMPORTANT: Use schedules for REMINDERS (notifications), use calendar for MEETINGS/EVENTS (calendar entries with attendees, location, etc.)
+
+CRITICAL - Multi-Intent Examples (web search + reminder):
+- "check Bitcoin price and schedule a reminder to check it again tomorrow at 2 PM" -> {"agents": ["websearch", "schedules"], "requiresSequential": true, "queries": {"websearch": "current Bitcoin prices", "schedules": "schedule a reminder to check Bitcoin price again tomorrow at 2 PM"}}
+- "find the latest AI news and remind me to read it tonight" -> {"agents": ["websearch", "schedules"], "requiresSequential": true, "queries": {"websearch": "latest AI news", "schedules": "remind me to read AI news tonight"}}
 
 CRITICAL - Multi-Intent Examples (web search + another action):
 - "search for the latest AI news and email the top 3 articles to john@example.com" -> {"agents": ["websearch", "gmail"], "requiresSequential": true, "queries": {"websearch": "latest AI news", "gmail": "email the top 3 AI news articles to john@example.com"}}
@@ -2255,7 +2383,9 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
               userId,
               conversationId: conversationId,  // ✅ CRITICAL: Pass conversationId to agents
               conversationHistory: conversationHistory,
-              ...(agentName === 'maps' && userLocation ? { userLocation } : {})
+              ...(agentName === 'maps' && userLocation ? { userLocation } : {}),
+              // Add timezone for schedules agent
+              ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {})
             };
             
             // ✅ CRITICAL FIX: Add researchContent to options if it was returned
@@ -2342,7 +2472,9 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
               userId,
               conversationId: conversationId,  // ✅ CRITICAL: Pass conversationId to agents
               conversationHistory: conversationHistory,
-              ...(agentName === 'maps' && userLocation ? { userLocation } : {})
+              ...(agentName === 'maps' && userLocation ? { userLocation } : {}),
+              // Add timezone for schedules agent
+              ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {})
             };
 
             const result = await agent.processQuery(agentQuery, agentOptions);
@@ -3098,6 +3230,22 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
 
       const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery, userId, conversationHistory);
       
+      // ✅ CRITICAL: Check if detection returned an error (e.g., invalid email)
+      if (detectedAction && detectedAction.error) {
+        console.error(`[Confirmation] ❌ Error detecting action for ${agentName}:`, detectedAction.message);
+        if (timeline) {
+          timeline.emitTaskFailed(new Error(detectedAction.message));
+        }
+        return {
+          results: {},
+          errors: {
+            [agentName]: { error: detectedAction.message, query: agentQuery }
+          },
+          storedArtifacts: [],
+          confirmationRequest: null
+        };
+      }
+      
       if (detectedAction) {
         console.log(`[Confirmation] Detected action for ${agentName}:`, JSON.stringify(detectedAction, null, 2));
         
@@ -3470,7 +3618,55 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
           keywords: ['email', 'mail', 'message'],
           toolName: 'sendEmail',
-          extractParams: async (q, userId) => {
+          extractParams: async (q, userId, conversationHistory) => {
+            // ✅ FIRST: Try to extract email address (valid or invalid)
+            const { validateEmailAddress } = require('../utils/toolParameterValidator');
+            
+            // Try strict regex first (valid emails)
+            let emailMatch = q.match(/(?:to|send.*to|email.*to|mail.*to)\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i);
+            let recipientEmail = emailMatch ? emailMatch[1] : null;
+            
+            // If no valid email found, try to capture invalid attempts
+            if (!recipientEmail) {
+              const invalidEmailMatch = q.match(/(?:to|send.*to|email.*to|mail.*to)\s+([^\s,]+@[^\s,]*)/i);
+              if (invalidEmailMatch) {
+                recipientEmail = invalidEmailMatch[1];
+              } else {
+                // Try even more lenient - anything after "to" that looks email-ish
+                const looseMatch = q.match(/(?:to|send.*to|email.*to|mail.*to)\s+([a-zA-Z0-9._%+-]+(?:@[a-zA-Z0-9.-]*)?)/i);
+                if (looseMatch) {
+                  recipientEmail = looseMatch[1];
+                } else {
+                  // Try without "to" - just look for email-like patterns
+                  const anyEmailMatch = q.match(/\b([a-zA-Z0-9][a-zA-Z0-9._-]*(?:@[a-zA-Z0-9.-]*)?)\b/i);
+                  if (anyEmailMatch && (anyEmailMatch[1].includes('@') || anyEmailMatch[1].includes('-'))) {
+                    recipientEmail = anyEmailMatch[1];
+                  }
+                }
+              }
+            }
+            
+            // ✅ CRITICAL: Validate email IMMEDIATELY if found
+            if (recipientEmail && recipientEmail !== 'pending') {
+              try {
+                recipientEmail = validateEmailAddress(recipientEmail);
+                console.log(`[Confirmation] ✅ Email validated: ${recipientEmail}`);
+              } catch (error) {
+                console.error(`[Confirmation] ❌ Invalid email: ${recipientEmail}`);
+                // Throw error immediately - this will be caught and returned as error object
+                throw new Error(
+                  `Invalid email address: "${recipientEmail}".\n\n` +
+                  (recipientEmail.includes('@') 
+                    ? (recipientEmail.endsWith('@')
+                      ? `The email is incomplete. Missing domain after @\n\nDid you mean:\n• ${recipientEmail.slice(0, -1)}@gmail.com\n• ${recipientEmail.slice(0, -1)}@outlook.com\n• ${recipientEmail.slice(0, -1)}@company.com`
+                      : !recipientEmail.includes('.')
+                      ? `Email domain is missing extension (.com, .org, etc.)\n\nDid you mean:\n• ${recipientEmail}.com\n• ${recipientEmail}.org\n• ${recipientEmail}.net`
+                      : `Please provide a valid email address in the format: name@domain.com`)
+                    : `Email addresses must contain an @ symbol.\n\nDid you mean:\n• ${recipientEmail}@gmail.com\n• ${recipientEmail}@outlook.com\n• ${recipientEmail}@company.com`)
+                );
+              }
+            }
+            
             // ✅ Check if this email depends on another action (like calendar event)
             const hasDependency = q.includes('meeting') || q.includes('event') || q.includes('calendar') || 
                                  q.includes('form') || q.includes('document') || q.includes('sheet') ||
@@ -3479,8 +3675,31 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             if (hasDependency) {
               // ✅ DON'T generate email yet - we don't have the dependency results!
               console.log(`[Confirmation] 📧 Email has dependency - deferring generation`);
-              const emailMatch = q.match(/(?:to|send.*to|email.*to|mail.*to)\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i);
-              const recipientEmail = emailMatch ? emailMatch[1] : 'pending';
+              
+              // ✅ Check conversation history for email if not found in query
+              if (!recipientEmail && conversationHistory && conversationHistory.length > 0) {
+                const recentMessages = conversationHistory.slice(-10);
+                for (const msg of recentMessages.reverse()) {
+                  const historyEmailMatch = msg.content?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+                  if (historyEmailMatch) {
+                    try {
+                      recipientEmail = validateEmailAddress(historyEmailMatch[1]);
+                      console.log(`[Confirmation] ✅ Found and validated email in conversation history: ${recipientEmail}`);
+                      break;
+                    } catch (error) {
+                      console.log(`[Confirmation] ⚠️ Found invalid email in history: ${historyEmailMatch[1]}`);
+                      continue;
+                    }
+                  }
+                }
+              }
+              
+              // ✅ FINAL CHECK: If still no valid email, throw error
+              if (!recipientEmail) {
+                throw new Error(
+                  'No valid email address found.\n\nPlease specify a recipient email address.\n\nExamples:\n• Send email to john@gmail.com about the meeting\n• Email contact@company.com with project update'
+                );
+              }
               
               return {
                 to: recipientEmail,
@@ -3491,7 +3710,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
               };
             } else {
               // No dependency - generate email now
-              return await this.extractEmailParamsWithAI(q, userId);
+              return await this.extractEmailParamsWithAI(q, userId, conversationHistory);
             }
           },
           isAsync: true,  // Changed to async for AI generation
@@ -3532,7 +3751,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
           keywords: ['outlook', 'microsoft', 'hotmail', 'email', 'mail', 'message'],
           toolName: 'microsoft_sendEmail',
-          extractParams: (q, userId) => this.extractMicrosoftEmailParamsWithAI(q, userId),
+          extractParams: (q, userId, conversationHistory) => this.extractMicrosoftEmailParamsWithAI(q, userId, conversationHistory),
           isAsync: true,
           excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox']
         },
@@ -3596,14 +3815,24 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       if (hasAction && hasTarget && !hasExclusion) {
         // Handle async extractors (like forms with AI-generated questions, gmail with AI content)
         // Pass userId for extractors that need it (like gmail for user signature)
-        const inferredParams = pattern.isAsync 
-          ? await pattern.extractParams(agentQuery, userId, conversationHistory)
-          : pattern.extractParams(agentQuery, userId, conversationHistory);
-          
-        return {
-          toolName: pattern.toolName,
-          inferredParams
-        };
+        try {
+          const inferredParams = pattern.isAsync 
+            ? await pattern.extractParams(agentQuery, userId, conversationHistory)
+            : pattern.extractParams(agentQuery, userId, conversationHistory);
+            
+          return {
+            toolName: pattern.toolName,
+            inferredParams
+          };
+        } catch (error) {
+          // ✅ CRITICAL: Catch validation errors and return them as error objects
+          console.error(`[detectConfirmationRequiredAction] ❌ Parameter extraction failed for ${pattern.toolName}:`, error.message);
+          return {
+            error: true,
+            message: error.message || 'Failed to extract parameters',
+            toolName: pattern.toolName
+          };
+        }
       }
     }
 
@@ -4086,10 +4315,26 @@ Respond with ONLY valid JSON, no markdown formatting.`
     const params = { to: '', subject: '', body: '' };
     const lowerQuery = query.toLowerCase();
     
-    // Extract email address
+    // Extract email address - try strict regex first
     const emailMatch = query.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
     if (emailMatch) {
       params.to = emailMatch[1];
+    } else {
+      // ✅ CRITICAL: Try to capture INVALID email attempts too
+      // Look for patterns like "to john@", "to invalid-email", "email to xyz@", etc.
+      const invalidEmailMatch = query.match(/(?:to|send.*to|email.*to|mail.*to)\s+([^\s,]+@[^\s,]*)/i);
+      if (invalidEmailMatch) {
+        // Capture the invalid email so we can show user what they typed wrong
+        params.to = invalidEmailMatch[1];
+        console.log(`[extractEmailParams] ⚠️ Captured potentially invalid email: ${params.to}`);
+      } else {
+        // Try even more lenient pattern - anything after "to" that looks email-ish
+        const looseMatch = query.match(/(?:to|send.*to|email.*to|mail.*to)\s+([a-zA-Z0-9._%+-]+(?:@[a-zA-Z0-9.-]*)?)/i);
+        if (looseMatch) {
+          params.to = looseMatch[1];
+          console.log(`[extractEmailParams] ⚠️ Captured loose email pattern: ${params.to}`);
+        }
+      }
     }
     
     // Parse date/time for better subject formatting
@@ -4278,9 +4523,121 @@ Respond with ONLY valid JSON, no markdown formatting.`
    * Extract email parameters with AI-generated content
    * This generates the actual email content that will be sent, so preview matches reality
    */
-  async extractEmailParamsWithAI(query, userId) {
+  async extractEmailParamsWithAI(query, userId, conversationHistory = []) {
     // First extract basic params using the existing method
     const basicParams = this.extractEmailParams(query);
+    
+    // ✅ CRITICAL: Validate email IMMEDIATELY after extraction
+    const { validateEmailAddress } = require('../utils/toolParameterValidator');
+    
+    if (basicParams.to && basicParams.to !== 'pending' && basicParams.to !== '') {
+      try {
+        basicParams.to = validateEmailAddress(basicParams.to);
+        console.log(`[MainAgent] ✅ Email validated: ${basicParams.to}`);
+      } catch (error) {
+        console.error(`[MainAgent] ❌ Invalid email in query: ${basicParams.to}`);
+        
+        // ✅ Provide helpful error message with suggestions
+        let errorMessage = `Invalid email address: "${basicParams.to}".`;
+        
+        // Check common mistakes and provide suggestions
+        if (!basicParams.to.includes('@')) {
+          errorMessage += `\n\nEmail addresses must contain an @ symbol.\n\nDid you mean:\n• ${basicParams.to}@gmail.com\n• ${basicParams.to}@outlook.com\n• ${basicParams.to}@company.com\n\nWhat's the complete email address?`;
+        } else if (basicParams.to.endsWith('@')) {
+          // Extract username before @
+          const username = basicParams.to.slice(0, -1);
+          errorMessage += `\n\nThe email is incomplete. Missing domain after @\n\nDid you mean:\n• ${username}@gmail.com\n• ${username}@outlook.com\n• ${username}@company.com\n\nWhat's the full email address?`;
+        } else if (!basicParams.to.includes('.')) {
+          // Has @ but no domain extension
+          const parts = basicParams.to.split('@');
+          if (parts.length === 2) {
+            errorMessage += `\n\nEmail domain is missing extension (.com, .org, etc.)\n\nDid you mean:\n• ${parts[0]}@${parts[1]}.com\n• ${parts[0]}@${parts[1]}.org\n• ${parts[0]}@${parts[1]}.net\n\nWhat's the complete domain?`;
+          } else {
+            errorMessage += `\n\nEmail addresses must have a domain extension like .com, .org, etc.\n\nPlease provide a valid email address (e.g., name@domain.com)`;
+          }
+        } else if (basicParams.to.includes(' ')) {
+          const fixed = basicParams.to.replace(/\s+/g, '');
+          errorMessage += `\n\nEmail addresses cannot contain spaces.\n\nDid you mean: ${fixed}?`;
+        } else {
+          errorMessage += `\n\nPlease provide a valid email address in the format: name@domain.com\n\nExamples:\n• john@gmail.com\n• contact@company.com\n• support@example.org`;
+        }
+        
+        throw new Error(errorMessage);
+      }
+    }
+    
+    // ✅ CRITICAL: Check conversation history for email addresses if not found in query
+    if (basicParams.to === 'pending' || basicParams.to === '') {
+      console.log(`[MainAgent] 📧 Email address not found in query, checking conversation history...`);
+      
+      // Look for email addresses in recent conversation
+      const recentMessages = conversationHistory.slice(-10); // Last 10 messages
+      for (const msg of recentMessages.reverse()) {
+        const emailMatch = msg.content?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+        if (emailMatch) {
+          // Validate the email found in history
+          try {
+            basicParams.to = validateEmailAddress(emailMatch[1]);
+            console.log(`[MainAgent] ✅ Found and validated email in conversation history: ${basicParams.to}`);
+            break;
+          } catch (error) {
+            console.log(`[MainAgent] ⚠️ Found invalid email in history: ${emailMatch[1]}, continuing search...`);
+            continue;
+          }
+        }
+      }
+      
+      // Also check for references like "this email", "this mail id", "that email"
+      if (basicParams.to === 'pending' || basicParams.to === '') {
+        const lowerQuery = query.toLowerCase();
+        if (lowerQuery.includes('this email') || lowerQuery.includes('this mail') || 
+            lowerQuery.includes('that email') || lowerQuery.includes('that mail') ||
+            lowerQuery.includes('above email') || lowerQuery.includes('above mail')) {
+          // Look for the most recent email mentioned
+          for (const msg of recentMessages.reverse()) {
+            const emailMatch = msg.content?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+            if (emailMatch) {
+              try {
+                basicParams.to = validateEmailAddress(emailMatch[1]);
+                console.log(`[MainAgent] ✅ Resolved reference to email: ${basicParams.to}`);
+                break;
+              } catch (error) {
+                console.log(`[MainAgent] ⚠️ Found invalid email reference: ${emailMatch[1]}, continuing search...`);
+                continue;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // ✅ FINAL CHECK: If still no valid email, throw error immediately
+    if (!basicParams.to || basicParams.to === 'pending' || basicParams.to === '') {
+      console.error(`[MainAgent] ❌ No valid email address found`);
+      throw new Error(
+        'No valid email address found.\n\nPlease specify a recipient email address.\n\nExamples:\n• Send email to john@gmail.com about the meeting\n• Email contact@company.com with project update\n• Send message to support@example.org'
+      );
+    }
+    
+    // ✅ NEW: Check for ambiguous content references
+    const lowerQuery = query.toLowerCase();
+    const hasAmbiguousReference = lowerQuery.match(/email\s+(this|that|it)\s+to/i) || 
+                                  lowerQuery.match(/send\s+(this|that|it)\s+to/i);
+    
+    if (hasAmbiguousReference) {
+      const reference = hasAmbiguousReference[1];
+      console.warn(`[MainAgent] ⚠️ Ambiguous content reference: "${reference}"`);
+      
+      // Check if there's any context about what "this" refers to
+      const hasSubject = query.match(/about|subject|regarding/i);
+      const hasContent = query.match(/message|content|body|text/i);
+      
+      if (!hasSubject && !hasContent) {
+        throw new Error(
+          `What should I email?\n\n"${reference}" is unclear. I need to know what content to send.\n\nPlease specify:\n• The email subject (e.g., "about the meeting")\n• The message content (e.g., "with project update")\n• Or reference a specific document/message\n\nExample:\n• Email this to john@gmail.com about the quarterly report\n• Send this to contact@company.com with meeting notes`
+        );
+      }
+    }
     
     try {
       console.log(`[MainAgent] Generating AI email content for preview...`);
@@ -4441,9 +4798,43 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
    * Extract Microsoft Outlook email parameters with AI-generated content
    * Similar to extractEmailParamsWithAI but uses Microsoft profile data
    */
-  async extractMicrosoftEmailParamsWithAI(query, userId) {
+  async extractMicrosoftEmailParamsWithAI(query, userId, conversationHistory = []) {
     // First extract basic params using the existing method
     const basicParams = this.extractEmailParams(query);
+    
+    // ✅ CRITICAL: Check conversation history for email addresses if not found in query
+    if (basicParams.to === 'pending' || basicParams.to === '') {
+      console.log(`[MainAgent] 📧 Email address not found in query, checking conversation history...`);
+      
+      // Look for email addresses in recent conversation
+      const recentMessages = conversationHistory.slice(-10); // Last 10 messages
+      for (const msg of recentMessages.reverse()) {
+        const emailMatch = msg.content?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+        if (emailMatch) {
+          basicParams.to = emailMatch[1];
+          console.log(`[MainAgent] ✅ Found email in conversation history: ${basicParams.to}`);
+          break;
+        }
+      }
+      
+      // Also check for references like "this email", "this mail id", "that email"
+      if (basicParams.to === 'pending' || basicParams.to === '') {
+        const lowerQuery = query.toLowerCase();
+        if (lowerQuery.includes('this email') || lowerQuery.includes('this mail') || 
+            lowerQuery.includes('that email') || lowerQuery.includes('that mail') ||
+            lowerQuery.includes('above email') || lowerQuery.includes('above mail')) {
+          // Look for the most recent email mentioned
+          for (const msg of recentMessages.reverse()) {
+            const emailMatch = msg.content?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+            if (emailMatch) {
+              basicParams.to = emailMatch[1];
+              console.log(`[MainAgent] ✅ Resolved reference to email: ${basicParams.to}`);
+              break;
+            }
+          }
+        }
+      }
+    }
     
     try {
       console.log(`[MainAgent] Generating AI email content for Microsoft Outlook...`);
@@ -4668,11 +5059,23 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
       const languageName = languageDetection.getLanguageName(detectedLanguage);
       console.log(`[MainAgent] 🌐 streamConfirmedActionResponse using language: ${languageName} (${detectedLanguage})`);
       
-      // ✅ NEW: Combine initialResults with the confirmed action result
-      const allResults = {
-        ...initialResults,  // Results from non-confirmation agents (e.g., weather)
-        [agentName]: result  // Result from confirmed agent (e.g., calendar)
-      };
+      // ✅ CRITICAL: Combine initialResults with execution results
+      // For sequential multi-agent tasks, use 'results' (all agents)
+      // For single agent tasks, use 'result' (one agent)
+      let allResults;
+      if (results && typeof results === 'object' && Object.keys(results).length > 0) {
+        // Sequential multi-agent execution: results contains all agents
+        allResults = {
+          ...initialResults,  // Results from non-confirmation agents executed in parallel
+          ...results  // Results from all agents in sequential execution
+        };
+      } else {
+        // Single agent execution
+        allResults = {
+          ...initialResults,  // Results from non-confirmation agents
+          [agentName]: result  // Result from confirmed agent
+        };
+      }
       
       console.log(`[MainAgent] 📊 Combined results from agents: ${Object.keys(allResults).join(', ')}`);
 
@@ -4690,7 +5093,7 @@ Do NOT say "let me know if you need anything else" - there's still more to do.`;
       try {
         // ✅ CRITICAL: Handle sequential multi-agent execution results
         if (results && typeof results === 'object' && !result) {
-          // Sequential multi-agent execution: results = { websearch: {...}, docs: {...}, ... }
+          // Sequential multi-agent execution: results = { websearch: {...}, docs: {...}, sheets: {...}, ... }
           const safeResults = {};
           for (const [agentKey, agentResult] of Object.entries(results)) {
             const rawResult = agentResult?.raw_results?.[0] || {};
@@ -4704,6 +5107,13 @@ Do NOT say "let me know if you need anything else" - there's still more to do.`;
               formId: rawResult.formId || agentResult?.formId,
               eventId: rawResult.eventId || agentResult?.eventId,
               messageId: rawResult.messageId || agentResult?.messageId,
+              // Sheets-specific fields
+              spreadsheetId: rawResult.spreadsheetId || agentResult?.spreadsheetId,
+              spreadsheetUrl: rawResult.url || agentResult?.url,
+              rowsAdded: rawResult.rowsAdded || agentResult?.rowsAdded,
+              // Schedules-specific fields
+              scheduleId: rawResult.scheduleId || agentResult?.scheduleId,
+              nextExecution: rawResult.nextExecutionLocal || rawResult.nextExecution,
             };
           }
           resultString = JSON.stringify(safeResults, null, 2);
@@ -4759,11 +5169,26 @@ Multiple actions were performed:
 
 ${Object.entries(allResults).map(([agent, agentResult]) => {
   const rawResult = agentResult?.raw_results?.[0] || agentResult || {};
+  
+  // Extract websearch synthesized content if available
+  let websearchContent = null;
+  if (agent === 'websearch' && agentResult?.executedActions) {
+    const researchAction = agentResult.executedActions.find(
+      action => action.tool === 'researchAndSynthesize' || action.tool === 'fetchAndSynthesize'
+    );
+    if (researchAction?.result?.synthesizedContent) {
+      websearchContent = researchAction.result.synthesizedContent;
+    }
+  }
+  
   return `${agent.toUpperCase()} Agent:
 ${JSON.stringify({
   success: agentResult?.success,
   response: agentResult?.response,
   summary: agentResult?.summary,
+  // Websearch-specific
+  synthesizedContent: websearchContent,
+  sourcesUsed: rawResult.sourcesUsed,
   // Weather-specific
   temperature: rawResult.current_weather?.temperature,
   weather_description: rawResult.current_weather?.description,
@@ -4771,6 +5196,13 @@ ${JSON.stringify({
   // Calendar-specific
   eventId: rawResult.eventId,
   eventLink: rawResult.eventLink,
+  // Schedules-specific
+  scheduleId: rawResult.scheduleId,
+  nextExecution: rawResult.nextExecutionLocal || rawResult.nextExecution,
+  // Sheets-specific
+  spreadsheetId: rawResult.spreadsheetId,
+  spreadsheetUrl: rawResult.url,
+  rowsAdded: rawResult.rowsAdded,
   // Other fields
   documentId: rawResult.documentId,
   formId: rawResult.formId,
@@ -4782,16 +5214,21 @@ ${chainContext}
 Please provide a natural, conversational response that:
 1. Addresses ALL parts of the user's original request
 2. Presents information from ALL agents that executed
-3. For weather: Include temperature, conditions, and location
-4. For calendar: Confirm event creation with details (title, date, time) and link
-5. For other actions: Include relevant details and links
-6. Is friendly and helpful in tone
-7. Combines all information naturally without repetition
-${nextConfirmation ? '8. Briefly mention that you will now proceed with the next action' : ''}
+3. For websearch: Present the synthesizedContent (which contains the complete research findings)
+4. For weather: Include temperature, conditions, and location
+5. For calendar: Confirm event creation with details (title, date, time) and link
+6. For schedules: Confirm reminder/scheduled action with the scheduled time
+7. For sheets: Confirm spreadsheet creation with link and data added
+8. For other actions: Include relevant details and links
+9. Is friendly and helpful in tone
+10. Combines all information naturally without repetition
+${nextConfirmation ? '11. Briefly mention that you will now proceed with the next action' : ''}
 
 IMPORTANT: 
 - Present ALL information from all agents in a cohesive response
-- Don't just focus on the confirmed action - include weather, maps, or other data too
+- For websearch: The synthesizedContent field contains complete markdown-formatted research - present it naturally
+- For sheets: If spreadsheetId and spreadsheetUrl are present, the spreadsheet WAS created successfully - include the link
+- Don't just focus on the confirmed action - include websearch results, weather, maps, schedules, or other data too
 - If success=true, the action DID complete successfully
 - Include clickable links where available
 
@@ -4866,7 +5303,34 @@ Detect the EXACT language of the "Original Query" above and respond ENTIRELY in 
       }).join('\n\n');
 
       const agentErrors = Object.entries(errors).map(([agent, error]) => {
-        return `${agent.toUpperCase()} Agent Error: ${error}`;
+        // ✅ FIX: Extract actual error message, not [object Object]
+        let errorMessage = '';
+        
+        if (typeof error === 'string') {
+          errorMessage = error;
+        } else if (error && error.error) {
+          // Error object with 'error' property
+          errorMessage = error.error;
+        } else if (error && error.message) {
+          // Error object with 'message' property
+          errorMessage = error.message;
+        } else if (error && typeof error === 'object') {
+          // Try to stringify if it's an object
+          errorMessage = JSON.stringify(error);
+        } else {
+          errorMessage = 'Unknown error occurred';
+        }
+        
+        // ✅ FIX: For validation errors, don't mention "Agent Error"
+        // These are user input errors, not agent execution errors
+        if (errorMessage.includes('Invalid email') || 
+            errorMessage.includes('No valid email') ||
+            errorMessage.includes('Missing required field') ||
+            errorMessage.includes('validation')) {
+          return `Input Validation Error: ${errorMessage}`;
+        }
+        
+        return `${agent.toUpperCase()} Agent Error: ${errorMessage}`;
       }).join('\n');
 
       // Build artifact context for the prompt
@@ -4902,7 +5366,16 @@ ${memoryContext ? `\n--- Long-Term Memories ---\n${memoryContext}\n(Use these me
 ${fileContextSection}
 
 CRITICAL INSTRUCTION - Response Style:
-${fileContext && fileContext.filesProcessed > 0 ? `
+${agentErrors && agentErrors.includes('Input Validation Error') ? `
+⚠️ This is a VALIDATION ERROR (user input issue, NOT an agent execution error).
+- DO NOT say "I encountered an error with the [agent name] agent"
+- DO NOT say "the agent failed" or "agent error occurred"
+- DO NOT mention technical details or agent names
+- The error message already contains user-friendly suggestions
+- Simply present the error message clearly and ask the user to provide correct information
+- Keep it SHORT and HELPFUL
+- Example: "I noticed the email address 'john@' is incomplete. [suggestions from error message]"
+` : fileContext && fileContext.filesProcessed > 0 ? `
 📎 The user has attached files. Focus on ANALYZING and RESPONDING to the file content.
 - Read and understand the file content provided in the system context
 - For documents: summarize, extract key points, answer questions about the content
