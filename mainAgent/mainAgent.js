@@ -265,9 +265,74 @@ class MainAgent {
     return timezone;
   }
 
+  /**
+   * Validate agents before execution
+   * Checks for validation errors that should stop execution immediately
+   * @param {object} analysis - Agent analysis result
+   * @param {string} query - Original user query
+   * @returns {object} - { hasErrors: boolean, errorMessage: string }
+   */
+  async _validateAgentsBeforeExecution(analysis, query) {
+    const { validateScheduleReminder, formatScheduleValidationErrors } = require('../utils/validation');
+    
+    // Check each agent for validation requirements
+    for (const agentName of analysis.agents) {
+      const agentQuery = analysis.queries[agentName];
+      
+      // ============================================================
+      // ✅ VALIDATE SCHEDULES/REMINDERS
+      // ============================================================
+      if (agentName === 'schedules') {
+        console.log('[MainAgent] 🔍 Pre-validating schedule/reminder parameters...');
+        
+        // Extract content from query (simple heuristic)
+        const reminderMatch = agentQuery.match(/remind(?:\s+me)?\s+(?:to\s+)?(.+?)(?:\s+(?:at|on|in|for|tomorrow|today|yesterday))/i);
+        const content = reminderMatch ? reminderMatch[1].trim() : agentQuery;
+        
+        const validation = validateScheduleReminder({
+          content: content,
+          datetime: agentQuery,
+          query: agentQuery
+        });
+        
+        console.log('[MainAgent] 📊 Schedule validation result:', JSON.stringify(validation, null, 2));
+        
+        if (!validation.isValid) {
+          console.log('[MainAgent] ❌ Schedule validation failed:', validation.errors);
+          
+          const errorMessage = formatScheduleValidationErrors(validation.errors);
+          
+          return {
+            hasErrors: true,
+            errorMessage: errorMessage,
+            agentName: agentName
+          };
+        }
+        
+        console.log('[MainAgent] ✅ Schedule validation passed');
+      }
+    }
+    
+    // No validation errors found
+    return {
+      hasErrors: false,
+      errorMessage: null
+    };
+  }
+
   _sanitizeErrorForUser(agentName, rawMessage) {
     const msg = String(rawMessage || '');
     const lower = msg.toLowerCase();
+
+    // ✅ CRITICAL: Preserve validation error messages (they are user-friendly)
+    if (msg.includes('I noticed you mentioned') || 
+        msg.includes('That time has already passed') ||
+        msg.includes('Did you mean:') ||
+        msg.includes('Which option would you prefer?') ||
+        msg.includes('Which time would you prefer?')) {
+      console.log('[MainAgent] 📝 Preserving validation error message');
+      return msg;
+    }
 
     if (lower.includes('tokens not found') || lower.includes('user tokens not found')) {
       return this._friendlyIntegrationError(agentName);
@@ -296,6 +361,44 @@ class MainAgent {
   checkForConfirmationRequired(agentName, toolName, params, userId, query, conversationHistory = []) {
     if (!confirmationUtils.requiresConfirmation(agentName, toolName)) {
       return null;
+    }
+
+    // ============================================================
+    // ✅ VALIDATE PARAMETERS BEFORE SHOWING CONFIRMATION
+    // ============================================================
+    if (agentName === 'calendar' && (toolName === 'createEvent' || toolName === 'updateEvent')) {
+      const { validateCalendarEvent, formatCalendarValidationErrors } = require('../utils/validation');
+      
+      console.log('[MainAgent] 🔍 Validating calendar event parameters...');
+      console.log('[MainAgent] 📝 Parameters:', JSON.stringify(params, null, 2));
+      
+      const validation = validateCalendarEvent({
+        summary: params.summary,
+        startDateTime: params.startDateTime,
+        endDateTime: params.endDateTime,
+        query: query
+      });
+      
+      console.log('[MainAgent] 📊 Validation result:', JSON.stringify(validation, null, 2));
+      
+      if (!validation.isValid) {
+        console.log('[MainAgent] ❌ Calendar event validation failed:', validation.errors);
+        
+        const errorMessage = formatCalendarValidationErrors(validation.errors);
+        
+        console.log('[MainAgent] 📤 Returning validation error to user');
+        
+        // Return validation error instead of confirmation
+        return {
+          type: 'validation_error',
+          agentName,
+          toolName,
+          message: errorMessage,
+          validationErrors: validation.errors
+        };
+      }
+      
+      console.log('[MainAgent] ✅ Calendar event validation passed');
     }
 
     // Preflight: don't even show confirmation if integration isn't connected
@@ -1885,6 +1988,30 @@ Language Detection Rules:
       
       console.log(`[MainAgent] 🎯 Intent Classification:`, JSON.stringify(intentClassification, null, 2));
 
+      // ============================================================
+      // ✅ VALIDATE URLs IN QUERY (BEFORE AGENT ROUTING)
+      // ============================================================
+      const URLValidator = require('../utils/urlValidation');
+      const urlValidation = URLValidator.validateURLsInQuery(query);
+      
+      if (urlValidation.hasURLs && !urlValidation.isValid) {
+        console.log('[MainAgent] ❌ URL validation failed:', urlValidation.invalidURLs);
+        
+        const errorMessage = URLValidator.formatValidationErrors(urlValidation.invalidURLs);
+        
+        // Return error immediately (don't proceed to agent routing)
+        return {
+          agents: [],
+          reasoning: 'URL validation failed - invalid or malformed URL detected',
+          error: errorMessage,
+          validationError: true
+        };
+      }
+      
+      if (urlValidation.hasURLs && urlValidation.isValid) {
+        console.log('[MainAgent] ✅ URL validation passed:', urlValidation.urls.map(u => u.originalURL));
+      }
+
       // Handle web search queries - BUT check if it's part of a multi-step request
       if (intentClassification.type === 'web_search' || intentClassification.requiresWebSearch) {
         // Check if query also contains other actions (e.g., "search for X and email it")
@@ -2329,7 +2456,7 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
    * Now includes artifact storage after successful operations
    * Now passes conversationHistory to agents for context
    */
-  async executeAgentQueries(analysis, userId, conversationId = null, userLocation = null, timeline = null, conversationHistory = []) {
+  async executeAgentQueries(analysis, userId, conversationId = null, userLocation = null, timeline = null, conversationHistory = [], query = '') {
     const results = {};
     const errors = {};
     const storedArtifacts = [];
@@ -2769,6 +2896,39 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       // Pass artifact context, memory context, file context, and detected language to analysis for better routing
       const analysis = await this.analyzeQuery(enhancedQuery, options.conversationHistory, artifactContext, memoryContext, options.fileContext, detectedLanguage);
       
+      // ✅ CRITICAL: Check if analysis returned a validation error
+      if (analysis.validationError && analysis.error) {
+        console.log('[MainAgent] ⚠️ Validation error detected in streaming mode');
+        console.log('[MainAgent] 📝 Error message:', analysis.error);
+        
+        // Stop thinking indicator
+        console.log('[MainAgent] 🛑 Sending thinking stop signal');
+        onChunk({ type: 'thinking', status: 'stop' });
+        
+        // Emit validation error event
+        timeline.emitNarrative('❌ URL validation failed');
+        
+        // Send error message to user
+        console.log('[MainAgent] 📤 Sending error content to user');
+        onChunk({
+          type: 'content',
+          text: analysis.error  // Use 'text' not 'content' for streaming
+        });
+        
+        // Send done signal
+        console.log('[MainAgent] ✅ Sending done signal');
+        onChunk({ type: 'done' });
+        
+        console.log('[MainAgent] 🏁 Validation error handling complete');
+        
+        // Return with validation error flag
+        return { 
+          timelineEvents: timeline.getEvents(), 
+          validationError: true,
+          error: analysis.error
+        };
+      }
+      
       console.log(`\n[MainAgent] 🤖 Query Analysis Result:`);
       console.log(`[MainAgent]   Agents: ${analysis.agents.join(', ')}`);
       console.log(`[MainAgent]   Reasoning: ${analysis.reasoning}`);
@@ -2798,6 +2958,38 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         onChunk({ type: 'status', message: `Coordinating ${analysis.agents.length} agents...` });
       }
 
+      // ============================================================
+      // ✅ PRE-EXECUTION VALIDATION FOR ALL AGENTS
+      // Check for validation errors BEFORE executing agents
+      // ============================================================
+      const preExecutionValidation = await this._validateAgentsBeforeExecution(analysis, enhancedQuery);
+      
+      if (preExecutionValidation.hasErrors) {
+        console.log('[MainAgent] ❌ Pre-execution validation failed');
+        
+        // Stop thinking indicator
+        onChunk({ type: 'thinking', status: 'stop' });
+        
+        // Emit validation error event
+        timeline.emitNarrative('❌ Validation failed');
+        
+        // Send error message to user
+        onChunk({
+          type: 'content',
+          text: preExecutionValidation.errorMessage
+        });
+        
+        // Send done signal
+        onChunk({ type: 'done' });
+        
+        // Return with validation error flag
+        return {
+          timelineEvents: timeline.getEvents(),
+          validationError: true,
+          error: preExecutionValidation.errorMessage
+        };
+      }
+
       // Step 2: Check if any agent actions require confirmation
       // For now, we execute queries and check if any tool in the result needs confirmation
       // This will be enhanced when specialized agents report their intended tools
@@ -2813,6 +3005,33 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
 
       // If a confirmation is required, send confirmation_request and stop
       if (confirmationRequest) {
+        // ✅ CRITICAL: Check if this is a validation error instead of confirmation
+        if (confirmationRequest.type === 'validation_error') {
+          console.log('[MainAgent] ⚠️ Validation error detected, sending error to user');
+          
+          // Stop thinking indicator
+          onChunk({ type: 'thinking', status: 'stop' });
+          
+          // Emit validation error event
+          timeline.emitNarrative('❌ Validation failed');
+          
+          // Send error message to user
+          onChunk({
+            type: 'content',
+            text: confirmationRequest.message
+          });
+          
+          // Send done signal
+          onChunk({ type: 'done' });
+          
+          // Return with validation error flag
+          return {
+            timelineEvents: timeline.getEvents(),
+            validationError: true,
+            error: confirmationRequest.message
+          };
+        }
+        
         onChunk({ type: 'thinking', status: 'stop' });
         
         // Emit confirmation required event
@@ -2849,7 +3068,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           
           onChunk({
             type: 'content',
-            content: completedMessage
+            text: completedMessage  // Use 'text' not 'content' for streaming
           });
         }
         
@@ -3230,19 +3449,21 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
 
       const detectedAction = await this.detectConfirmationRequiredAction(agentName, agentQuery, userId, conversationHistory);
       
-      // ✅ CRITICAL: Check if detection returned an error (e.g., invalid email)
+      // ✅ CRITICAL: Check if detection returned an error (e.g., invalid email, missing content)
       if (detectedAction && detectedAction.error) {
         console.error(`[Confirmation] ❌ Error detecting action for ${agentName}:`, detectedAction.message);
-        if (timeline) {
-          timeline.emitTaskFailed(new Error(detectedAction.message));
-        }
+        
+        // Return as validation_error type so it's sent directly to user
         return {
           results: {},
-          errors: {
-            [agentName]: { error: detectedAction.message, query: agentQuery }
-          },
+          errors: {},
           storedArtifacts: [],
-          confirmationRequest: null
+          confirmationRequest: {
+            type: 'validation_error',
+            agentName,
+            toolName: detectedAction.toolName,
+            message: detectedAction.message
+          }
         };
       }
       
@@ -3297,7 +3518,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           conversationId, 
           userLocation, 
           timeline, 
-          conversationHistory
+          conversationHistory,
+          query
         );
         
         nonConfirmationResults = executionResult.results;
@@ -3380,7 +3602,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           conversationId, 
           userLocation, 
           timeline, 
-          conversationHistory
+          conversationHistory,
+          query
         );
         
         nonConfirmationResults = executionResult.results;
@@ -3424,7 +3647,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
 
     // No confirmation required, proceed with normal execution
     // Pass conversationId for artifact storage, userLocation for Maps agent, and conversationHistory for context
-    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId, userLocation, timeline, conversationHistory);
+    const { results, errors, storedArtifacts } = await this.executeAgentQueries(analysis, userId, conversationId, userLocation, timeline, conversationHistory, query);
     return { results, errors, storedArtifacts, confirmationRequest: null };
   }
 
@@ -3615,8 +3838,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         {
           // Only match when user explicitly wants to SEND an email
           // Exclude read/search/get/show/check/find/what patterns
-          patterns: ['send', 'compose', 'write to', 'email to', 'mail to'],
-          keywords: ['email', 'mail', 'message'],
+          patterns: ['send', 'compose', 'write to', 'email to', 'mail to', 'send email'],
+          keywords: ['email', 'mail', 'message', '@'],  // Added @ to catch email addresses
           toolName: 'sendEmail',
           extractParams: async (q, userId, conversationHistory) => {
             // ✅ FIRST: Try to extract email address (valid or invalid)
@@ -3668,11 +3891,18 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             }
             
             // ✅ Check if this email depends on another action (like calendar event)
+            // BUT only defer if user hasn't provided complete subject AND body
             const hasDependency = q.includes('meeting') || q.includes('event') || q.includes('calendar') || 
                                  q.includes('form') || q.includes('document') || q.includes('sheet') ||
                                  q.includes('link') || q.includes('with its') || q.includes('with the');
             
-            if (hasDependency) {
+            // ✅ CRITICAL: Check if user provided explicit subject and body
+            const hasExplicitSubject = q.match(/(?:with\s+)?subject\s+['""]?(.+?)['""]?(?:\s+and|\s+message|\s*$)/i);
+            const hasExplicitBody = q.match(/(?:and\s+)?message\s+['""]?(.+?)['""]?(?:\s+to|\s*$)/i) ||
+                                   q.match(/saying\s+['""]?(.+?)['""]?(?:\s+to|\s*$)/i);
+            
+            // Only defer if has dependency AND user didn't provide complete content
+            if (hasDependency && (!hasExplicitSubject || !hasExplicitBody)) {
               // ✅ DON'T generate email yet - we don't have the dependency results!
               console.log(`[Confirmation] 📧 Email has dependency - deferring generation`);
               
@@ -3803,16 +4033,34 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
     const agentPatterns = patterns[agentName];
     if (!agentPatterns) return null;
 
+    console.log(`[detectConfirmationRequiredAction] 🔍 Checking ${agentName} with query: "${agentQuery}"`);
+    console.log(`[detectConfirmationRequiredAction] 📋 Found ${agentPatterns.length} patterns to check`);
+
     for (const pattern of agentPatterns) {
       const hasAction = pattern.patterns.some(p => query.includes(p));
       const hasTarget = pattern.keywords.some(k => query.includes(k));
       
       // Check for exclusion patterns - if any exclusion pattern is found, skip this pattern
+      // Use word boundaries to avoid false positives (e.g., "budget" shouldn't match "get")
       const hasExclusion = pattern.excludePatterns 
-        ? pattern.excludePatterns.some(p => query.includes(p))
+        ? pattern.excludePatterns.some(p => {
+            // Create regex with word boundaries to match whole words only
+            const regex = new RegExp(`\\b${p}\\b`, 'i');
+            const matches = regex.test(query);
+            if (matches) {
+              console.log(`[detectConfirmationRequiredAction]       ⚠️ Exclusion pattern matched: "${p}"`);
+            }
+            return matches;
+          })
         : false;
       
+      console.log(`[detectConfirmationRequiredAction]   Tool: ${pattern.toolName}`);
+      console.log(`[detectConfirmationRequiredAction]     hasAction: ${hasAction} (patterns: ${pattern.patterns.join(', ')})`);
+      console.log(`[detectConfirmationRequiredAction]     hasTarget: ${hasTarget} (keywords: ${pattern.keywords.join(', ')})`);
+      console.log(`[detectConfirmationRequiredAction]     hasExclusion: ${hasExclusion}`);
+      
       if (hasAction && hasTarget && !hasExclusion) {
+        console.log(`[detectConfirmationRequiredAction]   ✅ MATCH! Extracting params for ${pattern.toolName}`);
         // Handle async extractors (like forms with AI-generated questions, gmail with AI content)
         // Pass userId for extractors that need it (like gmail for user signature)
         try {
@@ -3820,6 +4068,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             ? await pattern.extractParams(agentQuery, userId, conversationHistory)
             : pattern.extractParams(agentQuery, userId, conversationHistory);
             
+          console.log(`[detectConfirmationRequiredAction]   ✅ Params extracted successfully`);
           return {
             toolName: pattern.toolName,
             inferredParams
@@ -3836,6 +4085,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       }
     }
 
+    console.log(`[detectConfirmationRequiredAction] ❌ No matching pattern found for ${agentName}`);
     return null;
   }
 
@@ -3851,8 +4101,12 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
     // Parse the date part
     const lowerQuery = query.toLowerCase();
     
+    // ✅ CRITICAL: Check for "yesterday" FIRST (before other date checks)
+    if (lowerQuery.includes('yesterday')) {
+      startDate.setDate(startDate.getDate() - 1);
+    }
     // Check for "tomorrow"
-    if (lowerQuery.includes('tomorrow')) {
+    else if (lowerQuery.includes('tomorrow')) {
       startDate.setDate(startDate.getDate() + 1);
     }
     // Check for "today"
@@ -4637,6 +4891,62 @@ Respond with ONLY valid JSON, no markdown formatting.`
           `What should I email?\n\n"${reference}" is unclear. I need to know what content to send.\n\nPlease specify:\n• The email subject (e.g., "about the meeting")\n• The message content (e.g., "with project update")\n• Or reference a specific document/message\n\nExample:\n• Email this to john@gmail.com about the quarterly report\n• Send this to contact@company.com with meeting notes`
         );
       }
+    }
+    
+    // ============================================================
+    // ✅ VALIDATE EMAIL CONTENT BEFORE AI GENERATION
+    // Check if user provided subject and body explicitly
+    // ============================================================
+    const { validateEmailContent, formatEmailValidationErrors } = require('../utils/validation');
+    
+    // ✅ CRITICAL: Extract explicit subject and body from query
+    const explicitSubjectMatch = query.match(/(?:with\s+)?subject\s+['""]?([^'"]+?)['""]?(?:\s+and|\s+message|\s*$)/i);
+    const explicitBodyMatch = query.match(/(?:and\s+)?message\s+['""]?([^'"]+?)['""]?(?:\s*$)/i) ||
+                             query.match(/saying\s+['""]?([^'"]+?)['""]?(?:\s*$)/i);
+    
+    const hasExplicitSubject = explicitSubjectMatch && explicitSubjectMatch[1].trim() !== '';
+    const hasExplicitBody = explicitBodyMatch && explicitBodyMatch[1].trim() !== '';
+    
+    // If user provided BOTH subject and body explicitly, use them directly
+    if (hasExplicitSubject && hasExplicitBody) {
+      console.log('[MainAgent] ✅ User provided complete email content - using exact values');
+      console.log(`[MainAgent]   Subject: "${explicitSubjectMatch[1]}"`);
+      console.log(`[MainAgent]   Body: "${explicitBodyMatch[1]}"`);
+      
+      // Return the exact values user provided
+      return {
+        to: basicParams.to,
+        subject: explicitSubjectMatch[1].trim(),
+        body: explicitBodyMatch[1].trim(),
+        isAIGenerated: false
+      };
+    }
+    
+    // Validate email content
+    console.log('[MainAgent] 🔍 Validating email content completeness...');
+    
+    const validation = validateEmailContent({
+      to: basicParams.to,
+      subject: hasExplicitSubject ? explicitSubjectMatch[1] : '',
+      body: hasExplicitBody ? explicitBodyMatch[1] : '',
+      query: query
+    });
+    
+    console.log('[MainAgent] 📊 Email validation result:', JSON.stringify(validation, null, 2));
+    
+    // Only reject if validation failed AND AI can't generate content
+    if (!validation.isValid && !validation.canGenerateAI) {
+      console.log('[MainAgent] ❌ Email content validation failed - no topic/intent found');
+      
+      const errorMessage = formatEmailValidationErrors(validation.errors, validation.warnings);
+      throw new Error(errorMessage);
+    }
+    
+    // If validation passed or AI can generate, continue
+    if (validation.canGenerateAI && validation.topic) {
+      console.log(`[MainAgent] ✅ Email topic detected: "${validation.topic}" - AI will generate content`);
+    } else {
+      console.log('[MainAgent] ✅ Email content validation passed - using provided content');
     }
     
     try {
@@ -5531,10 +5841,22 @@ Respond ENTIRELY in the language of the current query - if they asked in English
       // Step 1: Analyze the query to determine which agents are needed
       const analysis = await this.analyzeQuery(query, options.conversationHistory, null, '', null, detectedLanguage);
 
+      // ✅ CRITICAL: Check if analysis returned a validation error
+      if (analysis.validationError && analysis.error) {
+        console.log('[MainAgent] ⚠️ Validation error detected, returning error response');
+        return {
+          success: false,
+          query: query,
+          error: analysis.error,
+          validationError: true,
+          timestamp: new Date().toISOString()
+        };
+      }
+
       // Step 2: Execute queries on the appropriate agents
       // Pass conversationHistory so agents receive context (e.g. scheduled action instructions)
       const { results, errors } = await this.executeAgentQueries(
-        analysis, userId, null, null, null, options.conversationHistory || []
+        analysis, userId, null, null, null, options.conversationHistory || [], query
       );
 
       // Step 3: Combine responses into a coherent final response
