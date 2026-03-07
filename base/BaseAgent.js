@@ -127,17 +127,33 @@ class BaseAgent {
             let rawParams = JSON.parse(toolCall.function.arguments);
             
             // ✅ CRITICAL FIX: If forceToolExecution is set and this is the forced tool,
-            // use the EXACT params from forceToolExecution, not what the LLM generated
+            // use the EXACT params from forceToolExecution, not what the LLM generated.
+            // EXCEPTION: if the stored params are a deferred-generation placeholder
+            // (_deferredGeneration: true), the LLM has now produced the real content —
+            // keep the LLM params and discard the placeholder.
             if (executionContext.forceToolExecution && 
                 executionContext.forceToolExecution.toolName === toolName &&
                 executionContext.iteration === 1) {
-              console.log(`[${this.agentName}] 🔒 FORCING exact parameters from confirmation`);
-              console.log(`[${this.agentName}] ❌ LLM generated params (IGNORED):`, rawParams);
-              rawParams = executionContext.forceToolExecution.params;
-              console.log(`[${this.agentName}] ✅ Using forced params:`, rawParams);
               
+              const forcedParams = executionContext.forceToolExecution.params;
               // Clear forceToolExecution after first use so subsequent tools use LLM params
               executionContext.forceToolExecution = null;
+
+              if (forcedParams && forcedParams._deferredGeneration) {
+                // The forced params are just a placeholder — use what the LLM generated instead.
+                // However, always keep the confirmed recipient/target fields from the stored params
+                // so the email is still sent to the address the user actually confirmed.
+                console.log(`[${this.agentName}] ⏩ Skipping forced placeholder params (_deferredGeneration=true)`);
+                // Preserve confirmed addressee fields, let LLM supply subject/body
+                if (forcedParams.to && !rawParams.to) rawParams.to = forcedParams.to;
+                if (forcedParams.recipient && !rawParams.recipient) rawParams.recipient = forcedParams.recipient;
+                console.log(`[${this.agentName}] ✅ Using LLM-generated params (with confirmed recipient):`, rawParams);
+              } else {
+                console.log(`[${this.agentName}] 🔒 FORCING exact parameters from confirmation`);
+                console.log(`[${this.agentName}] ❌ LLM generated params (IGNORED):`, rawParams);
+                rawParams = forcedParams;
+                console.log(`[${this.agentName}] ✅ Using forced params:`, rawParams);
+              }
             }
             
             console.log(`[${this.agentName}] 📥 Parameters:`, rawParams);
@@ -384,6 +400,16 @@ class BaseAgent {
         content: this.getSystemPrompt() + '\n\n' + languageInstruction
       }
     ];
+
+    // Inject prior conversation turns so the agent understands cross-turn references
+    // (e.g. "add the above data to a spreadsheet" can resolve "above data" from history)
+    if (context.conversationHistory && Array.isArray(context.conversationHistory) && context.conversationHistory.length > 0) {
+      for (const msg of context.conversationHistory) {
+        if (msg && msg.role && msg.content) {
+          messages.push({ role: msg.role, content: msg.content });
+        }
+      }
+    }
 
     // If there's a confirmed action, add it as helpful context
     // This tells the agent which action to execute first with EXACT parameters

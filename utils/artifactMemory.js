@@ -601,6 +601,62 @@ const extractFlightsArtifact = (toolName, result) => {
     console.log(`[ArtifactMemory]   toolResult keys: ${Object.keys(toolResult).join(', ')}`);
 
     switch (toolName) {
+        case 'searchFlights': {
+            // Result shape from FlightsAgentMultiStep:
+            // { success, flights, count, raw: { search_parameters, best_flights, other_flights, ... } }
+            const raw = toolResult.raw || toolResult;
+            const sp = raw.search_parameters || {};
+            const searchParams = {
+                from: sp.departure_id || toolResult.from,
+                to: sp.arrival_id || toolResult.to,
+                date: sp.outbound_date || toolResult.date,
+                returnDate: sp.return_date || null,
+                currency: sp.currency || 'INR',
+                travelers: sp.adults || 1
+            };
+            const bestFlights = raw.best_flights || toolResult.flights || [];
+            const otherFlights = raw.other_flights || [];
+
+            if (!searchParams.from || !searchParams.to) {
+                console.log(`[ArtifactMemory]   ❌ Missing from/to in searchFlights result`);
+                return null;
+            }
+
+            const searchId2 = `${searchParams.from}-${searchParams.to}-${searchParams.date || Date.now()}`;
+            const routeTitle2 = `${searchParams.from} to ${searchParams.to}`;
+
+            const flightsList2 = [...bestFlights, ...otherFlights].slice(0, 10).map(flight => {
+                const firstLeg = flight.flights?.[0] || {};
+                return {
+                    airline: firstLeg.airline || flight.airline,
+                    flightNumber: firstLeg.flight_number || flight.flight_number,
+                    price: flight.price,
+                    departureTime: firstLeg.departure_airport?.time,
+                    arrivalTime: flight.flights?.[flight.flights.length - 1]?.arrival_airport?.time,
+                    duration: flight.total_duration,
+                    stops: (flight.flights?.length || 1) - 1
+                };
+            });
+
+            console.log(`[ArtifactMemory]   ✅ Extracted ${flightsList2.length} flights for route: ${routeTitle2}`);
+            return {
+                id: searchId2,
+                type: ARTIFACT_TYPES.FLIGHT_SEARCH,
+                title: `Flights: ${routeTitle2} on ${searchParams.date || 'unknown date'}`,
+                data: {
+                    from: searchParams.from,
+                    to: searchParams.to,
+                    date: searchParams.date,
+                    returnDate: searchParams.returnDate,
+                    currency: searchParams.currency,
+                    travelers: searchParams.travelers,
+                    flightsCount: bestFlights.length + otherFlights.length,
+                    flights: flightsList2,
+                    bestFlights: bestFlights,
+                    otherFlights: otherFlights
+                }
+            };
+        }
         case 'getFlightsList':
         case 'getFlightsPriceInsights':
             // Extract search parameters and flight data

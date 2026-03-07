@@ -33,9 +33,19 @@ class FlightsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[FlightsAgent] ✈️ Searching flights from ${params.from} to ${params.to}`);
           try {
-            const flights = await flightsService.searchFlights(context.userId, params);
+            // Map agent param names (departDate) to service param names (date)
+            const serviceParams = {
+              from: params.from,
+              to: params.to,
+              date: params.departDate || params.date,
+              returnDate: params.returnDate,
+              currency: params.currency,
+              travelers: params.passengers || params.travelers
+            };
+            const result = await flightsService.searchFlights(serviceParams);
+            const flights = result.best_flights || result.other_flights || [];
             console.log(`[FlightsAgent] ✅ Found ${flights.length} flights`);
-            return { success: true, flights: flights, count: flights.length };
+            return { success: true, flights: flights, count: flights.length, raw: result };
           } catch (error) {
             console.error(`[FlightsAgent] ❌ Error searching flights:`, error.message);
             throw error;
@@ -108,18 +118,35 @@ class FlightsAgentMultiStep extends BaseAgent {
 
   getSystemPrompt() {
     const basePrompt = super.getSystemPrompt();
+
+    // Build current date string dynamically so the LLM always has accurate temporal context
+    const now = new Date();
+    const currentDateStr = now.toLocaleDateString('en-US', {
+      weekday: 'long',
+      month: 'long',
+      day: 'numeric',
+      year: 'numeric'
+    });
+    const currentDateISO = now.toISOString().split('T')[0]; // YYYY-MM-DD
+
     return `${basePrompt}
+
+**CURRENT DATE: ${currentDateStr} (${currentDateISO})**
+- ALWAYS use this as the reference when resolving relative dates such as "today", "tomorrow", "this month", "next week", etc.
+- "15th of this month" means the 15th day of the CURRENT month and CURRENT year: resolve to ${currentDateISO.slice(0, 7)}-15
+- NEVER use dates from your training data. All dates must be derived from the current date above.
 
 FLIGHTS SPECIFIC GUIDELINES:
 
 1. **Flight Search**
    - Search for flights with departure and destination
    - Include date and number of passengers
+   - Always use IATA airport codes (e.g., PNQ for Pune, NAG for Nagpur, BOM for Mumbai, DEL for Delhi)
 
 2. **Multi-Step Example**
    User: "Search for flights from NYC to LA and book the cheapest one"
    
-   Step 1: searchFlights({ from: "NYC", to: "LA", departDate: "2025-03-15" })
+   Step 1: searchFlights({ from: "JFK", to: "LAX", departDate: "${currentDateISO.slice(0, 7)}-15" })
    Result: { flights: [...], count: 10 }
    
    Step 2: bookFlight({ flightId: "cheapest_flight_id", passengers: [...] })

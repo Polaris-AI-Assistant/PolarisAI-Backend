@@ -259,16 +259,25 @@ GOOGLE SHEETS SPECIFIC GUIDELINES:
    - Create spreadsheet first if user wants to create one
    - Include title in creation
 
-2. **Multi-Step Example**
+2. **Handling "add the above data" / "add the previous data" queries**
+   - When the user says "add the above data", "add the previous data", "add this to a spreadsheet", etc.,
+     look at the CONVERSATION HISTORY provided to you to find the data they are referring to.
+   - Extract the relevant data from the prior assistant message (e.g. flight results, a table, a list).
+   - ALWAYS follow these two steps:
+     * Step 1: createSpreadsheet({ title: "<descriptive title based on data>" })
+     * Step 2: addData({ spreadsheetId: "<id from step 1>", range: "Sheet1!A1", values: [[...headers...], [...row1...], ...] })
+   - DO NOT stop after createSpreadsheet — you MUST also call addData with the actual data.
+
+3. **Multi-Step Example**
    User: "Create a spreadsheet titled 'Sales' and add headers"
    
    Step 1: createSpreadsheet({ title: "Sales" })
    Result: { spreadsheetId: "abc123", url: "..." }
    
-   Step 2: addData({ spreadsheetId: "abc123", values: [["Name", "Amount", "Date"]] })
+   Step 2: addData({ spreadsheetId: "abc123", range: "Sheet1!A1", values: [["Name", "Amount", "Date"]] })
    Result: { success: true }
 
-3. **Data Management**
+4. **Data Management**
    - Use addData to insert new data
    - Use updateData to modify existing data
    - Use deleteData to remove data`;
