@@ -15,12 +15,25 @@ class FormsAgentMultiStep extends BaseAgent {
           type: 'function',
           function: {
             name: 'createForm',
-            description: 'Create a new Google Form with a title and description',
+            description: 'Create a new Google Form with title, description, and optional questions. If questions are provided, they will be added to the form during creation.',
             parameters: {
               type: 'object',
               properties: {
                 title: { type: 'string', description: 'Title of the form' },
-                description: { type: 'string', description: 'Description of the form' }
+                description: { type: 'string', description: 'Description of the form' },
+                questions: {
+                  type: 'array',
+                  description: 'Optional array of questions to add to the form during creation',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      title: { type: 'string', description: 'Question text' },
+                      type: { type: 'string', description: 'Question type: text, paragraph, scale, radio, checkbox, dropdown' },
+                      required: { type: 'boolean', description: 'Whether question is required' },
+                      options: { type: 'array', items: { type: 'string' }, description: 'Options for choice questions' }
+                    }
+                  }
+                }
               },
               required: ['title']
             }
@@ -29,13 +42,18 @@ class FormsAgentMultiStep extends BaseAgent {
         execute: async (params, context) => {
           console.log(`[FormsAgent] 📋 Creating form: "${params.title}"`);
           try {
-            const form = await formsService.createForm(context.userId, params);
-            console.log(`[FormsAgent] ✅ Form created: ${form.formId}`);
+            const result = await formsService.createForm(
+              context.userId, 
+              params.title, 
+              params.description || '', 
+              params.questions || []
+            );
+            console.log(`[FormsAgent] ✅ Form created: ${result.formId}`);
             return {
               success: true,
-              formId: form.formId,
-              title: form.info.title,
-              url: form.responderUri,
+              formId: result.formId,
+              title: result.form.info.title,
+              url: result.form.responderUri,
               createdAt: new Date().toISOString()
             };
           } catch (error) {
@@ -173,32 +191,41 @@ class FormsAgentMultiStep extends BaseAgent {
 
 GOOGLE FORMS SPECIFIC GUIDELINES:
 
-1. **Form Creation**
-   - Create form first if user wants to create one
-   - Include title and description
+1. **Form Creation with Questions**
+   - When creating a form, if questions are provided in the confirmation parameters, they are ALREADY included in the createForm execution
+   - DO NOT call addQuestion for questions that were part of the createForm parameters
+   - After createForm completes successfully with questions, the form is COMPLETE - no need to add questions again
 
-2. **Multi-Step Example**
-   User: "Create a form titled 'Feedback' and add a text question and a rating question"
-   
+2. **Adding Questions to Existing Forms**
+   - Use addQuestion ONLY when adding NEW questions to an EXISTING form
+   - Example: User says "add a phone number field to the form we just created"
+
+3. **Multi-Step Example** 
+   User: "Create a form titled 'Feedback'"
    Step 1: createForm({ title: "Feedback", description: "..." })
-   Result: { formId: "abc123", url: "..." }
+   Result: Form created with all questions already included
    
-   Step 2: addQuestion({ formId: "abc123", title: "What do you think?", type: "PARAGRAPH" })
-   Result: { success: true }
-   
-   Step 3: addQuestion({ formId: "abc123", title: "Rate us", type: "LINEAR_SCALE" })
-   Result: { success: true }
+   User later: "Add another question to that form"
+   Step 2: addQuestion({ formId: "abc123", title: "Phone number?", type: "SHORT_ANSWER" })
 
-3. **Question Types**
-   - SHORT_ANSWER: Single line text
+4. **Question Types**
+   - SHORT_ANSWER / TEXT: Single line text
    - PARAGRAPH: Multi-line text
-   - MULTIPLE_CHOICE: Radio buttons
-   - CHECKBOX: Multiple selections
-   - LINEAR_SCALE: Rating scale
+   - LINEAR_SCALE / SCALE: Rating scale
+   - MULTIPLE_CHOICE / RADIO: Radio buttons (requires options)
+   - CHECKBOX: Multiple selections (requires options)
+   - DROPDOWN: Dropdown menu (requires options)
+   - DATE: Date picker
+   - TIME: Time picker
 
-4. **Publishing**
+5. **Publishing**
    - Publish form when user requests
-   - Include published URL in response`;
+   - Include published URL in response
+   
+6. **IMPORTANT: When forceToolExecution is active**
+   - Execute the tool ONCE with the provided parameters
+   - The parameters already include all necessary data (including questions for createForm)
+   - Do NOT attempt to add the same data again in subsequent iterations`;
   }
 
   async processQuery(query, userIdOrContext, options = {}) {

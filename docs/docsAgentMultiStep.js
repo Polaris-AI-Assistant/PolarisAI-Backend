@@ -520,15 +520,55 @@ GOOGLE DOCS SPECIFIC GUIDELINES:
    - Use replaceText to modify existing content
    - Always use the actual documentId from the previous step
 
-3. **Formatting**
+3. **CRITICAL: Auto-Generate Content When Requested**
+   **IF the user asks to:**
+   - "add content according to its title"
+   - "add content to it" (after creating a document)
+   - "create a doc about X and add content"
+   - "create a doc titled Y and populate it"
+   
+   **THEN YOU MUST:**
+   - Generate comprehensive, well-structured content based on the document title/topic
+   - Use your knowledge to create professional, informative content (2-3 paragraphs minimum)
+   - Format it properly using markdown (# for headings, ## for subheadings, **text** for bold, - for bullets)
+   - Call appendFormattedText with the generated content
+   - DO NOT ask the user what content to add - generate it yourself!
+   
+   **Example:**
+   Document title: "Pattern Recognition"
+   You should generate comprehensive content like:
+   
+   # Pattern Recognition
+   
+   ## Introduction
+   
+   Pattern recognition is a fundamental aspect of machine learning and artificial intelligence focused on identifying patterns and regularities in data. It involves the automated recognition of patterns and regularities in data through the use of algorithms and statistical techniques.
+   
+   ## Key Concepts
+   
+   - **Classification**: Assigning input data to predefined categories
+   - **Feature Extraction**: Identifying relevant characteristics of the data
+   - **Training Data**: Using labeled examples to teach recognition models
+   - **Neural Networks**: Advanced architectures for complex pattern detection
+   
+   ## Applications
+   
+   Pattern recognition is widely used in:
+   - Image and facial recognition systems
+   - Speech recognition and natural language processing
+   - Medical diagnosis and bioinformatics
+   - Fraud detection and cybersecurity
+
+
+4. **Formatting**
    - Use formatText to apply formatting (bold, italic, underline, etc.)
    - Formatting requires the exact text to format
 
-4. **Sharing**
+5. **Sharing**
    - Use shareDocument to share with others
    - Specify the role: 'reader' (view only), 'writer' (can edit), 'commenter' (can comment)
 
-5. **Multi-Step Example**
+6. **Multi-Step Example**
    User: "Create a doc titled 'Plan' and add an introduction section"
    
    Step 1: createDocument({ title: "Plan" })
@@ -540,15 +580,15 @@ GOOGLE DOCS SPECIFIC GUIDELINES:
    Step 3: No more tools needed
    Execution complete
 
-6. **Always Return Document URLs**
+7. **Always Return Document URLs**
    - Users need to access their documents
    - Include URLs in results when available
 
-7. **For Introduction Sections**
+8. **For Introduction Sections**
    - Use markdown formatting with # for heading
    - Example: "# Introduction\\n\\nThis document outlines..."
 
-8. **CRITICAL: Smart Content Formatting Based on Search Results**
+9. **CRITICAL: Smart Content Formatting Based on Search Results**
    
    When you receive search results from a previous action, AUTOMATICALLY detect the content type and format appropriately:
    

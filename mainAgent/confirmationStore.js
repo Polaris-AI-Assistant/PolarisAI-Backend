@@ -571,6 +571,16 @@ function removeActionChain(chainId) {
   console.log(`[ConfirmationStore] Removed action chain: ${chainId}`);
 }
 
+/**
+ * Get chain data by chain ID
+ * 
+ * @param {string} chainId - Chain ID to retrieve
+ * @returns {object|null} - Chain data or null if not found
+ */
+function getActionChain(chainId) {
+  return actionChains.get(chainId) || null;
+}
+
 module.exports = {
   storePendingAction,
   getPendingAction,
@@ -586,5 +596,6 @@ module.exports = {
   storeActionChain,
   getNextChainAction,
   getChainInfo,
-  removeActionChain
+  removeActionChain,
+  getActionChain
 };

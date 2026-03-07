@@ -901,27 +901,43 @@ async function createExcelWorkbook(userId, fileName, parentFolderId = 'root') {
     // Ensure the filename has .xlsx extension
     const workbookName = fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`;
     
-    // Create a minimal valid .xlsx file
-    // The simplest approach is to create an empty session and let Microsoft create the file
-    // Or we can use the upload endpoint with a template
-    
-    // First, create an empty file placeholder using special endpoint
     const endpoint = parentFolderId === 'root' 
       ? `/me/drive/root:/${workbookName}:/content`
       : `/me/drive/items/${parentFolderId}:/${workbookName}:/content`;
     
-    // For Excel, we need to use the content endpoint with proper mime type
-    // Microsoft Graph allows creating Excel files by uploading minimal content
-    // However, the proper way is to use the Excel workbook session API
+    // Check if file already exists (might be locked from previous attempt)
+    try {
+      const checkEndpoint = parentFolderId === 'root'
+        ? `/me/drive/root:/${workbookName}`
+        : `/me/drive/items/${parentFolderId}:/${workbookName}`;
+      
+      const existingFile = await graphRequest(userId, checkEndpoint, 'GET');
+      
+      if (existingFile && existingFile.id) {
+        console.log(`[Microsoft] File ${workbookName} already exists (ID: ${existingFile.id}), deleting it...`);
+        
+        // Delete the existing file to avoid locked state
+        try {
+          await graphRequest(userId, `/me/drive/items/${existingFile.id}`, 'DELETE');
+          console.log(`[Microsoft] Deleted existing file ${workbookName}`);
+          // Wait a moment after deletion
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (deleteError) {
+          console.warn(`[Microsoft] Could not delete existing file:`, deleteError.message);
+          // Continue anyway - might succeed
+        }
+      }
+    } catch (checkError) {
+      // File doesn't exist - good, we can create it
+      console.log(`[Microsoft] File ${workbookName} does not exist, creating new...`);
+    }
     
-    // Alternative: Create via OneDrive with special Excel template
-    // First create the file, then create a session
-    
+    // Create the Excel file
     const createResponse = await graphRequest(
       userId,
       endpoint,
       'PUT',
-      '', // Empty content - Microsoft will create a valid Excel template
+      '', // Empty content - Microsoft will create template
       null,
       {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -929,30 +945,51 @@ async function createExcelWorkbook(userId, fileName, parentFolderId = 'root') {
     );
     
     if (createResponse && createResponse.id) {
-      // Get the web URL for the workbook
-      const webUrl = createResponse.webUrl || `https://onedrive.live.com/edit.aspx?cid=${createResponse.id}`;
+      // Wait for the file to be fully created and unlocked
+      console.log(`[Microsoft] Waiting for file to be unlocked...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
-      return {
-        success: true,
-        workbookId: createResponse.id,
-        name: createResponse.name,
-        webUrl: webUrl,
-        createdDateTime: createResponse.createdDateTime,
-        message: `Excel workbook "${workbookName}" created successfully!`
-      };
+      // Verify the file is accessible
+      try {
+        const verifyResponse = await graphRequest(userId, `/me/drive/items/${createResponse.id}`, 'GET');
+        
+        console.log(`[Microsoft] ✅ Excel workbook created and verified: ${verifyResponse.id}`);
+        
+        return {
+          success: true,
+          id: verifyResponse.id,
+          workbookId: verifyResponse.id,
+          name: verifyResponse.name,
+          webUrl: verifyResponse.webUrl,
+          createdDateTime: verifyResponse.createdDateTime,
+          message: `Excel workbook "${workbookName}" created successfully!`
+        };
+      } catch (verifyError) {
+        console.warn('[Microsoft] File created but verification failed:', verifyError.message);
+        // Return the initial response even if verification fails
+        return {
+          success: true,
+          id: createResponse.id,
+          workbookId: createResponse.id,
+          name: createResponse.name,
+          webUrl: createResponse.webUrl,
+          createdDateTime: createResponse.createdDateTime,
+          message: `Excel workbook "${workbookName}" created successfully!`
+        };
+      }
     }
     
-    return {
-      success: false,
-      error: 'Failed to create Excel workbook'
-    };
+    throw new Error('Failed to create Excel workbook - no ID returned');
     
   } catch (error) {
     console.error('Error creating Excel workbook:', error);
-    return {
-      success: false,
-      error: error.message || 'Failed to create Excel workbook'
-    };
+    
+    // Provide helpful error message for locked files
+    if (error.response && error.response.status === 423) {
+      throw new Error('The file is locked by another process. Please try again in a moment or use a different filename.');
+    }
+    
+    throw error;
   }
 }
 

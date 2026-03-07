@@ -517,11 +517,32 @@ class MainAgent {
           }
         }
         
+        // ✅ CRITICAL: Get chain actions if this is part of a chain
+        let chainActions = null;
+        if (chainId) {
+          const chain = confirmationStore.getActionChain(chainId);
+          if (chain && chain.actions) {
+            chainActions = chain.actions;
+            console.log(`[MainAgent] 🔗 Found chain with ${chainActions.length} actions`);
+          }
+        }
+        
         for (const currentAgentName of originalAnalysis.agents) {
           // ✅ CRITICAL: Skip agents that were already executed in initial phase
           if (initialResults && initialResults[currentAgentName]) {
             console.log(`[MainAgent] ⏭️ Skipping ${currentAgentName} - already executed in initial phase`);
             continue;
+          }
+          
+          // ✅ CRITICAL: If this is a chain and we're past the confirmed agent, STOP and prepare next confirmation
+          if (chainId && currentAgentName !== agentName) {
+            const currentIndex = originalAnalysis.agents.indexOf(currentAgentName);
+            const confirmedIndex = originalAnalysis.agents.indexOf(agentName);
+            
+            if (currentIndex > confirmedIndex) {
+              console.log(`[MainAgent] 🛑 Stopping sequential execution - next agent (${currentAgentName}) requires user confirmation`);
+              break;  // Exit the loop - don't execute agents beyond the confirmed one
+            }
           }
           
           try {
@@ -569,69 +590,20 @@ class MainAgent {
               }
             }
             
-            // If this is the confirmed agent, force the specific tool execution
+            // ✅ CRITICAL FIX: Only force execution for the CONFIRMED agent, not chain actions
+            // Chain actions should be prepared but not executed - they need user confirmation
             if (currentAgentName === agentName) {
-              // ✅ CRITICAL: Check if this is a deferred email that needs regeneration
-              if ((toolName === 'sendEmail' || toolName === 'microsoft_sendEmail') && params._deferredGeneration) {
-                console.log(`[MainAgent] 🔄 Deferred email detected - regenerating with actual details before execution`);
-                
-                // Find the previous agent's result to extract artifact details
-                const previousAgentNames = originalAnalysis.agents.slice(0, originalAnalysis.agents.indexOf(currentAgentName));
-                let previousArtifact = null;
-                let previousResult = null;
-                
-                // Get the most recent artifact from previous agents
-                for (const prevAgentName of previousAgentNames.reverse()) {
-                  if (results[prevAgentName] && storedArtifacts.length > 0) {
-                    previousArtifact = storedArtifacts[storedArtifacts.length - 1];
-                    previousResult = results[prevAgentName];
-                    break;
-                  }
-                }
-                
-                if (previousArtifact || previousResult) {
-                  console.log(`[MainAgent] 📧 Enhancing email with previous result from ${previousAgentNames[previousAgentNames.length - 1]}`);
-                  
-                  // Create a mock email action to pass to enhanceEmailWithPreviousResult
-                  const emailAction = {
-                    agentName: currentAgentName,
-                    toolName: toolName,
-                    params: params
-                  };
-                  
-                  const completedResult = {
-                    agentName: previousAgentNames[previousAgentNames.length - 1],
-                    toolName: null,
-                    result: previousResult,
-                    artifact: previousArtifact
-                  };
-                  
-                  const enhancedEmailAction = await this.enhanceEmailWithPreviousResult(emailAction, completedResult, userId);
-                  
-                  // Use the enhanced params instead of the placeholder params
-                  agentOptions.forceToolExecution = {
-                    toolName,
-                    params: enhancedEmailAction.params
-                  };
-                  
-                  console.log(`[MainAgent] ✅ Email enhanced with actual details:`, {
-                    subject: enhancedEmailAction.params.subject,
-                    bodyPreview: enhancedEmailAction.params.body.substring(0, 100)
-                  });
-                } else {
-                  console.warn(`[MainAgent] ⚠️ No previous artifact found for email enhancement`);
-                  agentOptions.forceToolExecution = {
-                    toolName,
-                    params
-                  };
-                }
-              } else {
-                // Normal forced execution (not a deferred email)
-                agentOptions.forceToolExecution = {
-                  toolName,
-                  params
-                };
-              }
+              // Determine which tool and params to use
+              const toolToExecute = toolName;
+              const paramsToUse = params;
+              
+              console.log(`[MainAgent] 🔧 Forcing execution of ${toolToExecute} for ${currentAgentName}`);
+              
+              // Normal forced execution
+              agentOptions.forceToolExecution = {
+                toolName: toolToExecute,
+                params: paramsToUse
+              };
             }
             
             console.log(`[MainAgent] 🔍 agentOptions for ${currentAgentName}:`, { 
@@ -688,6 +660,64 @@ class MainAgent {
         // Remove the pending action after successful execution
         confirmationStore.removePendingAction(requestId);
         
+        // ✅ CRITICAL: Check if this is part of a chain and prepare next action for confirmation
+        let nextConfirmation = null;
+        if (chainId) {
+          console.log(`[MainAgent] 🔗 Checking for next action in chain: ${chainId}`);
+          
+          // Build a result object to pass to the next action
+          const completedResult = {
+            agentName,
+            toolName,
+            result: results[agentName],
+            artifact: storedArtifacts.length > 0 ? storedArtifacts[storedArtifacts.length - 1] : null
+          };
+          
+          // Get timeline events from current step to accumulate in chain
+          const currentTimelineEvents = timeline ? timeline.getEvents() : [];
+          
+          const nextChainAction = confirmationStore.getNextChainAction(chainId, userId, completedResult, currentTimelineEvents);
+          
+          if (nextChainAction && !nextChainAction.chainComplete) {
+            console.log(`[MainAgent] 🔗 Next action in chain: ${nextChainAction.nextAction.toolName}`);
+            
+            // Enhance the next action's params with results from this action
+            let enhancedNextAction = nextChainAction.nextAction;
+            
+            // If the next action is an email, enhance it with the form/doc link
+            if (enhancedNextAction.toolName === 'sendEmail' || enhancedNextAction.toolName === 'microsoft_sendEmail') {
+              console.log(`[MainAgent] 📧 Enhancing email action with previous results...`);
+              enhancedNextAction = await this.enhanceEmailWithPreviousResult(enhancedNextAction, completedResult, userId);
+              
+              // ✅ CRITICAL: Update the pending action in the store with enhanced params
+              console.log(`[MainAgent] 💾 Updating pending action with enhanced params`);
+              confirmationStore.updatePendingActionParams(enhancedNextAction.requestId, enhancedNextAction.params, enhancedNextAction.previewContent);
+            }
+            
+            // Return the next action for user confirmation
+            nextConfirmation = {
+              requestId: enhancedNextAction.requestId,
+              toolName: enhancedNextAction.toolName,
+              agentName: enhancedNextAction.agentName,
+              actionType: confirmationUtils.getActionType(enhancedNextAction.agentName, enhancedNextAction.toolName),
+              description: confirmationUtils.getActionDescription(enhancedNextAction.agentName, enhancedNextAction.toolName),
+              params: enhancedNextAction.params,
+              previewContent: enhancedNextAction.previewContent,
+              originalQuery: query,
+              chainInfo: {
+                chainId: chainId,
+                currentStep: nextChainAction.currentIndex + 1,
+                totalSteps: nextChainAction.totalActions,
+                previousResults: nextChainAction.completedResults
+              }
+            };
+            
+            console.log(`[MainAgent] ✅ Prepared next confirmation for user: ${enhancedNextAction.toolName}`);
+          } else if (nextChainAction && nextChainAction.chainComplete) {
+            console.log(`[MainAgent] ✅ Action chain complete: ${chainId}`);
+          }
+        }
+        
         // Return combined results from all agents
         return {
           success: Object.keys(errors).length === 0,
@@ -698,7 +728,7 @@ class MainAgent {
           agentName: agentName,
           storedArtifacts: storedArtifacts,
           conversationId: conversationId,
-          nextConfirmation: null  // No chain for sequential multi-agent tasks
+          nextConfirmation: nextConfirmation  // ✅ Return next action if it exists
         };
       }
       
@@ -1448,8 +1478,10 @@ Return ONLY a JSON object:
             if (raw.htmlLink && !raw.hangoutLink) {
               collectedData.push({ type: 'Calendar Event', link: raw.htmlLink, title: raw.event?.summary || 'Event' });
             }
-            // Google Forms
-            if (raw.formUrl) {
+            // Google Forms (support both url and formUrl fields)
+            if (raw.url && raw.formId) {
+              collectedData.push({ type: 'Google Form', link: raw.url, title: raw.title || 'Form' });
+            } else if (raw.formUrl) {
               collectedData.push({ type: 'Google Form', link: raw.formUrl, title: raw.formTitle || 'Form' });
             }
             // Google Docs
@@ -3470,18 +3502,98 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       if (detectedAction) {
         console.log(`[Confirmation] Detected action for ${agentName}:`, JSON.stringify(detectedAction, null, 2));
         
-        // Generate a preview for this action
+        // ✅ CRITICAL FIX: If this is an email with deferred generation, generate actual content NOW
+        // BEFORE showing the preview to the user
+        let params = detectedAction.inferredParams;
+        if ((detectedAction.toolName === 'sendEmail' || detectedAction.toolName === 'microsoft_sendEmail') && 
+            params._deferredGeneration) {
+          console.log(`[Confirmation] 🔄 Email has deferred generation - regenerating with actual content NOW`);
+          
+          // Try to get artifact from conversation context
+          let artifact = null;
+          
+          if (conversationId) {
+            try {
+              const artifactContext = await buildArtifactContext(conversationId, query);
+              if (artifactContext.resolvedArtifact) {
+                artifact = artifactContext.resolvedArtifact;
+                console.log(`[Confirmation] 📦 Using artifact from conversation: ${artifact.type} - ${artifact.title}`);
+              }
+            } catch (err) {
+              console.warn(`[Confirmation] ⚠️ Could not fetch artifact context:`, err.message);
+            }
+          }
+          
+          // If we have an artifact, regenerate the email with actual content
+          if (artifact) {
+            let itemType = null;
+            let itemDetails = null;
+            
+            const artifactType = artifact.type?.toLowerCase();
+            if (artifactType === 'doc' || artifactType === 'document') {
+              itemType = 'document';
+              itemDetails = {
+                docId: artifact.id,
+                docLink: `https://docs.google.com/document/d/${artifact.id}/edit`,
+                title: artifact.title
+              };
+            } else if (artifactType === 'form') {
+              itemType = 'form';
+              itemDetails = {
+                formId: artifact.id,
+                formLink: `https://docs.google.com/forms/d/${artifact.id}/viewform`,
+                title: artifact.title
+              };
+            } else if (artifactType === 'event' || artifactType === 'calendar_event') {
+              itemType = 'meeting';
+              itemDetails = {
+                eventId: artifact.id,
+                eventLink: artifact.eventLink,
+                meetLink: artifact.meetLink,
+                summary: artifact.title,
+                startTime: artifact.startTime,
+                endTime: artifact.endTime
+              };
+            }
+            
+            if (itemType && itemDetails) {
+              console.log(`[Confirmation] 🎨 Generating ${itemType} email with actual details`);
+              
+              const regeneratedEmail = await this.generateEmailFromScratch(
+                params.to,
+                itemType,
+                itemDetails,
+                params._originalQuery || query,
+                userId
+              );
+              
+              console.log(`[Confirmation] ✅ Email regenerated with actual content:`, {
+                subject: regeneratedEmail.subject,
+                bodyLength: regeneratedEmail.body.length
+              });
+              
+              // Replace placeholder params with actual content
+              params = regeneratedEmail;
+            } else {
+              console.warn(`[Confirmation] ⚠️ Could not determine item type from artifact: ${artifactType}`);
+            }
+          } else {
+            console.warn(`[Confirmation] ⚠️ No artifact found - will show placeholder content (BAD UX!)`);
+          }
+        }
+        
+        // Generate a preview for this action (now with actual content if it was regenerated)
         const previewContent = confirmationUtils.generatePreview(
           agentName, 
           detectedAction.toolName, 
-          detectedAction.inferredParams
+          params
         );
         
         confirmationRequiredActions.push({
           agentName,
           agentQuery,
           toolName: detectedAction.toolName,
-          params: detectedAction.inferredParams,
+          params: params,  // Use potentially regenerated params
           previewContent
         });
       } else {

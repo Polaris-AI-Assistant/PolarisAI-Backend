@@ -506,6 +506,167 @@ async function publishForm(userIdentifier, formId, isPublished = true, isAccepti
   }
 }
 
+/**
+ * Add a single question to an existing form
+ */
+async function addQuestion(userIdentifier, params) {
+  try {
+    const { forms } = await getFormsClient(userIdentifier);
+    const { formId, title, type, options, required } = params;
+    
+    // Get current form to know where to add the question
+    const currentForm = await forms.forms.get({ formId: formId });
+    const currentItemsCount = currentForm.data.items ? currentForm.data.items.length : 0;
+    
+    // Build the question item structure
+    const questionItem = {
+      question: {}
+    };
+    
+    // Normalize type - support both formats (SHORT_ANSWER and text)
+    const questionType = (type || 'SHORT_ANSWER').toUpperCase();
+    
+    // Determine question type and build appropriate structure
+    if (questionType === 'SHORT_ANSWER' || questionType === 'TEXT') {
+      questionItem.question.textQuestion = {};
+    } else if (questionType === 'PARAGRAPH' || questionType === 'LONG_ANSWER') {
+      questionItem.question.textQuestion = { paragraph: true };
+    } else if (questionType === 'LINEAR_SCALE' || questionType === 'SCALE') {
+      questionItem.question.scaleQuestion = {
+        low: 1,
+        high: options && options.length > 0 ? parseInt(options[options.length - 1]) : 5,
+        lowLabel: 'Low',
+        highLabel: 'High'
+      };
+    } else if (questionType === 'MULTIPLE_CHOICE' || questionType === 'RADIO') {
+      if (!options || options.length === 0) {
+        throw new Error('Multiple choice questions require options');
+      }
+      questionItem.question.choiceQuestion = {
+        type: 'RADIO',
+        options: options.map(opt => ({ value: opt }))
+      };
+    } else if (questionType === 'CHECKBOX' || questionType === 'CHECKBOXES') {
+      if (!options || options.length === 0) {
+        throw new Error('Checkbox questions require options');
+      }
+      questionItem.question.choiceQuestion = {
+        type: 'CHECKBOX',
+        options: options.map(opt => ({ value: opt }))
+      };
+    } else if (questionType === 'DROPDOWN' || questionType === 'DROP_DOWN') {
+      if (!options || options.length === 0) {
+        throw new Error('Dropdown questions require options');
+      }
+      questionItem.question.choiceQuestion = {
+        type: 'DROP_DOWN',
+        options: options.map(opt => ({ value: opt }))
+      };
+    } else if (questionType === 'DATE') {
+      questionItem.question.dateQuestion = {
+        includeTime: false,
+        includeYear: true
+      };
+    } else if (questionType === 'TIME') {
+      questionItem.question.timeQuestion = {
+        duration: false
+      };
+    } else {
+      // Default to text question
+      questionItem.question.textQuestion = {};
+    }
+    
+    // Set required field
+    questionItem.question.required = required || false;
+    
+    // Add the question via batchUpdate
+    const response = await forms.forms.batchUpdate({
+      formId: formId,
+      requestBody: {
+        requests: [{
+          createItem: {
+            item: {
+              title: title,
+              questionItem: questionItem
+            },
+            location: {
+              index: currentItemsCount
+            }
+          }
+        }]
+      }
+    });
+    
+    // Extract the created question ID from the response
+    const questionId = response.data.replies && response.data.replies[0] && response.data.replies[0].createItem
+      ? response.data.replies[0].createItem.itemId
+      : null;
+    
+    return {
+      success: true,
+      formId: formId,
+      questionId: questionId,
+      message: `Question "${title}" added successfully`
+    };
+    
+  } catch (error) {
+    console.error('Error adding question:', error);
+    throw error;
+  }
+}
+
+/**
+ * Add a section to an existing form
+ */
+async function addSection(userIdentifier, params) {
+  try {
+    const { forms } = await getFormsClient(userIdentifier);
+    const { formId, title, description } = params;
+    
+    // Get current form to know where to add the section
+    const currentForm = await forms.forms.get({ formId: formId });
+    const currentItemsCount = currentForm.data.items ? currentForm.data.items.length : 0;
+    
+    // Build the section item
+    const pageBreakItem = {
+      title: title,
+      description: description || '',
+      pageBreakItem: {}
+    };
+    
+    // Add the section via batchUpdate
+    const response = await forms.forms.batchUpdate({
+      formId: formId,
+      requestBody: {
+        requests: [{
+          createItem: {
+            item: pageBreakItem,
+            location: {
+              index: currentItemsCount
+            }
+          }
+        }]
+      }
+    });
+    
+    // Extract the created section ID from the response
+    const sectionId = response.data.replies && response.data.replies[0] && response.data.replies[0].createItem
+      ? response.data.replies[0].createItem.itemId
+      : null;
+    
+    return {
+      success: true,
+      formId: formId,
+      sectionId: sectionId,
+      message: `Section "${title}" added successfully`
+    };
+    
+  } catch (error) {
+    console.error('Error adding section:', error);
+    throw error;
+  }
+}
+
 module.exports = {
   getFormsClient,
   listForms,
@@ -514,5 +675,7 @@ module.exports = {
   getForm,
   updateForm,
   publishForm,
+  addQuestion,
+  addSection,
   SCOPES
 };

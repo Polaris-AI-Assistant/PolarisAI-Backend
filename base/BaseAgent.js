@@ -441,9 +441,13 @@ CRITICAL RULES FOR MULTI-STEP EXECUTION:
    - Don't continue if a critical step fails
    - Provide clear error messages to the user
 
-5. **Completion**
+5. **Completion - COMPLETE ALL TASKS**
+   - **CRITICAL**: The user's request may contain MULTIPLE tasks (e.g., "create X and do Y")
+   - You MUST complete EVERY task the user mentioned before stopping
+   - Count the tasks: "create a workbook and add data" = 2 tasks (create + add)
+   - Do NOT stop after completing only the first task
    - Continue until ALL requested actions are complete
-   - When done, stop calling tools (don't call any more tools)
+   - When ALL tasks are done, stop calling tools
    - Provide a summary of what was accomplished
 
 EXECUTION FLOW EXAMPLE:
@@ -455,19 +459,19 @@ Iteration 1:
 - System returns: { documentId: "abc123xyz", url: "https://..." }
 
 Iteration 2:
-- You reason: "Now I have the document ID, I can add content"
+- You reason: "Now I have the document ID, I can add content to complete the second task"
 - You see documentId from previous step in the conversation
 - You call: appendContent({ documentId: "abc123xyz", content: "# Introduction\\n\\n..." })
 - System returns: { success: true }
 
 Iteration 3:
-- You reason: "All requested actions are complete"
+- You reason: "All requested actions are complete (created document AND added introduction)"
 - You don't call any tools
 - Execution completes
 
 Available tools: ${Object.keys(this.tools).join(', ')}
 
-Remember: The key to multi-step execution is SEQUENTIAL execution with ACTUAL values from previous steps.`;
+Remember: The key to multi-step execution is SEQUENTIAL execution with ACTUAL values from previous steps. ALWAYS complete ALL tasks in the user's request.`;
   }
 
   /**
