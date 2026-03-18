@@ -97,7 +97,14 @@ const TYPE_DETECTION_MAP = {
     'spicejet': ARTIFACT_TYPES.FLIGHT_SEARCH,
     'vistara': ARTIFACT_TYPES.FLIGHT_SEARCH,
     'akasa': ARTIFACT_TYPES.FLIGHT_SEARCH,
-    'airline': ARTIFACT_TYPES.FLIGHT_SEARCH
+    'airline': ARTIFACT_TYPES.FLIGHT_SEARCH,
+    
+    // Web Search
+    'search': ARTIFACT_TYPES.WEB_SEARCH,
+    'results': ARTIFACT_TYPES.WEB_SEARCH,
+    'info': ARTIFACT_TYPES.WEB_SEARCH,
+    'information': ARTIFACT_TYPES.WEB_SEARCH,
+    'research': ARTIFACT_TYPES.WEB_SEARCH
 };
 
 // Action keywords that indicate intent to modify/use an artifact
@@ -275,7 +282,8 @@ const buildArtifactContext = async (conversationId, query) => {
             repo: 'repository',
             issue: 'issue',
             pull_request: 'pull request',
-            flight_search: 'flight search'
+            flight_search: 'flight search',
+            web_search: 'web search'
         };
         
         const typeName = typeNames[resolved.artifact.type] || resolved.artifact.type;
@@ -311,7 +319,8 @@ const buildArtifactContext = async (conversationId, query) => {
                 repo: 'repository',
                 issue: 'issue',
                 pull_request: 'pull request',
-                flight_search: 'flight search'
+                flight_search: 'flight search',
+                web_search: 'web search'
             };
             
             const typeName = typeNames[lastArtifact.type] || lastArtifact.type;
@@ -344,7 +353,8 @@ const getIdFieldName = (type) => {
         repo: 'repoId',
         issue: 'issueId',
         pull_request: 'prId',
-        flight_search: 'searchId'
+        flight_search: 'searchId',
+        web_search: 'searchId'
     };
     return idFields[type] || 'id';
 };

@@ -120,21 +120,26 @@ class WebSearchAgentMultiStep extends BaseAgent {
             const successfulPages = extractedPages.filter(p => p.success && p.content);
             console.log(`[WebSearchAgent] ✅ Successfully extracted ${successfulPages.length}/${urls.length} pages`);
             
-            if (successfulPages.length === 0) {
-              return {
-                success: false,
-                error: 'Could not extract content from any URLs',
-                stage: 'extraction_failed'
-              };
+            // Evaluate source quality
+            const totalContentLength = successfulPages.reduce((sum, p) => sum + (p.content?.length || 0), 0);
+            const avgContentLength = successfulPages.length > 0 ? totalContentLength / successfulPages.length : 0;
+            
+            // Determine search confidence based on source count and content quality
+            let searchConfidence = 'HIGH';
+            if (successfulPages.length < 2 || totalContentLength < 1000) {
+              searchConfidence = 'LOW';
             }
-
-            // STAGE 3: Synthesize with LLM
+            
+            console.log(`[WebSearchAgent] 📊 Source quality: ${successfulPages.length} pages, ${totalContentLength} chars, confidence: ${searchConfidence}`);
+            
+            // STAGE 3: Synthesize with LLM (even if no pages extracted, LLM can provide helpful explanation)
             console.log(`[WebSearchAgent] 🧠 Synthesizing content...`);
             
             const synthesisPrompt = this.buildSynthesisPrompt(
               params.query,
               params.synthesisGoal || 'relevant information',
-              successfulPages
+              successfulPages,
+              searchConfidence
             );
 
             const llm = context.llm || this.llm;
@@ -143,7 +148,7 @@ class WebSearchAgentMultiStep extends BaseAgent {
               messages: [
                 {
                   role: 'system',
-                  content: 'You are a research synthesis expert. Your job is to read multiple web sources and synthesize them into structured, coherent knowledge. Extract key information, remove duplicates, and organize clearly.'
+                  content: 'You are a helpful research assistant who synthesizes web information for users. Your responses should always be friendly, natural, and human-like. Never say "no results found" or mention system failures. If information is limited or unrealistic, explain why briefly and suggest helpful alternatives. Extract key information from sources, remove duplicates, and organize clearly with a conversational tone.'
                 },
                 {
                   role: 'user',
@@ -227,20 +232,24 @@ class WebSearchAgentMultiStep extends BaseAgent {
             const extractedPages = await contentExtractor.extractMultiple(topUrls, 8000);
             const successfulPages = extractedPages.filter(p => p.success && p.content);
             
-            if (successfulPages.length === 0) {
-              return {
-                success: false,
-                error: 'Could not extract content from any sources',
-                stage: 'extraction_failed'
-              };
+            // Evaluate source quality
+            const totalContentLength = successfulPages.reduce((sum, p) => sum + (p.content?.length || 0), 0);
+            const avgContentLength = successfulPages.length > 0 ? totalContentLength / successfulPages.length : 0;
+            
+            // Determine search confidence based on source count and content quality
+            let searchConfidence = 'HIGH';
+            if (successfulPages.length < 2 || totalContentLength < 1000) {
+              searchConfidence = 'LOW';
             }
-
+            
+            console.log(`[WebSearchAgent] 📊 Source quality: ${successfulPages.length} pages, ${totalContentLength} chars, confidence: ${searchConfidence}`);
             console.log(`[WebSearchAgent] 🧠 Synthesizing from ${successfulPages.length} sources...`);
             
             const synthesisPrompt = this.buildSynthesisPrompt(
               params.query,
               params.synthesisGoal || 'relevant information',
-              successfulPages
+              successfulPages,
+              searchConfidence
             );
 
             const llm = context.llm || this.llm;
@@ -249,7 +258,7 @@ class WebSearchAgentMultiStep extends BaseAgent {
               messages: [
                 {
                   role: 'system',
-                  content: 'You are a research synthesis expert. Extract key information from multiple sources, remove duplicates, and organize into clear, structured content.'
+                  content: 'You are a helpful research assistant who synthesizes web information for users. Your responses should always be friendly, natural, and human-like. Never say "no results found" or mention system failures. If information is limited or unrealistic, explain why briefly and suggest helpful alternatives. Extract key information from sources, remove duplicates, and organize clearly with a conversational tone.'
                 },
                 {
                   role: 'user',
@@ -292,17 +301,50 @@ class WebSearchAgentMultiStep extends BaseAgent {
   /**
    * Build synthesis prompt for LLM
    */
-  buildSynthesisPrompt(query, goal, pages) {
+  buildSynthesisPrompt(query, goal, pages, searchConfidence = 'HIGH') {
     let prompt = `User Query: "${query}"\n`;
-    prompt += `Synthesis Goal: Extract and organize ${goal}\n\n`;
-    prompt += `I have fetched content from ${pages.length} web sources. Please:\n`;
-    prompt += `1. Read all sources carefully\n`;
-    prompt += `2. Extract key information relevant to the query\n`;
-    prompt += `3. Remove duplicate information\n`;
-    prompt += `4. Synthesize into clear, structured content\n`;
-    prompt += `5. Organize with headers and sections\n`;
-    prompt += `6. Do NOT just list the sources - synthesize the knowledge\n\n`;
-    prompt += `Sources:\n\n`;
+    prompt += `Synthesis Goal: Extract and organize ${goal}\n`;
+    prompt += `Search Confidence: ${searchConfidence}\n\n`;
+    
+    prompt += `IMPORTANT: Your response should always be helpful and user-friendly.\n\n`;
+    
+    prompt += `RULES:\n`;
+    prompt += `1. If searchConfidence is HIGH and relevant information is found:\n`;
+    prompt += `   - Provide a clear, structured answer based on the sources\n`;
+    prompt += `   - Extract key information and remove duplicates\n`;
+    prompt += `   - Organize with headers and sections\n\n`;
+    
+    prompt += `2. If searchConfidence is LOW (weak sources or unrealistic query):\n`;
+    prompt += `   - Do NOT generate speculative content, loosely related examples, or random associations\n`;
+    prompt += `   - Do NOT turn this into a blog article with multiple sections\n`;
+    prompt += `   - Do NOT invent examples just because they share a word with the query\n`;
+    prompt += `   - Instead:\n`;
+    prompt += `     a) Acknowledge the user's request directly\n`;
+    prompt += `     b) Briefly explain why reliable information doesn't exist (if applicable)\n`;
+    prompt += `     c) Suggest 2-3 useful, REAL alternatives the user can actually explore\n`;
+    prompt += `   - KEEP IT CONVERSATIONAL: 3-6 sentences maximum\n`;
+    prompt += `   - STAY FOCUSED: Only suggest alternatives that truly make sense\n\n`;
+    
+    prompt += `3. Always maintain a friendly, conversational tone like a helpful assistant\n\n`;
+    
+    prompt += `4. NEVER mention internal system details like:\n`;
+    prompt += `   - "web search failed"\n`;
+    prompt += `   - "content extraction failed"\n`;
+    prompt += `   - "no sources found"\n`;
+    prompt += `   Instead, present a natural explanation\n\n`;
+    
+    prompt += `EXAMPLE FALLBACK PATTERN (for impossible queries):\n`;
+    prompt += `User query: "restaurants on Mars"\n`;
+    prompt += `Bad: "No results found."\n`;
+    prompt += `Too Long: [Multi-paragraph science fiction explanation about hydroponic farms and 3D-printed food]\n`;
+    prompt += `Good: "There are currently no restaurants on the planet Mars — human settlements haven't been established there yet. 🚀\n\n`;
+    prompt += `However, you might be interested in:\n`;
+    prompt += `• Restaurants in Mars, Pennsylvania\n`;
+    prompt += `• Space-themed restaurants on Earth\n`;
+    prompt += `• Future concepts for dining in space\n\n`;
+    prompt += `Let me know if you'd like recommendations for any of these!"\n\n`;
+    
+    prompt += `I have fetched content from ${pages.length} web source(s):\n\n`;
 
     pages.forEach((page, index) => {
       prompt += `--- SOURCE ${index + 1}: ${page.title} ---\n`;
@@ -310,9 +352,10 @@ class WebSearchAgentMultiStep extends BaseAgent {
       prompt += `Content:\n${page.content.substring(0, 3000)}\n\n`;
     });
 
-    prompt += `\nNow synthesize this information into structured, coherent content that directly answers the user's query.`;
+    prompt += `\nNow synthesize this information following the rules above.`;
     prompt += `\nFormat with markdown (headers, bullet points, etc.) for readability.`;
-    prompt += `\nOptionally cite sources at the end if relevant.`;
+    prompt += `\nBe helpful and human, not robotic or technical.`;
+    prompt += `\nIf the query cannot be answered due to lack of real data, keep your response brief and practical.`;
 
     return prompt;
   }

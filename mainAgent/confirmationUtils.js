@@ -438,14 +438,11 @@ const confirmationConfig = {
         lines.push(`**Subject:** ${params.subject}`);
         lines.push('\n**Content:**');
         
-        // If AI has already generated the content, show it
-        if (params.isAIGenerated && params.body) {
+        // ALWAYS show body if it exists - NEVER show placeholder in preview
+        if (params.body && params.body.trim()) {
           lines.push(params.body);
-        } else if (params.body && params.body.trim()) {
-          lines.push(params.body);
-          lines.push('\n_✨ AI will compose a proper email based on this intent_');
         } else {
-          lines.push('_(AI will generate appropriate email content)_');
+          lines.push('_(Email content will be generated)_');
         }
         return lines.join('\n');
       }

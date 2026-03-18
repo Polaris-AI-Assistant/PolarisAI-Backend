@@ -45,6 +45,7 @@ const ARTIFACT_TYPES = {
     LABEL: 'label',
     FILTER: 'filter',
     FLIGHT_SEARCH: 'flight_search',
+    WEB_SEARCH: 'web_search',
     // Microsoft-specific types
     OUTLOOK_EMAIL: 'outlook_email',
     OUTLOOK_DRAFT: 'outlook_draft',
@@ -70,6 +71,7 @@ const TYPE_DISPLAY_NAMES = {
     label: 'Label',
     filter: 'Filter',
     flight_search: 'Flight Search',
+    web_search: 'Web Search',
     // Microsoft-specific display names
     outlook_email: 'Outlook Email',
     outlook_draft: 'Outlook Draft',
@@ -170,6 +172,9 @@ const extractAndStoreArtifact = async (conversationId, agentType, toolName, resu
             break;
         case 'flights':
             artifact = extractFlightsArtifact(toolName, result);
+            break;
+        case 'websearch':
+            artifact = extractWebSearchArtifact(toolName, result);
             break;
         case 'microsoft':
             artifact = extractMicrosoftArtifact(toolName, result);
@@ -709,6 +714,74 @@ const extractFlightsArtifact = (toolName, result) => {
 };
 
 /**
+ * Extract artifact from WebSearch tool result
+ * Stores web search results for reference in subsequent operations
+ */
+const extractWebSearchArtifact = (toolName, result) => {
+    console.log(`[ArtifactMemory] 🔍 extractWebSearchArtifact called for tool: ${toolName}`);
+    console.log(`[ArtifactMemory]   Result success: ${result?.success}`);
+    
+    if (!result || !result.success) {
+        console.log(`[ArtifactMemory]   ❌ Result is null or not successful`);
+        return null;
+    }
+
+    // Unwrap agent result to get actual tool output
+    let toolResult = result;
+    if (result.raw_results && Array.isArray(result.raw_results) && result.raw_results.length > 0) {
+        const successResult = result.raw_results.find(r => r.success);
+        if (successResult) {
+            toolResult = successResult;
+        }
+    }
+    
+    console.log(`[ArtifactMemory]   toolResult keys: ${Object.keys(toolResult).join(', ')}`);
+
+    switch (toolName) {
+        case 'webSearch':
+        case 'searchWeb':
+        case 'fetchAndSynthesize':
+        case 'researchAndSynthesize':
+            // Extract synthesizedContent from websearch results
+            const synthesizedContent = toolResult.synthesizedContent || toolResult.content;
+            const sources = toolResult.sources || [];
+            const query = toolResult.query || toolResult.searchQuery || 'Unknown query';
+            
+            if (!synthesizedContent) {
+                console.log(`[ArtifactMemory]   ❌ No synthesizedContent found in websearch result`);
+                return null;
+            }
+            
+            // Create a unique search ID based on query and timestamp
+            const searchId = `websearch_${Date.now()}_${query.substring(0, 20).replace(/\s+/g, '_')}`;
+            
+            console.log(`[ArtifactMemory]   ✅ Extracted websearch result for query: "${query}"`);
+            console.log(`[ArtifactMemory]   📊 Content length: ${synthesizedContent.length} chars, Sources: ${sources.length}`);
+            
+            return {
+                id: searchId,
+                type: ARTIFACT_TYPES.WEB_SEARCH,
+                title: `Web Search: ${query}`,
+                data: {
+                    query: query,
+                    synthesizedContent: synthesizedContent,
+                    sources: sources.map(s => ({
+                        title: s.title,
+                        url: s.url,
+                        snippet: s.snippet
+                    })),
+                    searchedAt: new Date().toISOString(),
+                    contentLength: synthesizedContent.length,
+                    sourcesCount: sources.length
+                }
+            };
+    }
+
+    console.log(`[ArtifactMemory]   ❌ No artifact could be extracted for websearch tool: ${toolName}`);
+    return null;
+};
+
+/**
  * Extract artifact from Microsoft tool result
  * Handles Outlook email, Calendar, OneDrive, and Excel operations
  */
@@ -981,6 +1054,27 @@ const formatArtifactsForPrompt = async (conversationId) => {
             }
         }
         
+        // Add extra context for websearch artifacts
+        if (artifact.type === 'web_search' && artifact.data) {
+            const wsData = artifact.data;
+            line += `\n  Query: "${wsData.query}"`;
+            line += `\n  Content: ${wsData.contentLength} characters`;
+            line += `\n  Sources: ${wsData.sourcesCount || 0}`;
+            if (wsData.synthesizedContent) {
+                // Show first 300 chars of the synthesized content
+                const preview = wsData.synthesizedContent.length > 300 
+                    ? wsData.synthesizedContent.substring(0, 300) + '...' 
+                    : wsData.synthesizedContent;
+                line += `\n  Preview: ${preview}`;
+            }
+            if (wsData.sources && wsData.sources.length > 0) {
+                line += `\n  Top Sources:`;
+                wsData.sources.slice(0, 3).forEach((source, i) => {
+                    line += `\n    ${i + 1}. ${source.title || 'Untitled'} - ${source.url}`;
+                });
+            }
+        }
+        
         // Add extra context for Microsoft artifacts
         if (artifact.type === 'outlook_email' && artifact.data) {
             if (artifact.data.to) line += `\n  To: ${artifact.data.to}`;
@@ -1002,8 +1096,9 @@ const formatArtifactsForPrompt = async (conversationId) => {
     });
 
     lines.push('');
-    lines.push('When user refers to "it", "that", "the previous one", "the form/doc/sheet we created", "that flight", "the IndiGo flight", "the outlook email", "the onedrive file", etc., resolve to the appropriate artifact above.');
+    lines.push('When user refers to "it", "that", "the previous one", "the form/doc/sheet we created", "that flight", "the IndiGo flight", "the outlook email", "the onedrive file", "this info", "these results", "the search results", etc., resolve to the appropriate artifact above.');
     lines.push('For flights: If user says "book flight X" or "I want the IndiGo flight", use the flight details from the stored flight search artifact above.');
+    lines.push('For web searches: If user says "send this info", "email these results", "send the search results", use the synthesized content and sources from the web search artifact above.');
     lines.push('For Microsoft: Resolve references to "the email I sent via outlook", "the teams meeting", "the file on onedrive" to the appropriate Microsoft artifact.');
     
     return lines.join('\n');
@@ -1028,6 +1123,7 @@ const getIdFieldName = (type) => {
         label: 'labelId',
         filter: 'filterId',
         flight_search: 'searchId',
+        web_search: 'searchId',
         // Microsoft-specific ID fields
         outlook_email: 'messageId',
         outlook_draft: 'draftId',
@@ -1090,7 +1186,13 @@ const resolveArtifactReference = async (conversationId, reference) => {
         'indigo': ARTIFACT_TYPES.FLIGHT_SEARCH,
         'air india': ARTIFACT_TYPES.FLIGHT_SEARCH,
         'spicejet': ARTIFACT_TYPES.FLIGHT_SEARCH,
-        'vistara': ARTIFACT_TYPES.FLIGHT_SEARCH
+        'vistara': ARTIFACT_TYPES.FLIGHT_SEARCH,
+        'search': ARTIFACT_TYPES.WEB_SEARCH,
+        'web search': ARTIFACT_TYPES.WEB_SEARCH,
+        'research': ARTIFACT_TYPES.WEB_SEARCH,
+        'info': ARTIFACT_TYPES.WEB_SEARCH,
+        'information': ARTIFACT_TYPES.WEB_SEARCH,
+        'results': ARTIFACT_TYPES.WEB_SEARCH
     };
 
     // Check if reference contains a type hint

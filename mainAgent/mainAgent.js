@@ -494,23 +494,49 @@ class MainAgent {
           
           // Also extract artifacts from initial results
           for (const [agentName, agentResult] of Object.entries(initialResults)) {
-            if (agentResult.success && agentResult.tools_used) {
-              for (let i = 0; i < agentResult.tools_used.length; i++) {
-                const tool = agentResult.tools_used[i];
-                try {
-                  const rawResult = agentResult.raw_results?.[i] || agentResult.raw_results?.find(r => r.success !== false) || agentResult;
-                  const artifact = await extractAndStoreArtifact(
-                    conversationId,
-                    agentName,
-                    tool.name || tool,
-                    rawResult
-                  );
-                  if (artifact) {
-                    storedArtifacts.push(artifact);
-                    console.log(`[MainAgent] ✅ Artifact from initial results: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+            if (agentResult.success) {
+              // ✅ NEW FORMAT: Handle BaseAgent executedActions format
+              if (agentResult.executedActions && Array.isArray(agentResult.executedActions)) {
+                console.log(`[MainAgent] 📦 Processing ${agentResult.executedActions.length} executed actions for ${agentName} (initial results)`);
+                for (const action of agentResult.executedActions) {
+                  try {
+                    const toolName = action.tool;
+                    const toolResult = action.result;
+                    console.log(`[MainAgent] 🔍 Attempting to store artifact for ${agentName}/${toolName} (initial)`);
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId,
+                      agentName,
+                      toolName,
+                      toolResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                      console.log(`[MainAgent] ✅ Artifact from initial results: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] ⚠️ Error extracting artifact from initial results:`, artifactError);
                   }
-                } catch (artifactError) {
-                  console.error(`[MainAgent] ⚠️ Error extracting artifact from initial results:`, artifactError);
+                }
+              }
+              // ✅ OLD FORMAT: Handle legacy tools_used format
+              else if (agentResult.tools_used) {
+                for (let i = 0; i < agentResult.tools_used.length; i++) {
+                  const tool = agentResult.tools_used[i];
+                  try {
+                    const rawResult = agentResult.raw_results?.[i] || agentResult.raw_results?.find(r => r.success !== false) || agentResult;
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId,
+                      agentName,
+                      tool.name || tool,
+                      rawResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                      console.log(`[MainAgent] ✅ Artifact from initial results: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] ⚠️ Error extracting artifact from initial results:`, artifactError);
+                  }
                 }
               }
             }
@@ -622,23 +648,49 @@ class MainAgent {
             }
             
             // Store artifacts from successful tool executions
-            if (conversationId && result.success && result.tools_used) {
-              for (let i = 0; i < result.tools_used.length; i++) {
-                const tool = result.tools_used[i];
-                try {
-                  const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
-                  const artifact = await extractAndStoreArtifact(
-                    conversationId,
-                    currentAgentName,
-                    tool.name || tool,
-                    rawResult
-                  );
-                  if (artifact) {
-                    storedArtifacts.push(artifact);
-                    console.log(`[MainAgent] ✅ Artifact stored: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+            if (conversationId && result.success) {
+              // ✅ NEW FORMAT: Handle BaseAgent executedActions format
+              if (result.executedActions && Array.isArray(result.executedActions)) {
+                console.log(`[MainAgent] 📦 Processing ${result.executedActions.length} executed actions for ${currentAgentName}`);
+                for (const action of result.executedActions) {
+                  try {
+                    const toolName = action.tool;
+                    const toolResult = action.result;
+                    console.log(`[MainAgent] 🔍 Attempting to store artifact for ${currentAgentName}/${toolName}`);
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId,
+                      currentAgentName,
+                      toolName,
+                      toolResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                      console.log(`[MainAgent] ✅ Artifact stored: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] ⚠️ Error storing artifact:`, artifactError);
                   }
-                } catch (artifactError) {
-                  console.error(`[MainAgent] ⚠️ Error storing artifact:`, artifactError);
+                }
+              }
+              // ✅ OLD FORMAT: Handle legacy tools_used format
+              else if (result.tools_used) {
+                for (let i = 0; i < result.tools_used.length; i++) {
+                  const tool = result.tools_used[i];
+                  try {
+                    const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId,
+                      currentAgentName,
+                      tool.name || tool,
+                      rawResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                      console.log(`[MainAgent] ✅ Artifact stored: ${artifact.type} - ${artifact.title} (${artifact.id})`);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] ⚠️ Error storing artifact:`, artifactError);
+                  }
                 }
               }
             }
@@ -2569,23 +2621,49 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
             }
 
             // Store artifacts from successful tool executions (SEQUENTIAL)
-            if (conversationId && result.success && result.tools_used) {
-              for (let i = 0; i < result.tools_used.length; i++) {
-                const tool = result.tools_used[i];
-                try {
-                  // Match the tool with its corresponding result by index
-                  const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
-                  const artifact = await extractAndStoreArtifact(
-                    conversationId, 
-                    agentName, 
-                    tool.name || tool, 
-                    rawResult
-                  );
-                  if (artifact) {
-                    storedArtifacts.push(artifact);
+            if (conversationId && result.success) {
+              // ✅ NEW FORMAT: Handle BaseAgent executedActions format
+              if (result.executedActions && Array.isArray(result.executedActions)) {
+                console.log(`[MainAgent] 📦 Processing ${result.executedActions.length} executed actions for ${agentName} (sequential)`);
+                for (const action of result.executedActions) {
+                  try {
+                    const toolName = action.tool;
+                    const toolResult = action.result;
+                    console.log(`[MainAgent] 🔍 Attempting to store artifact for ${agentName}/${toolName} (sequential)`);
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId,
+                      agentName,
+                      toolName,
+                      toolResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                      console.log(`[MainAgent] ✅ Artifact stored (sequential): ${artifact.type} - ${artifact.title}`);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] ⚠️ Error storing artifact (sequential):`, artifactError);
                   }
-                } catch (artifactError) {
-                  console.error(`[MainAgent] Error storing artifact:`, artifactError);
+                }
+              }
+              // ✅ OLD FORMAT: Handle legacy tools_used format
+              else if (result.tools_used) {
+                for (let i = 0; i < result.tools_used.length; i++) {
+                  const tool = result.tools_used[i];
+                  try {
+                    // Match the tool with its corresponding result by index
+                    const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId, 
+                      agentName, 
+                      tool.name || tool, 
+                      rawResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] Error storing artifact:`, artifactError);
+                  }
                 }
               }
             }
@@ -2674,23 +2752,49 @@ NEVER return empty agents for queries containing "create", "make", "send", "sche
             results[agentName] = result;
 
             // Store artifacts from successful tool executions (PARALLEL)
-            if (conversationId && result.success && result.tools_used) {
-              for (let i = 0; i < result.tools_used.length; i++) {
-                const tool = result.tools_used[i];
-                try {
-                  // Match the tool with its corresponding result by index
-                  const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
-                  const artifact = await extractAndStoreArtifact(
-                    conversationId, 
-                    agentName, 
-                    tool.name || tool, 
-                    rawResult
-                  );
-                  if (artifact) {
-                    storedArtifacts.push(artifact);
+            if (conversationId && result.success) {
+              // ✅ NEW FORMAT: Handle BaseAgent executedActions format
+              if (result.executedActions && Array.isArray(result.executedActions)) {
+                console.log(`[MainAgent] 📦 Processing ${result.executedActions.length} executed actions for ${agentName}`);
+                for (const action of result.executedActions) {
+                  try {
+                    const toolName = action.tool;
+                    const toolResult = action.result;
+                    console.log(`[MainAgent] 🔍 Attempting to store artifact for ${agentName}/${toolName}`);
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId,
+                      agentName,
+                      toolName,
+                      toolResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                      console.log(`[MainAgent] ✅ Stored artifact: ${artifact.type} - ${artifact.title}`);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] ⚠️ Error storing artifact from executedActions:`, artifactError);
                   }
-                } catch (artifactError) {
-                  console.error(`[MainAgent] Error storing artifact:`, artifactError);
+                }
+              }
+              // ✅ OLD FORMAT: Handle legacy tools_used format
+              else if (result.tools_used) {
+                for (let i = 0; i < result.tools_used.length; i++) {
+                  const tool = result.tools_used[i];
+                  try {
+                    // Match the tool with its corresponding result by index
+                    const rawResult = result.raw_results?.[i] || result.raw_results?.find(r => r.success !== false) || result;
+                    const artifact = await extractAndStoreArtifact(
+                      conversationId, 
+                      agentName, 
+                      tool.name || tool, 
+                      rawResult
+                    );
+                    if (artifact) {
+                      storedArtifacts.push(artifact);
+                    }
+                  } catch (artifactError) {
+                    console.error(`[MainAgent] Error storing artifact:`, artifactError);
+                  }
                 }
               }
             }
@@ -3509,23 +3613,79 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             params._deferredGeneration) {
           console.log(`[Confirmation] 🔄 Email has deferred generation - regenerating with actual content NOW`);
           
-          // Try to get artifact from conversation context
-          let artifact = null;
+          // Get ALL artifacts from conversation context
+          let artifacts = [];
+          let artifactContext = null;
           
           if (conversationId) {
             try {
-              const artifactContext = await buildArtifactContext(conversationId, query);
-              if (artifactContext.resolvedArtifact) {
-                artifact = artifactContext.resolvedArtifact;
-                console.log(`[Confirmation] 📦 Using artifact from conversation: ${artifact.type} - ${artifact.title}`);
-              }
+              artifactContext = await buildArtifactContext(conversationId, query);
+              artifacts = artifactContext.allArtifacts || [];
+              console.log(`[Confirmation] 📦 Retrieved ${artifacts.length} artifact(s) from conversation`);
+              artifacts.forEach((a, i) => {
+                console.log(`[Confirmation]   ${i + 1}. [${a.type}] "${a.title}" (ID: ${a.id})`);
+              });
             } catch (err) {
-              console.warn(`[Confirmation] ⚠️ Could not fetch artifact context:`, err.message);
+              console.error(`[Confirmation] ❌ Error fetching artifact context:`, err.message);
             }
           }
           
-          // If we have an artifact, regenerate the email with actual content
-          if (artifact) {
+          // Detect if user wants to send multiple artifacts
+          const multipleArtifactPattern = /\b(both|all|these|those|two|multiple)\b/i;
+          const wantsMultiple = multipleArtifactPattern.test(query) && artifacts.length > 1;
+          
+          if (wantsMultiple) {
+            console.log(`[Confirmation] 📧 User wants to send MULTIPLE artifacts (${artifacts.length})`);
+            
+            // Generate email with ALL artifacts
+            const allLinks = artifacts.map(artifact => {
+              const artifactType = artifact.type?.toLowerCase();
+              let link = '';
+              let typeName = '';
+              
+              if (artifactType === 'doc' || artifactType === 'document') {
+                link = `https://docs.google.com/document/d/${artifact.id}/edit`;
+                typeName = 'Document';
+              } else if (artifactType === 'form') {
+                link = `https://docs.google.com/forms/d/${artifact.id}/viewform`;
+                typeName = 'Form';
+              } else if (artifactType === 'sheet' || artifactType === 'spreadsheet') {
+                link = `https://docs.google.com/spreadsheets/d/${artifact.id}/edit`;
+                typeName = 'Spreadsheet';
+              } else if (artifactType === 'event' || artifactType === 'calendar_event') {
+                link = artifact.eventLink || artifact.meetLink || '';
+                typeName = 'Event';
+              }
+              
+              return { title: artifact.title, link, typeName };
+            }).filter(item => item.link);
+            
+            // Generate professional email with all links
+            const subject = `Sharing ${allLinks.length} Resources`;
+            let body = `Hello,\n\nI'm sharing the following resources with you:\n\n`;
+            
+            allLinks.forEach((item, index) => {
+              body += `${index + 1}. **${item.typeName}: ${item.title}**\n   ${item.link}\n\n`;
+            });
+            
+            body += `Feel free to access these at your convenience.\n\nBest regards`;
+            
+            params = {
+              to: params.to,
+              subject,
+              body,
+              isAIGenerated: true  // Mark as AI-generated so preview shows the full body
+            };
+            
+            console.log(`[Confirmation] ✅ Generated email for ${allLinks.length} artifacts`);
+            console.log(`[Confirmation]   Subject: ${subject}`);
+            console.log(`[Confirmation]   Body length: ${body.length} chars`);
+            
+          } else if (artifacts.length > 0) {
+            // Single artifact - use the most relevant one
+            const artifact = artifactContext.resolvedArtifact || artifacts[artifacts.length - 1];
+            console.log(`[Confirmation] 📧 User wants to send SINGLE artifact: ${artifact.type} - ${artifact.title}`);
+            
             let itemType = null;
             let itemDetails = null;
             
@@ -3542,6 +3702,13 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
               itemDetails = {
                 formId: artifact.id,
                 formLink: `https://docs.google.com/forms/d/${artifact.id}/viewform`,
+                title: artifact.title
+              };
+            } else if (artifactType === 'sheet' || artifactType === 'spreadsheet') {
+              itemType = 'spreadsheet';
+              itemDetails = {
+                sheetId: artifact.id,
+                sheetLink: `https://docs.google.com/spreadsheets/d/${artifact.id}/edit`,
                 title: artifact.title
               };
             } else if (artifactType === 'event' || artifactType === 'calendar_event') {
@@ -3573,12 +3740,31 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
               });
               
               // Replace placeholder params with actual content
-              params = regeneratedEmail;
+              params = {
+                ...regeneratedEmail,
+                isAIGenerated: true  // Mark as AI-generated so preview shows the full body
+              };
             } else {
-              console.warn(`[Confirmation] ⚠️ Could not determine item type from artifact: ${artifactType}`);
+              console.error(`[Confirmation] ❌ Could not determine item type from artifact: ${artifactType}`);
+              // Generate generic email as fallback
+              params = {
+                to: params.to,
+                subject: `Sharing: ${artifact.title}`,
+                body: `Hello,\n\nI wanted to share this with you: ${artifact.title}\n\nBest regards`,
+                isAIGenerated: true  // Mark as AI-generated so preview shows the full body
+              };
             }
           } else {
-            console.warn(`[Confirmation] ⚠️ No artifact found - will show placeholder content (BAD UX!)`);
+            console.error(`[Confirmation] ❌ NO ARTIFACTS FOUND - This should NEVER happen!`);
+            console.error(`[Confirmation] ❌ Conversation ID: ${conversationId}`);
+            console.error(`[Confirmation] ❌ Query: ${query}`);
+            // Generate generic email to avoid showing placeholder
+            params = {
+              to: params.to,
+              subject: 'Sharing Information',
+              body: `Hello,\n\nI wanted to share some information with you.\n\nBest regards`,
+              isAIGenerated: true  // Mark as AI-generated so preview shows the full body
+            };
           }
         }
         
@@ -5503,11 +5689,30 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
 
       // Build context about chain status
       let chainContext = '';
+      const multipleAgentsCompleted = Object.keys(allResults).length > 1;
+      
+      console.log(`[MainAgent] 📝 Response generation context:`, {
+        multipleAgentsCompleted,
+        hasNextConfirmation: !!nextConfirmation,
+        nextAction: nextConfirmation?.toolName || 'none'
+      });
+      
       if (nextConfirmation) {
+        // There's a next action waiting for confirmation
         chainContext = `\n\nIMPORTANT: This is step ${nextConfirmation.chainInfo.currentStep - 1} of ${nextConfirmation.chainInfo.totalSteps} in the user's request.
 The next step is: ${nextConfirmation.toolName} (${nextConfirmation.agentName})
 After confirming this action was successful, mention that you'll now proceed with the next action (${nextConfirmation.description}).
 Do NOT say "let me know if you need anything else" - there's still more to do.`;
+      } else if (multipleAgentsCompleted) {
+        // All actions in chain are complete - make this VERY clear to the LLM
+        console.log(`[MainAgent] ✅ All ${Object.keys(allResults).length} actions completed - enforcing past tense in response`);
+        chainContext = `\n\n✅ CRITICAL: ALL requested actions have been COMPLETED successfully.
+This was a multi-step task and EVERY step is now DONE.
+- Do NOT use future tense like "I will now..." or "I will proceed..."
+- Do NOT say you're going to do something - everything is ALREADY done
+- Clearly state that ALL tasks have been completed
+- Present the results from all actions cohesively
+- Use past tense: "I have created...", "Both the form and spreadsheet have been created..."`;
       }
 
       // Safely stringify result, handling circular references
@@ -5633,6 +5838,16 @@ ${JSON.stringify({
 }).join('\n\n')}
 ${chainContext}
 
+${multipleAgentsCompleted && !nextConfirmation ? `\nCOMPLETED ACTIONS SUMMARY (all done):
+${Object.entries(allResults).map(([agent, result], index) => {
+  const rawResult = result?.raw_results?.[0] || result || {};
+  const title = rawResult.title || rawResult.name || rawResult.documentTitle || 'Item';
+  const id = rawResult.formId || rawResult.spreadsheetId || rawResult.documentId || rawResult.eventId || 'created';
+  return `${index + 1}. ${agent.toUpperCase()}: "${title}" (${id}) - ✅ COMPLETED`;
+}).join('\n')}
+
+REMINDER: All of the above have been CREATED and COMPLETED. Do not use future tense.` : ''}
+
 Please provide a natural, conversational response that:
 1. Addresses ALL parts of the user's original request
 2. Presents information from ALL agents that executed
@@ -5644,10 +5859,11 @@ Please provide a natural, conversational response that:
 8. For other actions: Include relevant details and links
 9. Is friendly and helpful in tone
 10. Combines all information naturally without repetition
-${nextConfirmation ? '11. Briefly mention that you will now proceed with the next action' : ''}
+${nextConfirmation ? '11. Briefly mention that you will now proceed with the next action' : multipleAgentsCompleted ? '11. Clearly state that ALL requested tasks have been completed (use past tense only)' : ''}
 
 IMPORTANT: 
 - Present ALL information from all agents in a cohesive response
+${multipleAgentsCompleted && !nextConfirmation ? '- ALL actions are COMPLETE - never use future tense, always use past tense' : ''}
 - For websearch: The synthesizedContent field contains complete markdown-formatted research - present it naturally
 - For sheets: If spreadsheetId and spreadsheetUrl are present, the spreadsheet WAS created successfully - include the link
 - Don't just focus on the confirmed action - include websearch results, weather, maps, schedules, or other data too
