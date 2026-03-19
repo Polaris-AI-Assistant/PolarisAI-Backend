@@ -2170,352 +2170,193 @@ Language Detection Rules:
         }
       }
 
-      // If we reach here, it's an actionable query - proceed with agent routing
+      // If we reach here, it's an actionable query - proceed with agent routing using LLM-based routing
       if (intentClassification.type !== 'actionable') {
-        console.log('[MainAgent] ⚠️ Unexpected intent type:', intentClassification.type);
-        // Default to actionable if classification is unclear
+        console.log('[MainAgent] ⚠️ Intent type:', intentClassification.type);
+        // Still proceed - let LLM routing handle edge cases
       }
 
+      // ========================================================================
+      // PURE LLM-BASED AGENT ROUTING (NO PATTERN MATCHING)
+      // ========================================================================
+      // Use a SIMPLE, CLEAN prompt that leverages the IntentClassification result
+      // Eliminates all the heuristics and pattern matching - just reasoning
+      
       let artifactSection = '';
       if (artifactContext && artifactContext.allArtifacts && artifactContext.allArtifacts.length > 0) {
-        artifactSection = `\n\nCONVERSATION ARTIFACTS (Previously created items in this conversation):
-${artifactContext.allArtifacts.map(a => `- [${a.type.toUpperCase()}] "${a.title}" (ID: ${a.id})`).join('\n')}
-
-IMPORTANT: If the user refers to "it", "the form", "that document", etc., they are referring to one of the artifacts above. 
-Include the specific artifact ID in the query you generate for the agent.`;
+        artifactSection = `\n\nCONVERSATION ARTIFACTS:
+${artifactContext.allArtifacts.map(a => `- [${a.type.toUpperCase()}] "${a.title}" (ID: ${a.id})`).join('\n')}`;
       }
 
-      // Build long-term memory section for the prompt
       let memorySection = '';
       if (memoryContext && memoryContext.length > 0) {
-        memorySection = `\n\nLONG-TERM USER MEMORIES (Relevant past interactions with this user):
-${memoryContext}
-
-IMPORTANT: Consider these memories when analyzing the query. They may provide context about:
-- User preferences and habits
-- Ongoing tasks they may be following up on
-- Past interactions with specific services
-Use this context to better understand the user's intent and route accordingly.`;
+        memorySection = `\n\nLONG-TERM USER MEMORIES:\n${memoryContext}`;
       }
 
-      // Build conversation history section for context
       let conversationSection = '';
       if (conversationHistory && conversationHistory.length > 0) {
-        // Get last few messages for context (max 6 messages)
-        const recentHistory = conversationHistory.slice(-6);
-        
-        // Check if the current query references content from conversation
-        // (e.g., "add this summary", "put this in a doc", "add that to")
-        const lowerQ = query.toLowerCase();
-        const referencesContent = /\b(add|put|insert|paste|copy|include|use)\b.*\b(this|that|the|it|above|previous|last)\b.*\b(summary|content|text|response|answer|result|info|information|details|data)\b/i.test(query) ||
-          /\b(add|put)\b.*\b(this|that|it)\b.*\b(to|into|in)\b/i.test(query) ||
-          /\b(this|that|the)\b.*\b(summary|content|text)\b.*\b(to|into|in)\b/i.test(query);
-        
-        // Use higher char limit when user references content from conversation
-        // to ensure the full content is available for the routing LLM
-        const charLimit = referencesContent ? 8000 : 500;
-        
+        const recentHistory = conversationHistory.slice(-4);
         const historyText = recentHistory.map(msg => 
-          `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, charLimit)}`
+          `${msg.role === 'user' ? 'User' : 'Assistant'}: ${String(msg.content).substring(0, 300)}`
         ).join('\n');
-        
-        conversationSection = `\n\nRECENT CONVERSATION HISTORY:
-${historyText}
-
-IMPORTANT: Consider the conversation context above when analyzing the current query. 
-- If the user provides a date/time after asking about flights, they are providing the date FOR THE FLIGHTS, not for a calendar event.
-- If the user says just a date like "14 dec" or "tomorrow" after asking about flights, route to flights agent with the full context.
-- Short follow-up messages like dates, times, or confirmations should be interpreted in the context of the previous messages.`;
+        conversationSection = `\n\nRECENT CONTEXT:\n${historyText}`;
       }
 
-      const analysisPrompt = `STEP 1: First, answer this question:
-Is the user asking about PAST information (what they already told you, what happened before, what they searched/created)?
+      const routingPrompt = `You are an expert at routing user queries to specialized agents based on their intent.
 
 User Query: "${query}"
+Intent Classification: ${JSON.stringify(intentClassification)}
 ${conversationSection}
-
-CRITICAL - These words indicate NEW ACTIONS (NOT past queries - MUST use agents):
-- "create", "make", "build", "generate" → User wants to CREATE something NEW
-- "send", "email", "message" → User wants to SEND something
-- "schedule", "book", "set up" → User wants to SCHEDULE something
-- "search", "find", "look for", "show", "list", "check", "get" → User wants to FETCH/FIND data
-
-ABSOLUTELY NOT PAST QUERIES - Always route to agents:
-- "create a google form" → MUST use forms agent
-- "create a form for X" → MUST use forms agent  
-- "make a survey" → MUST use forms agent
-- "create a document" → MUST use docs agent
-- "send an email" → MUST use gmail/microsoft agent
-- "schedule a meeting" → MUST use calendar agent
-- Any query starting with "create", "make", "build", "send", "schedule" → REQUIRES agents
-
-If query contains "create", "make", "build", "send", "schedule", "search", "find", "show", "list", "get" → Skip to STEP 2
-
-Common PAST queries ONLY (return empty agents):
-- "what is my name" / "who am I" 
-- "what did I tell you" / "what did we discuss"
-- "what flights did I search" / "what forms did I create" (asking about PAST actions)
-- "remind me" / "tell me about what we talked"
-- Questions using "was", "were", "did" about past actions they already performed
-
-If YES (truly past query) → You MUST return: {"agents": [], "reasoning": "User is asking about past conversation/information"}
-If NO → Continue to STEP 2
-
-STEP 2: Only if query is NOT about past, determine which agents are needed.
 ${artifactSection}
 ${memorySection}
 
-Available agents:
-- calendar: Google Calendar operations (events, meetings, schedules). IMPORTANT: Calendar agent can create events WITH Google Meet video conferencing attached. Use ONLY calendar for "create a google meet at [time]" or "schedule a meeting with video call".
-- docs: Google Docs operations (create/edit documents, text formatting)
-- forms: Google Forms operations (create forms, manage questions, view responses)
-- github: GitHub operations (repos, commits, issues, PRs, profile)
-- gmail: Gmail operations (send/read/search emails, drafts, labels, filters) - Use ONLY when user explicitly mentions "Gmail" or wants to use Google email services
-- meet: Google Meet operations (ONLY for standalone meeting spaces without calendar events, viewing meeting history, recordings, participants). Do NOT use meet agent if user wants a scheduled meeting with a time - use calendar instead.
-- sheets: Google Sheets operations (create/edit spreadsheets, data management)
-- flights: Flight search operations (search flights, compare prices, price insights, airlines, tickets)
-- maps: Google Maps operations (search places, directions, distance, geocoding, nearby search)
-- websearch: Web search operations (search for current information, news, events, real-time data from the internet). Use when user asks about CURRENT/LATEST/RECENT information, events, news, or anything requiring up-to-date data from the web.
-- microsoft: Microsoft 365 operations (Outlook Mail, Microsoft Calendar, OneDrive, Excel, Microsoft Teams chats/channels, Microsoft Word documents). Use this agent when user mentions "Outlook", "Microsoft", "OneDrive", "Excel", "Teams", "Microsoft Teams", "Word", "Microsoft Word", "Microsoft Calendar", or wants to send email "through Outlook" or "via Outlook". ALSO use for "show my outlook emails", "list my outlook mails", "check my outlook inbox", "list my teams", "show my teams chats", "list word documents".
-- weather: Weather and air quality operations (current weather, forecasts, temperature, precipitation, air quality, weather conditions). Use when user asks about weather, temperature, rain, snow, air quality, or outdoor conditions.
-- schedules: Reminders and scheduled actions (create reminders, schedule future actions, list/delete schedules). Use when user wants to "remind me to...", "set a reminder for...", "schedule a reminder...", or "check it again later". IMPORTANT: Use schedules agent for REMINDERS, use calendar agent for MEETINGS/EVENTS.
+AVAILABLE AGENTS AND THEIR CAPABILITIES:
 
-CRITICAL RULES for Web Search:
-1. "Do you know about [current event]" → Use websearch agent
-2. "What's the latest [news/update/information]" → Use websearch agent
-3. "Tell me about recent [developments/events]" → Use websearch agent
-4. "Is there an [event/summit/conference] happening" → Use websearch agent
-5. Any query requiring CURRENT, REAL-TIME, or UP-TO-DATE information → Use websearch agent
+- **calendar**: Google Calendar operations (events, meetings, schedules)
+  * Use for: "create event", "schedule meeting", "add to calendar", "show my events"
+  * IMPORTANT: Calendar agent can create events WITH Google Meet video conferencing attached
+  
+- **docs**: Google Docs operations (create/edit documents, text formatting)
+  * Use for: "create document", "write doc", "add to doc", "list my docs", "show my documents"
+  
+- **forms**: Google Forms operations (create forms, manage questions, view responses)
+  * Use for: "create form", "create survey", "make questionnaire", "add form question"
+  
+- **github**: GitHub operations (repos, commits, issues, PRs, profile)
+  * Use for: "create repo", "commit code", "create issue", "show repos", "pull request"
+  
+- **gmail**: Gmail operations (send/read/search emails, drafts, labels, filters)
+  * Use for: "send email" (default), "check gmail", "read email", "list my emails", "search emails"
+  * Use ONLY when user explicitly mentions "Gmail" or wants to use Google email services
+  
+- **meet**: Google Meet operations (standalone meeting spaces, recordings, participants, meeting history)
+  * Use for: "create meeting room", "show meetings", "list past meetings", "view recordings", "who joined meeting", "retrieve meeting history"
+  * IMPORTANT: Use for retrieving past Google Meet conference records (via Meet API)
+  * Do NOT use for scheduled meetings with time - use calendar instead
+  * IMPORTANT: "list my past Google Meet meetings" → meet agent (gets actual conference records)
+  * IMPORTANT: "show meeting history" or "who attended my meetings" → meet agent
+  
+- **sheets**: Google Sheets operations (create/edit spreadsheets, data management)
+  * Use for: "create spreadsheet", "create sheet", "add data to sheet", "list sheets"
+  
+- **flights**: Flight search operations
+  * Use for: "find flights", "compare prices", "search flights", "cheapest flights"
+  
+- **maps**: Google Maps operations (places, directions, distance, geocoding, nearby search)
+  * Use for: "find restaurants", "directions to", "distance between", "nearby hotels", "coordinates"
+  
+- **websearch**: Web search operations (current/real-time information, news, events)
+  * Use for: "what's latest", "do you know about", "tell me about recent", "current news"
+  * Use ONLY for CURRENT/REAL-TIME/UP-TO-DATE information, NOT for user's personal data
+  * CRITICAL: Never use websearch for "my docs", "my emails", "my calendar" - use specific agent
+  
+- **microsoft**: Microsoft 365 operations (Outlook Mail, Calendar, OneDrive, Excel, Teams, Word)
+  * Use for: "send via outlook", "outlook email", "microsoft calendar", "onedrive files", "teams chat", "word document"
+  * Use when user mentions: "Outlook", "Microsoft", "OneDrive", "Excel", "Teams", "Word"
+  
+- **weather**: Weather and air quality operations
+  * Use for: "what's weather", "temperature in", "will it rain", "air quality"
+  
+- **schedules**: Reminders and scheduled actions
+  * Use for: "remind me to", "set reminder", "schedule reminder"
+  * IMPORTANT: Use for REMINDERS (notifications), use calendar for MEETINGS/EVENTS
 
-CRITICAL RULES for Weather Queries:
-1. "What's the weather" → Use weather agent
-2. "Will it rain" → Use weather agent
-3. "Temperature in [location]" → Use weather agent
-4. "Air quality in [location]" → Use weather agent
-5. "Weather forecast" → Use weather agent
-6. DO NOT use websearch for weather queries - use the dedicated weather agent
+CRITICAL ROUTING RULES:
 
-CRITICAL RULES for Multi-Intent Queries (web search + another action):
-1. "Search for X and email it" → Use BOTH websearch AND gmail agents, requiresSequential: true
-2. "Find X and add to calendar" → Use BOTH websearch AND calendar agents, requiresSequential: true
-3. "Look up X and create a document" → Use BOTH websearch AND docs agents, requiresSequential: true
-4. Pattern: "[search/find/look up] X [and/then] [send/email/create/add/share]" → ALWAYS multi-agent sequential
-5. The websearch agent will find the information, then the second agent will use that information
-6. NEVER route multi-intent queries to ONLY websearch - you MUST include both agents
+RULE 1: USER PERSONAL DATA QUERIES
+- "list my docs", "show my emails", "my calendar events" → Use docs/gmail/calendar/microsoft agent
+- "my most recent X", "my latest X" where X is user's data → Use specific agent, NEVER websearch
+- These are fetches from user's account, not web searches
 
-CRITICAL RULES for Email Routing:
-1. "send email through outlook" or "send email via outlook" or "outlook email" → Use ONLY microsoft agent
-2. "send email through gmail" or "send email via gmail" or "gmail email" → Use ONLY gmail agent
-3. "send email to user@outlook.com" (no mention of which service) → Ask user which service OR use gmail as default
-4. User mentions "outlook", "microsoft mail", "hotmail" → Use microsoft agent
-5. User mentions "gmail", "google mail" → Use gmail agent
-6. Generic "send email" without specifying service → Use gmail agent (default)
-7. "show my outlook emails" / "list my outlook mails" / "check outlook inbox" → Use microsoft agent (FETCHING data)
-8. "show my gmail" / "check my gmail inbox" → Use gmail agent (FETCHING data)
+RULE 2: WEB SEARCH vs PERSONAL DATA
+- "what's latest AI news" → websearch (external info)
+- "show my recent docs" → docs agent (user's data)
+- NEVER confuse these - they route to completely different places
 
-CRITICAL RULES for Google Meet:
-1. "Create a google meet tomorrow at 11am" -> Use ONLY calendar agent with query "create a google meet event tomorrow at 11am with video call"
-2. "Schedule a meeting with video call" -> Use ONLY calendar agent
-3. "Create a standalone meeting room/space" (no time specified) -> Use meet agent
-4. "Show my meeting recordings" -> Use meet agent
-5. When user wants a SCHEDULED meeting with a specific time, ALWAYS use calendar agent which will automatically add Google Meet conferencing
+RULE 3: WEATHER QUERIES
+- "what's weather", "temperature", "rain", "air quality" → weather agent, NOT websearch
+- Weather has dedicated agent - don't route to web search
 
-CRITICAL RULES:
-1. If query asks about PAST (what/who/when/where user already told you) → {"agents": []}
-2. Only use agents for NEW actions: CREATE, SEARCH, SEND, SCHEDULE, FIND
+RULE 4: EMAIL ROUTING BY SERVICE
+- "send email via outlook" + "outlook" mentioned → microsoft agent
+- "send email via gmail" + "gmail" mentioned → gmail agent
+- "send email" (no service specified) → gmail agent (default)
 
-Examples showing when to return EMPTY agents array:
-- "what is my name" → {"agents": [], "reasoning": "Asking about past information from conversation"}
-- "who am I" → {"agents": []}
-- "what flights did I search" → {"agents": []}
-- "what forms did I create" → {"agents": []}
+RULE 5: GOOGLE MEET ROUTING
+- "create google meet tomorrow at 3pm" → calendar agent (scheduled meeting)
+- "create meeting room" (no time) → meet agent (standalone space)
+- "list my past Google Meet meetings" → meet agent (retrieve conference records)
+- "show meeting history" or "who joined my meeting" → meet agent (meeting data retrieval)
+- Scheduled meetings with time → ALWAYS calendar (adds Meet automatically)
+- Past meeting history/recordings → ALWAYS meet agent (conference records from Meet API)
 
-Examples showing when to use agents:
-- "find flights to Mumbai tomorrow" → {"agents": ["flights"], ...}
-- "create a form" → {"agents": ["forms"], ...}
+RULE 6: MULTI-INTENT QUERIES (Sequential Execution)
+- "search for X and email it" → websearch + gmail agents, sequential
+- "find X and add to calendar" → websearch + calendar agents, sequential
+- "create form and send link" → forms + gmail agents, sequential
+- Pattern: [action1] X [and/then] [action2] → Use both agents with requiresSequential: true
 
-Respond with a JSON object containing:
+RULE 7: SCHEDULE vs CALENDAR
+- "remind me to check price tomorrow at 2pm" → schedules agent (reminder)
+- "schedule meeting tomorrow at 2pm" → calendar agent (calendar event)
+- Reminders ≠ Calendar events - they use different agents
+
+EXAMPLES:
+
+User Data Fetch (use specific agent):
+- "list my docs" → {"agents": ["docs"], ...}
+- "show my recent emails" → {"agents": ["gmail"], ...}
+- "my calendar events" → {"agents": ["calendar"], ...}
+
+Web Search (use websearch):
+- "what's latest Tesla news" → {"agents": ["websearch"], ...}
+- "tell me about recent AI summits" → {"agents": ["websearch"], ...}
+- "do you know about Bitcoin prices" → {"agents": ["websearch"], ...}
+
+Creation/Action:
+- "create a document" → {"agents": ["docs"], ...}
+- "send an email" → {"agents": ["gmail"], ...}
+- "create a meeting" → {"agents": ["calendar"], ...}
+
+External Data:
+- "weather in Delhi" → {"agents": ["weather"], ...}
+- "restaurants near me" → {"agents": ["maps"], ...}
+
+Return ONLY valid JSON:
 {
-  "agents": ["agent1", "agent2"],  // Array of agent names needed (can be one or multiple)
+  "agents": ["agent1", "agent2"],
   "reasoning": "Why these agents were chosen",
-  "queries": {  // Specific queries to send to each agent - MUST include artifact IDs if referencing existing items
-    "agent1": "query for agent1",
-    "agent2": "query for agent2"
-  },
-  "requiresSequential": true,  // true if one action depends on another (e.g., create form THEN send email about it)
-  "dependencies": {}  // Optional: if sequential, specify dependencies like {"agent2": "agent1"}
-}
+  "queries": {"agent1": "specific query", "agent2": "specific query"},
+  "requiresSequential": false,
+  "dependencies": {}
+}`;
 
-Examples:
-- "what is my name" -> {"agents": [], "reasoning": "User is asking about information from conversation history, no agents needed"}
-- "who am I" -> {"agents": [], "reasoning": "Conversational query about past information"}
-- "what did we talk about" -> {"agents": [], "reasoning": "Asking about conversation history"}
-- "what flights did I search for" -> {"agents": [], "reasoning": "Asking about past search, answer from conversation history"}
-- "remind me what forms I created" -> {"agents": [], "reasoning": "Query about artifact memory, no new action needed"}
-- "create a google meet tomorrow at 3pm" -> {"agents": ["calendar"], "queries": {"calendar": "create a google meet event tomorrow at 3pm with video call"}}
-- "schedule a video call for monday at 10am" -> {"agents": ["calendar"], "queries": {"calendar": "schedule a video call meeting for monday at 10am with google meet"}}
-- "create a meeting room" (no time) -> {"agents": ["meet"], ...}
-- "schedule a meeting tomorrow" -> {"agents": ["calendar"], ...}
-- "create a document and add it to my calendar" -> {"agents": ["docs", "calendar"], "requiresSequential": true, ...}
-- "show me my GitHub repos" -> {"agents": ["github"], ...}
-- "send an email to john@example.com" -> {"agents": ["gmail"], ...}
-- "check my unread emails" -> {"agents": ["gmail"], ...}
-- "create a form about customer feedback and a spreadsheet to track responses" -> {"agents": ["forms", "sheets"], ...}
-- "send an email about the meeting I scheduled" -> {"agents": ["gmail", "calendar"], "requiresSequential": true, ...}
-- "add a question to it" (with artifact FORM "Survey" formId=abc123) -> {"agents": ["forms"], "queries": {"forms": "add a question to form with formId abc123"}}
-- "find flights from Mumbai to Delhi tomorrow" -> {"agents": ["flights"], ...}
-- "compare flight prices from BOM to BLR" -> {"agents": ["flights"], ...}
-- "what are the cheapest flights to Goa next week" -> {"agents": ["flights"], ...}
-- "find cafes near me" -> {"agents": ["maps"], ...}
-- "best hotels in Paris" -> {"agents": ["maps"], ...}
-- "how far is it from Mumbai to Pune" -> {"agents": ["maps"], ...}
-- "restaurants near Times Square" -> {"agents": ["maps"], ...}
-- "what are the coordinates of Taj Mahal" -> {"agents": ["maps"], ...}
+      const routingMessages = [
+        { 
+          role: 'system', 
+          content: `You are an expert agent router. Always respond with valid JSON only, no other text.
 
-CRITICAL - Web Search Examples (use websearch agent for current/real-time information):
-- "do you know about the AI summit happening in Delhi" -> {"agents": ["websearch"], "queries": {"websearch": "AI summit happening in Delhi India"}}
-- "what's the latest news about Tesla" -> {"agents": ["websearch"], "queries": {"websearch": "latest news about Tesla"}}
-- "tell me about recent AI developments" -> {"agents": ["websearch"], "queries": {"websearch": "recent AI developments"}}
-- "is there a tech conference happening this week" -> {"agents": ["websearch"], "queries": {"websearch": "tech conference happening this week"}}
-- "find information about upcoming events in Bangalore" -> {"agents": ["websearch"], "queries": {"websearch": "upcoming events in Bangalore"}}
-- "what are the current Bitcoin prices" -> {"agents": ["websearch"], "queries": {"websearch": "current Bitcoin prices"}}
-
-CRITICAL - Weather Examples (use weather agent, NOT websearch):
-- "what's the weather in Mumbai today" -> {"agents": ["weather"], "queries": {"weather": "what's the weather in Mumbai today"}}
-- "what is the current weather in Ujjain" -> {"agents": ["weather"], "queries": {"weather": "current weather in Ujjain"}}
-- "will it rain tomorrow" -> {"agents": ["weather"], "queries": {"weather": "will it rain tomorrow"}}
-- "temperature in Dubai" -> {"agents": ["weather"], "queries": {"weather": "temperature in Dubai"}}
-- "weather forecast for next 3 days in Tokyo" -> {"agents": ["weather"], "queries": {"weather": "weather forecast for next 3 days in Tokyo"}}
-- "air quality in Delhi" -> {"agents": ["weather"], "queries": {"weather": "air quality in Delhi"}}
-- "is it safe to exercise outside" -> {"agents": ["weather"], "queries": {"weather": "is it safe to exercise outside - check air quality"}}
-- "should I bring an umbrella today" -> {"agents": ["weather"], "queries": {"weather": "should I bring an umbrella today"}}
-- "how hot is it in London" -> {"agents": ["weather"], "queries": {"weather": "how hot is it in London"}}
-- "weather in Paris" -> {"agents": ["weather"], "queries": {"weather": "weather in Paris"}}
-
-CRITICAL - Schedules/Reminders Examples (use schedules agent for reminders, NOT calendar):
-- "remind me to check Bitcoin price tomorrow at 2 PM" -> {"agents": ["schedules"], "queries": {"schedules": "remind me to check Bitcoin price tomorrow at 2 PM"}}
-- "set a reminder to call mom on Friday" -> {"agents": ["schedules"], "queries": {"schedules": "set a reminder to call mom on Friday"}}
-- "schedule a reminder to submit report next Monday at 9 AM" -> {"agents": ["schedules"], "queries": {"schedules": "schedule a reminder to submit report next Monday at 9 AM"}}
-- "remind me about the presentation in 2 hours" -> {"agents": ["schedules"], "queries": {"schedules": "remind me about the presentation in 2 hours"}}
-- "check it again tomorrow at 2 PM" -> {"agents": ["schedules"], "queries": {"schedules": "remind me to check it again tomorrow at 2 PM"}}
-- "show my reminders" -> {"agents": ["schedules"], "queries": {"schedules": "show my reminders"}}
-- "list my scheduled reminders" -> {"agents": ["schedules"], "queries": {"schedules": "list my scheduled reminders"}}
-- "cancel my reminder about Bitcoin" -> {"agents": ["schedules"], "queries": {"schedules": "cancel my reminder about Bitcoin"}}
-IMPORTANT: Use schedules for REMINDERS (notifications), use calendar for MEETINGS/EVENTS (calendar entries with attendees, location, etc.)
-
-CRITICAL - Multi-Intent Examples (web search + reminder):
-- "check Bitcoin price and schedule a reminder to check it again tomorrow at 2 PM" -> {"agents": ["websearch", "schedules"], "requiresSequential": true, "queries": {"websearch": "current Bitcoin prices", "schedules": "schedule a reminder to check Bitcoin price again tomorrow at 2 PM"}}
-- "find the latest AI news and remind me to read it tonight" -> {"agents": ["websearch", "schedules"], "requiresSequential": true, "queries": {"websearch": "latest AI news", "schedules": "remind me to read AI news tonight"}}
-
-CRITICAL - Multi-Intent Examples (web search + another action):
-- "search for the latest AI news and email the top 3 articles to john@example.com" -> {"agents": ["websearch", "gmail"], "requiresSequential": true, "queries": {"websearch": "latest AI news", "gmail": "email the top 3 AI news articles to john@example.com"}}
-- "find recent tech conferences and add them to my calendar" -> {"agents": ["websearch", "calendar"], "requiresSequential": true, "queries": {"websearch": "recent tech conferences", "calendar": "add tech conferences to calendar"}}
-- "search for Python tutorials and create a document with the best ones" -> {"agents": ["websearch", "docs"], "requiresSequential": true, "queries": {"websearch": "Python tutorials", "docs": "create document with best Python tutorials"}}
-- "look up the latest AI summit and send details via outlook" -> {"agents": ["websearch", "microsoft"], "requiresSequential": true, "queries": {"websearch": "latest AI summit", "microsoft": "send AI summit details via outlook email"}}
-- "find top 5 restaurants near me and share the list" -> {"agents": ["maps", "gmail"], "requiresSequential": true, "queries": {"maps": "find top 5 restaurants near me", "gmail": "share restaurant list"}}
-
-CRITICAL - Microsoft 365 / Outlook Examples (use microsoft agent, NOT gmail):
-- "send email through outlook" -> {"agents": ["microsoft"], "queries": {"microsoft": "send email through outlook"}}
-- "send email via outlook to john@example.com" -> {"agents": ["microsoft"], "queries": {"microsoft": "send email to john@example.com via outlook"}}
-- "send mail through my outlook" -> {"agents": ["microsoft"], ...}
-- "check my outlook emails" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my outlook emails"}}
-- "show my outlook emails" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my outlook emails"}}
-- "show my most recent outlook mails" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my most recent outlook emails"}}
-- "list my outlook inbox" -> {"agents": ["microsoft"], "queries": {"microsoft": "list emails from outlook inbox"}}
-- "read my outlook mail" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my outlook emails"}}
-- "show my microsoft calendar events" -> {"agents": ["microsoft"], ...}
-- "list files in my onedrive" -> {"agents": ["microsoft"], ...}
-- "show my onedrive files" -> {"agents": ["microsoft"], "queries": {"microsoft": "list files in onedrive"}}
-- "read my excel file" -> {"agents": ["microsoft"], ...}
-- "create event in microsoft calendar" -> {"agents": ["microsoft"], ...}
-- "create an excel spreadsheet" -> {"agents": ["microsoft"], "queries": {"microsoft": "create a new excel workbook"}}
-- "create excel sheet titled expenses" -> {"agents": ["microsoft"], "queries": {"microsoft": "create an excel workbook named expenses"}}
-- "list my teams" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my Microsoft Teams"}}
-- "show my teams chats" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my Teams chats"}}
-- "show channels in my team" -> {"agents": ["microsoft"], "queries": {"microsoft": "list channels in my team"}}
-- "send a message in teams chat" -> {"agents": ["microsoft"], "queries": {"microsoft": "send a message in Teams chat"}}
-- "list my word documents" -> {"agents": ["microsoft"], "queries": {"microsoft": "list my Word documents"}}
-- "show my word files" -> {"agents": ["microsoft"], "queries": {"microsoft": "list Word documents in OneDrive"}}
-- "create a word document" -> {"agents": ["microsoft"], "queries": {"microsoft": "create a new Word document"}}
-
-CRITICAL - Multi-Agent Sequential Examples (when one action depends on another):
-- "create a feedback form and send the link to john@example.com" -> {"agents": ["forms", "gmail"], "requiresSequential": true, "queries": {"forms": "create a feedback form", "gmail": "send email to john@example.com with the form link"}}
-- "create a student survey and email it to bhumika@gmail.com" -> {"agents": ["forms", "gmail"], "requiresSequential": true, ...}
-- "make a registration form and share it with the team via email" -> {"agents": ["forms", "gmail"], "requiresSequential": true, ...}
-- "create a document and send it to my manager" -> {"agents": ["docs", "gmail"], "requiresSequential": true, ...}
-- "create a form and send the link through outlook" -> {"agents": ["forms", "microsoft"], "requiresSequential": true, "queries": {"forms": "create a form", "microsoft": "send form link via outlook email"}}
-
-CRITICAL - Conversation Context Examples:
-- User previously asked "show me flights from pune to indore", then says "14 dec" or "tomorrow" -> {"agents": ["flights"], "queries": {"flights": "show me flights from Pune to Indore on 14 December"}} (NOT calendar!)
-- User previously asked about flights, then says "the 15th" -> Route to flights with the date context
-- User previously asked about calendar, then says "tomorrow" -> Route to calendar
-- Short follow-up messages should ALWAYS be interpreted based on the previous conversation topic
-
-Important:
-- Only include agents that are actually needed
-- Break down complex multi-step requests appropriately
-- Be specific in the queries for each agent
-- Set requiresSequential to true when one action depends on another (create something, then share/email it)
-- Consider if operations need to be sequential (e.g., create then send) or can be parallel
-- ALWAYS consider conversation history for context - a date mentioned after flight queries is for flights, NOT calendar
-
-CRITICAL - Content Reference Rule for Docs/Sheets/Microsoft:
-When the user says "add this summary to a new doc", "put this in a google doc", "add the summary to a doc", or similar phrases that reference content from a PREVIOUS assistant message in the conversation:
-- The query you generate for the agent MUST include the FULL content from that previous assistant message
-- Do NOT just say "add the summary" - include the ACTUAL summary text in the query
-- Example: If the previous assistant message contained a resume summary, the docs query should be: "create a new google doc titled 'resume summary' and add the following content to it: [FULL SUMMARY TEXT FROM CONVERSATION]"
-- This ensures the agent has the actual content to add to the document`;
-
-      // Build file context section for analysis prompt
-      let fileContextSection = '';
-      if (fileContext && fileContext.filesProcessed > 0) {
-        const fileNames = fileContext.textContexts ? fileContext.textContexts.map(f => f.filename).join(', ') : 'attached files';
-        fileContextSection = `\n\nATTACHED FILES (User has uploaded ${fileContext.filesProcessed} file(s) with this message):
-Files: ${fileNames}
-
-CRITICAL FILE ROUTING RULE:
-The user has attached file(s) to this message. Their content is ALREADY available in the conversation context.
-If the user is asking to READ, SUMMARIZE, ANALYZE, EXPLAIN, REVIEW, or ASK QUESTIONS ABOUT the attached file(s):
-→ Return {"agents": [], "reasoning": "User is asking about attached file content - already available in context"}
-Do NOT route to gmail, docs, microsoft, or any other agent for file-reading queries.
-Only route to agents if the user wants to DO SOMETHING EXTERNAL with the file (e.g., "email this file to someone" → gmail).`;
-      }
-
-      const messages = [
-        { role: 'system', content: `You are an expert at analyzing user requests and routing them to appropriate specialized agents. Always respond with valid JSON only, no other text.
-
-${languageInstruction}
-
-${fileContext && fileContext.filesProcessed > 0 ? `\nIMPORTANT: The user has attached ${fileContext.filesProcessed} file(s) to this message. If the user is asking to read, summarize, analyze, explain, review, or understand the attached file content, return {"agents": [], "reasoning": "..."} since file content is already in context. Do NOT route file-reading queries to gmail, docs, or any agent.\n` : ''}
-CRITICAL RULE FOR ACTION VERBS - These ALWAYS require agents:
-- "create", "make", "build" → Route to appropriate creation agent (forms, docs, sheets, etc.)
-- "send", "email", "message" → Route to gmail or microsoft agent
-- "schedule", "book", "set up" → Route to calendar agent
-- "search", "find", "show", "list", "check", "get", "read" → Route to appropriate fetch agent
-${fileContext && fileContext.filesProcessed > 0 ? '- EXCEPTION: "read" with attached files → Return empty agents (file content already available)\n' : ''}
-ONLY return empty agents for truly conversational queries like:
-- "what is my name", "who am I", "what did we discuss", "remind me what I said"
-${fileContext && fileContext.filesProcessed > 0 ? '- "read this file", "summarize this", "what does it contain", "analyze this document" (when files are attached)\n' : ''}
-"create a google form" → MUST return {"agents": ["forms"], ...}
-"create a form for X" → MUST return {"agents": ["forms"], ...}
-"make a survey" → MUST return {"agents": ["forms"], ...}
-
-NEVER return empty agents for queries containing "create", "make", "send", "schedule", "search", "find".` },
-        { role: 'user', content: analysisPrompt + fileContextSection }
+CORE RULES:
+1. User's personal data (my docs, my emails, my calendar, my files) → ALWAYS route to specific agent (docs, gmail, calendar, microsoft), NEVER websearch
+2. External real-time info (news, weather, events) → websearch or weather agent
+3. App actions (create, send, schedule, add) → appropriate agent
+4. Trust the IntentClassification result - it's usually correct
+5. When in doubt, prefer specific agent over websearch for user data queries` 
+        },
+        { role: 'user', content: routingPrompt }
       ];
 
-      const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini', // Using gpt-4o-mini which supports JSON mode and is cost-effective
-        messages: messages,
-        temperature: 0.3,
+      const routingResponse = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: routingMessages,
+        temperature: 0.2,
         response_format: { type: "json_object" }
       });
 
-      const analysis = JSON.parse(response.choices[0].message.content);
+      const analysis = JSON.parse(routingResponse.choices[0].message.content);
       
-      console.log('[MainAgent] Query analysis:', JSON.stringify(analysis, null, 2));
+      console.log('[MainAgent] 🤖 LLM Agent Routing Result:', JSON.stringify(analysis, null, 2));
 
-      // ===== Heuristic routing overrides (post-LLM) =====
       // README.md (or other repo file) requests should use GitHub agent, not Docs.
       const mentionsRepoContext = /\b(repo|repository|github)\b/i.test(query);
       const mentionsReadme = /\breadme(\.md)?\b/i.test(query);

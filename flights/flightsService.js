@@ -191,8 +191,175 @@ function formatFlightResults(flightData) {
   };
 }
 
+/**
+ * Compare multiple flights
+ * Takes search results and provides detailed comparison
+ * 
+ * @param {string} userId - User ID for logging
+ * @param {Object} params - Comparison parameters
+ * @param {Array} params.flights - Array of flight search results to compare
+ * @returns {Promise<Object>} Comparison analysis
+ */
+async function compareFlights(userId, params) {
+  const { flights = [] } = params;
+  
+  if (!flights || flights.length === 0) {
+    throw new Error("No flights provided for comparison");
+  }
+
+  try {
+    const formatted = flights.map(flight => {
+      if (typeof flight === 'object') {
+        return {
+          price: flight.price || 0,
+          duration: flight.total_duration || 0,
+          stops: flight.stops || 0,
+          airline: flight.airline || 'Unknown',
+          departure_time: flight.departure_airport?.time || 'N/A',
+          arrival_time: flight.arrival_airport?.time || 'N/A',
+          departure_airport: flight.departure_airport?.name || 'N/A',
+          arrival_airport: flight.arrival_airport?.name || 'N/A'
+        };
+      }
+      return flight;
+    });
+
+    // Calculate comparison metrics
+    const prices = formatted.map(f => f.price).filter(p => !isNaN(p));
+    const durations = formatted.map(f => f.duration).filter(d => !isNaN(d));
+    const stopCounts = formatted.map(f => f.stops || 0).filter(s => !isNaN(s));
+
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const avgPrice = prices.reduce((a, b) => a + b, 0) / prices.length;
+    
+    const minDuration = Math.min(...durations);
+    const maxDuration = Math.max(...durations);
+    
+    const comparison = {
+      total_flights: formatted.length,
+      flights: formatted,
+      price_range: {
+        min: minPrice,
+        max: maxPrice,
+        average: Math.round(avgPrice),
+        cheapest_flight_index: formatted.findIndex(f => f.price === minPrice)
+      },
+      duration_range: {
+        min: minDuration,
+        max: maxDuration,
+        fastest_flight_index: formatted.findIndex(f => f.duration === minDuration)
+      },
+      recommendations: {
+        cheapest: `Flight ${formatted.findIndex(f => f.price === minPrice)} - ₹${minPrice}`,
+        fastest: `Flight ${formatted.findIndex(f => f.duration === minDuration)} - ${minDuration} mins`,
+        best_value: `Flight with best price-to-duration ratio`
+      }
+    };
+
+    return {
+      success: true,
+      comparison: comparison,
+      message: `Comparison of ${formatted.length} flights complete`
+    };
+
+  } catch (error) {
+    console.error('Compare flights error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Book a flight (placeholder - integrates with booking systems)
+ * 
+ * @param {string} userId - User ID for booking attribution
+ * @param {Object} params - Booking parameters
+ * @param {string} params.flightId - ID of the flight to book
+ * @param {Array} params.passengers - Array of passenger details
+ * @param {string} params.passengers.name - Passenger name
+ * @param {string} params.passengers.email - Passenger email
+ * @param {string} params.passengers.phone - Passenger phone
+ * @param {Object} params.contact - Contact information
+ * @returns {Promise<Object>} Booking confirmation
+ */
+async function bookFlight(userId, params) {
+  const { flightId, passengers = [], contact = {} } = params;
+  
+  if (!flightId) {
+    throw new Error("Flight ID is required");
+  }
+
+  if (!passengers || passengers.length === 0) {
+    throw new Error("At least one passenger is required");
+  }
+
+  if (!contact.email) {
+    throw new Error("Contact email is required");
+  }
+
+  try {
+    // Generate booking reference
+    const bookingRef = `FB${Date.now().toString().slice(-8)}`;
+    const bookingDate = new Date().toISOString();
+    
+    // Validate passenger details
+    const validPassengers = passengers.map(p => {
+      if (!p.name || !p.email) {
+        throw new Error("Each passenger must have name and email");
+      }
+      return {
+        name: p.name,
+        email: p.email,
+        phone: p.phone || '',
+        title: p.title || 'Mr'
+      };
+    });
+
+    const booking = {
+      success: true,
+      booking_reference: bookingRef,
+      flight_id: flightId,
+      booking_date: bookingDate,
+      passengers: validPassengers,
+      contact_email: contact.email,
+      contact_phone: contact.phone || '',
+      status: 'confirmed',
+      payment_status: 'pending',
+      confirmation_message: `Your flight has been booked! Booking Reference: ${bookingRef}`,
+      next_steps: [
+        'Check your email for confirmation details',
+        'Download your booking confirmation',
+        'Proceed to payment if required',
+        'Check in online 24 hours before departure'
+      ]
+    };
+
+    // In a real system, this would:
+    // 1. Connect to airline APIs
+    // 2. Process payment
+    // 3. Store booking in database
+    // 4. Send confirmation emails
+    
+    console.log(`[FlightsService] Flight booked: ${bookingRef} for user ${userId}`);
+    
+    return booking;
+
+  } catch (error) {
+    console.error('Book flight error:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
 module.exports = {
   searchFlights,
   getFlightsPriceInsights,
-  formatFlightResults
+  formatFlightResults,
+  compareFlights,
+  bookFlight
 };

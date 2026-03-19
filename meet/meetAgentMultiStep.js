@@ -135,6 +135,166 @@ class MeetAgentMultiStep extends BaseAgent {
             throw error;
           }
         }
+      },
+
+      listConferences: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'listConferences',
+            description: 'List all past Google Meet conferences. Use when user asks about meeting history, past meetings, previous conferences, or their meetings.',
+            parameters: {
+              type: 'object',
+              properties: {
+                spaceName: {
+                  type: 'string',
+                  description: 'Optional: specific meeting space name/ID in format spaces/{space_id}. If not provided, lists all conferences accessible to user.'
+                },
+                pageSize: {
+                  type: 'number',
+                  description: 'Number of conferences to return (default: 20, max: 100)'
+                },
+                pageToken: {
+                  type: 'string',
+                  description: 'Token for pagination to get next page of results'
+                }
+              },
+              required: []
+            }
+          }
+        },
+        execute: async (params, context) => {
+          // Google Meet API v2 doesn't use spaceName parameter - it returns user's own conferences
+          // The spaceName is kept for backward compatibility but not sent to the API
+          console.log(`[MeetAgent] 📋 Retrieving your past conferences`);
+          try {
+            const result = await meetService.listConferences(
+              context.userId,
+              params.spaceName || null,
+              params.pageSize || 20,
+              params.pageToken
+            );
+            if (result.success) {
+              console.log(`[MeetAgent] ✅ Found ${result.count} past conferences`);
+            } else {
+              console.log(`[MeetAgent] ⚠️ Error retrieving conferences: ${result.error}`);
+            }
+            return result;
+          } catch (error) {
+            console.error(`[MeetAgent] ❌ Error listing conferences:`, error.message);
+            return {
+              success: false,
+              error: error.message,
+              conferences: []
+            };
+          }
+        }
+      },
+
+      getConference: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'getConference',
+            description: 'Get details of a specific past Google Meet conference',
+            parameters: {
+              type: 'object',
+              properties: {
+                conferenceName: {
+                  type: 'string',
+                  description: 'The conference name/ID in format conferenceRecords/{record_id}'
+                }
+              },
+              required: ['conferenceName']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MeetAgent] 🔍 Getting conference details: ${params.conferenceName}`);
+          try {
+            const result = await meetService.getConference(context.userId, params.conferenceName);
+            console.log(`[MeetAgent] ✅ Retrieved conference details`);
+            return result;
+          } catch (error) {
+            console.error(`[MeetAgent] ❌ Error getting conference:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      listParticipants: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'listParticipants',
+            description: 'List all participants who joined a Google Meet conference. Shows who attended and when they joined/left.',
+            parameters: {
+              type: 'object',
+              properties: {
+                conferenceName: {
+                  type: 'string',
+                  description: 'The conference name/ID in format conferenceRecords/{record_id}'
+                },
+                pageSize: {
+                  type: 'number',
+                  description: 'Number of participants to return (default: 20, max: 100)'
+                },
+                pageToken: {
+                  type: 'string',
+                  description: 'Token for pagination to get next page of results'
+                }
+              },
+              required: ['conferenceName']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MeetAgent] 👥 Listing participants for conference: ${params.conferenceName}`);
+          try {
+            const result = await meetService.listParticipants(
+              context.userId,
+              params.conferenceName,
+              params.pageSize || 20,
+              params.pageToken
+            );
+            console.log(`[MeetAgent] ✅ Found ${result.count} participants`);
+            return result;
+          } catch (error) {
+            console.error(`[MeetAgent] ❌ Error listing participants:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      getMeetingSpace: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'getMeetingSpace',
+            description: 'Get details of a specific Google Meet space, including active conference info',
+            parameters: {
+              type: 'object',
+              properties: {
+                spaceName: {
+                  type: 'string',
+                  description: 'The meeting space name/ID in format spaces/{space_id}'
+                }
+              },
+              required: ['spaceName']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MeetAgent] 🏠 Getting meeting space: ${params.spaceName}`);
+          try {
+            const result = await meetService.getMeetingSpace(context.userId, params.spaceName);
+            console.log(`[MeetAgent] ✅ Retrieved meeting space details`);
+            return result;
+          } catch (error) {
+            console.error(`[MeetAgent] ❌ Error getting meeting space:`, error.message);
+            throw error;
+          }
+        }
       }
     };
 
@@ -147,11 +307,24 @@ class MeetAgentMultiStep extends BaseAgent {
 
 GOOGLE MEET SPECIFIC GUIDELINES:
 
-1. **Meeting Creation**
+1. **Retrieving Past Meetings (USER'S TOP REQUEST) - SIMPLIFIED**
+   - When user asks: "Show my past meetings", "List my meetings", "What meetings did I have?"
+   - ✅ ALWAYS use listConferences() tool - NO parameters needed at all
+   - listConferences() automatically retrieves ALL past conferences for the authenticated user
+   - This is the simplest and most direct way to get meeting history
+   - You can also use listParticipants() afterwards to show who attended if user asks for that detail
+   
+   Example flow:
+   User: "list my past Google Meet meetings"
+   → Call listConferences() with NO parameters
+   → Returns list of all past conferences with dates and times
+   → User can ask "who was in meeting X?" and you call listParticipants()
+
+2. **Meeting Creation**
    - Create meeting first if user wants to create one
    - Include title and optional time details
 
-2. **Multi-Step Example**
+3. **Multi-Step Example**
    User: "Create a meeting and add john@example.com"
    
    Step 1: createMeeting({ title: "Team Meeting" })
@@ -160,7 +333,13 @@ GOOGLE MEET SPECIFIC GUIDELINES:
    Step 2: addParticipant({ meetingId: "abc123", email: "john@example.com" })
    Result: { success: true }
 
-3. **Participant Management**
+4. **Participant Details Example**
+   User: "Who attended my last meeting?"
+   
+   Step 1: listConferences() → Gets past meetings (user's own conferences)
+   Step 2: listParticipants({ conferenceName: "conferenceRecords/ABC123" }) → Shows attendees
+
+5. **Participant Management**
    - Add participants to meetings
    - Specify roles (organizer, presenter, attendee)
    - Send invitations`;

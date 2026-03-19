@@ -1757,6 +1757,155 @@ async function archiveEmail(userId, params) {
   }
 }
 
+/**
+ * Delete an email (move to trash)
+ */
+async function deleteMessage(userId, params) {
+  const { messageId } = params;
+  
+  if (!messageId) {
+    throw new Error("Missing required field: messageId");
+  }
+  
+  try {
+    const { gmail } = await getGmailClient(userId);
+    
+    // Move to trash by adding TRASH label
+    const response = await gmail.users.messages.trash({
+      userId: 'me',
+      id: messageId
+    });
+    
+    return {
+      success: true,
+      messageId: messageId,
+      message: 'Email deleted (moved to trash)'
+    };
+    
+  } catch (error) {
+    console.error('Delete message error:', error);
+    throw new Error(`Failed to delete email: ${error.message}`);
+  }
+}
+
+/**
+ * Add label/tag to an email
+ */
+async function addLabel(userId, params) {
+  const { messageId, labelName, labelId } = params;
+  
+  if (!messageId || (!labelName && !labelId)) {
+    throw new Error("Missing required fields: messageId and (labelName or labelId)");
+  }
+  
+  try {
+    const { gmail } = await getGmailClient(userId);
+    
+    let targetLabelId = labelId;
+    
+    // If labelName is provided but not labelId, find or create the label
+    if (!targetLabelId && labelName) {
+      const labelListResponse = await gmail.users.labels.list({
+        userId: 'me'
+      });
+      
+      const existingLabel = labelListResponse.data.labels.find(
+        l => l.name.toLowerCase() === labelName.toLowerCase()
+      );
+      
+      if (existingLabel) {
+        targetLabelId = existingLabel.id;
+      } else {
+        // Create new label
+        const newLabelResponse = await gmail.users.labels.create({
+          userId: 'me',
+          requestBody: {
+            name: labelName,
+            labelListVisibility: 'labelShow',
+            messageListVisibility: 'show'
+          }
+        });
+        targetLabelId = newLabelResponse.data.id;
+      }
+    }
+    
+    // Apply the label to the message
+    const response = await gmail.users.messages.modify({
+      userId: 'me',
+      id: messageId,
+      requestBody: {
+        addLabelIds: [targetLabelId]
+      }
+    });
+    
+    return {
+      success: true,
+      messageId: messageId,
+      labelId: targetLabelId,
+      labelName: labelName || 'Label',
+      message: `Label '${labelName || 'Label'}' added to email`
+    };
+    
+  } catch (error) {
+    console.error('Add label error:', error);
+    throw new Error(`Failed to add label: ${error.message}`);
+  }
+}
+
+/**
+ * Remove label from an email
+ */
+async function removeLabel(userId, params) {
+  const { messageId, labelId, labelName } = params;
+  
+  if (!messageId || (!labelId && !labelName)) {
+    throw new Error("Missing required fields: messageId and (labelId or labelName)");
+  }
+  
+  try {
+    const { gmail } = await getGmailClient(userId);
+    
+    let targetLabelId = labelId;
+    
+    // If labelName is provided but not labelId, find the label
+    if (!targetLabelId && labelName) {
+      const labelListResponse = await gmail.users.labels.list({
+        userId: 'me'
+      });
+      
+      const label = labelListResponse.data.labels.find(
+        l => l.name.toLowerCase() === labelName.toLowerCase()
+      );
+      
+      if (label) {
+        targetLabelId = label.id;
+      } else {
+        throw new Error(`Label '${labelName}' not found`);
+      }
+    }
+    
+    // Remove the label from the message
+    const response = await gmail.users.messages.modify({
+      userId: 'me',
+      id: messageId,
+      requestBody: {
+        removeLabelIds: [targetLabelId]
+      }
+    });
+    
+    return {
+      success: true,
+      messageId: messageId,
+      labelId: targetLabelId,
+      message: `Label removed from email`
+    };
+    
+  } catch (error) {
+    console.error('Remove label error:', error);
+    throw new Error(`Failed to remove label: ${error.message}`);
+  }
+}
+
 module.exports = {
   // Original functions
   getGmailMessages,
@@ -1798,6 +1947,8 @@ module.exports = {
   // Agent tool functions - Label Management
   listLabels,
   createLabel,
+  addLabel,
+  removeLabel,
   applyLabels,
   removeLabels,
   deleteLabel,
@@ -1812,5 +1963,6 @@ module.exports = {
   markAsUnread,
   starEmail,
   trashEmail,
-  archiveEmail
+  archiveEmail,
+  deleteMessage
 };

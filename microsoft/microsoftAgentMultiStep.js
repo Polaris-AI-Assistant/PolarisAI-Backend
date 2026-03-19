@@ -366,6 +366,328 @@ class MicrosoftAgentMultiStep extends BaseAgent {
             throw error;
           }
         }
+      },
+
+      listEmails: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'listEmails',
+            description: 'List emails from Outlook inbox. Can filter by unread status, date range, or sender.',
+            parameters: {
+              type: 'object',
+              properties: {
+                unreadOnly: { type: 'boolean', description: 'If true, only show unread emails', default: false },
+                folder: { type: 'string', description: 'Folder name (inbox, drafts, sent, deleted, etc.)', default: 'inbox' },
+                top: { type: 'number', description: 'Maximum number of emails to return', default: 10 }
+              }
+            }
+          }
+        },
+        execute: async (params, context) => {
+          const folder = params.folder || 'inbox';
+          const unreadOnly = params.unreadOnly === true;
+          const top = params.top || 10;
+          
+          console.log(`[MicrosoftAgent] 📧 Listing emails from ${folder}${unreadOnly ? ' (unread only)' : ''}...`);
+          try {
+            const result = await microsoftService.listEmails(context.userId, {
+              folder,
+              unreadOnly,
+              top: Math.min(top, 100)
+            });
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to list emails');
+            }
+            
+            console.log(`[MicrosoftAgent] ✅ Found ${result.count} emails`);
+            return {
+              success: true,
+              emails: result.emails,
+              count: result.count,
+              folder: result.folder,
+              unreadOnly: result.unreadOnly,
+              summary: `Found ${result.count} ${result.unreadOnly ? 'unread ' : ''}emails in ${result.folder}`
+            };
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error listing emails:`, error.message);
+            return {
+              success: false,
+              error: error.message,
+              emails: [],
+              count: 0
+            };
+          }
+        }
+      },
+
+      searchEmails: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'searchEmails',
+            description: 'Search for emails by subject, sender, or keywords. Use this to find a specific email before deleting, replying, or forwarding it.',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: { type: 'string', description: 'Search query (can be subject line, sender name, keywords, file names, etc.)' },
+                folder: { type: 'string', description: 'Folder to search in (inbox, sent, drafts, deleted, etc.)', default: 'inbox' },
+                top: { type: 'number', description: 'Maximum number of results to return', default: 20 }
+              },
+              required: ['query']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          const query = params.query;
+          const folder = params.folder || 'inbox';
+          const top = params.top || 20;
+          
+          console.log(`[MicrosoftAgent] 🔍 Searching for emails: "${query}"`);
+          try {
+            const result = await microsoftService.searchEmails(context.userId, query, {
+              folder,
+              top: Math.min(top, 100)
+            });
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to search emails');
+            }
+            
+            console.log(`[MicrosoftAgent] ✅ Found ${result.count} matching emails`);
+            return {
+              success: true,
+              query: query,
+              emails: result.emails,
+              count: result.count,
+              folder: result.folder,
+              summary: `Found ${result.count} email(s) matching "${query}"`
+            };
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error searching emails:`, error.message);
+            return {
+              success: false,
+              error: error.message,
+              query: query,
+              emails: [],
+              count: 0
+            };
+          }
+        }
+      },
+
+      readEmail: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'readEmail',
+            description: 'Read the full content of a specific email',
+            parameters: {
+              type: 'object',
+              properties: {
+                messageId: { type: 'string', description: 'The ID of the email to read' }
+              },
+              required: ['messageId']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] 📖 Reading email: ${params.messageId}`);
+          try {
+            const email = await microsoftService.getEmail(context.userId, params.messageId);
+            console.log(`[MicrosoftAgent] ✅ Email read successfully`);
+            return { success: true, email };
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error reading email:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      listMailFolders: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'listMailFolders',
+            description: 'List all mail folders in Outlook (inbox, drafts, sent, deleted, junk, archive, custom folders)',
+            parameters: {
+              type: 'object',
+              properties: {
+                includeUnreadCount: { type: 'boolean', description: 'Include unread email count for each folder', default: true }
+              }
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] 📁 Listing mail folders...`);
+          try {
+            const result = await microsoftService.listMailFolders(context.userId, params);
+            
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to list folders');
+            }
+            
+            console.log(`[MicrosoftAgent] ✅ Retrieved ${result.count} folders`);
+            return {
+              success: true,
+              folders: result.folders,
+              count: result.count,
+              summary: `Retrieved ${result.count} mail folders`
+            };
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error listing folders:`, error.message);
+            return {
+              success: false,
+              error: error.message,
+              folders: [],
+              count: 0
+            };
+          }
+        }
+      },
+
+      markEmailAsRead: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'markEmailAsRead',
+            description: 'Mark an email as read',
+            parameters: {
+              type: 'object',
+              properties: {
+                messageId: { type: 'string', description: 'The ID of the email to mark as read' }
+              },
+              required: ['messageId']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] ✔️ Marking email as read: ${params.messageId}`);
+          try {
+            const result = await microsoftService.markEmailRead(context.userId, params.messageId);
+            console.log(`[MicrosoftAgent] ✅ Email marked as read`);
+            return result;
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error marking email as read:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      markEmailAsUnread: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'markEmailAsUnread',
+            description: 'Mark an email as unread',
+            parameters: {
+              type: 'object',
+              properties: {
+                messageId: { type: 'string', description: 'The ID of the email to mark as unread' }
+              },
+              required: ['messageId']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] 📍 Marking email as unread: ${params.messageId}`);
+          try {
+            const result = await microsoftService.markEmailUnread(context.userId, params.messageId);
+            console.log(`[MicrosoftAgent] ✅ Email marked as unread`);
+            return result;
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error marking email as unread:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      replyToEmail: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'replyToEmail',
+            description: 'Reply to an email',
+            parameters: {
+              type: 'object',
+              properties: {
+                messageId: { type: 'string', description: 'The ID of the email to reply to' },
+                body: { type: 'string', description: 'Reply message body' }
+              },
+              required: ['messageId', 'body']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] 💬 Replying to email: ${params.messageId}`);
+          try {
+            const result = await microsoftService.replyToEmail(context.userId, params.messageId, params.body);
+            console.log(`[MicrosoftAgent] ✅ Reply sent successfully`);
+            return result;
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error replying to email:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      forwardEmail: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'forwardEmail',
+            description: 'Forward an email to recipients',
+            parameters: {
+              type: 'object',
+              properties: {
+                messageId: { type: 'string', description: 'The ID of the email to forward' },
+                toRecipients: { type: 'array', items: { type: 'string' }, description: 'Email addresses to forward to' },
+                comment: { type: 'string', description: 'Optional comment/message to add' }
+              },
+              required: ['messageId', 'toRecipients']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] ➡️ Forwarding email: ${params.messageId}`);
+          try {
+            const result = await microsoftService.forwardEmail(context.userId, params);
+            console.log(`[MicrosoftAgent] ✅ Email forwarded successfully`);
+            return result;
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error forwarding email:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      deleteEmail: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'deleteEmail',
+            description: 'Delete an email (moves to deleted items)',
+            parameters: {
+              type: 'object',
+              properties: {
+                messageId: { type: 'string', description: 'The ID of the email to delete' }
+              },
+              required: ['messageId']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[MicrosoftAgent] 🗑️ Deleting email: ${params.messageId}`);
+          try {
+            const result = await microsoftService.deleteEmail(context.userId, params.messageId);
+            console.log(`[MicrosoftAgent] ✅ Email deleted successfully`);
+            return result;
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error deleting email:`, error.message);
+            throw error;
+          }
+        }
       }
     };
 
@@ -386,13 +708,39 @@ MICROSOFT 365 SPECIFIC GUIDELINES:
      2. addDataToExcel (using the workbookId from step 1)
    - ALWAYS check if there are multiple tasks in the query before stopping
 
-1. **Document Creation**
+1. **Email Management (Outlook) - CRITICAL MULTI-STEP WORKFLOW**
+   
+   ⚠️ **IMPORTANT - Finding Emails by Subject/Sender:**
+   When user asks to "delete/reply to/forward email [subject line]", you MUST:
+   1. FIRST use searchEmails({ query: "[subject line]" }) to find the email
+   2. Get the email ID from the search results
+   3. THEN use deleteEmail/replyToEmail/forwardEmail with that ID
+   
+   Example: "delete the mail Re: Agile Methodology.docx"
+   Step 1: searchEmails({ query: "Re: Agile Methodology" })
+   Result: { emails: [{ id: "real-message-id-123", subject: "Re: Agile Methodology.docx" }] }
+   Step 2: deleteEmail({ messageId: "real-message-id-123" })
+   ✅ CRITICAL: ALWAYS search first to get the real ID!
+   ❌ NEVER make up or guess message IDs - they must come from search results!
+   
+   ⚠️ **OPERATIONS:**
+   - **View Emails**: Use listEmails to show inbox emails, with unreadOnly=true for unread emails
+   - **Search Emails**: Use searchEmails({ query: "keywords/subject" }) to find specific emails
+   - **Read Email**: Use readEmail to get full content of a specific email
+   - **Send Email**: Use createEmail to send emails
+   - **Reply**: Use replyToEmail (AFTER searching for the email to get its ID)
+   - **Forward**: Use forwardEmail (AFTER searching for the email to get its ID)
+   - **Delete**: Use deleteEmail (AFTER searching for the email to get its ID)
+   - **Mark as Read/Unread**: Use markEmailAsRead or markEmailAsUnread
+   - **View Folders**: Use listMailFolders to show all mail folders with unread counts
+
+2. **Document Creation**
    - Create Word documents for text content
    - Create Excel workbooks for data
    - Include title and optional initial content
    - **EXCEL SPECIFIC**: If asked to add data/sample data, use addDataToExcel AFTER creating the workbook
 
-2. **Multi-Step Examples**
+3. **Multi-Step Examples**
    
    Example 1: "Create a Word document and send it via email"
    Step 1: createDocument({ title: "Report" })
@@ -410,8 +758,8 @@ MICROSOFT 365 SPECIFIC GUIDELINES:
    ⚠️ IMPORTANT: Pass the title from Step 1 to generate contextually appropriate sample data
    Result: { success: true, rowsAdded: 10 }
 
-3. **Communication**
-   - Send emails via Outlook
+4. **Communication**
+   - Send emails via Outlook (use createEmail)
    - Send Teams messages
    - Create calendar events
    
@@ -423,7 +771,7 @@ MICROSOFT 365 SPECIFIC GUIDELINES:
    - If you cannot find the email address in the query OR conversation history, ask the user for it
    - Examples of references: "send to this email", "share with that person", "email them"
 
-4. **Storage**
+5. **Storage**
    - Create OneDrive folders
    - Organize files and documents`;
   }

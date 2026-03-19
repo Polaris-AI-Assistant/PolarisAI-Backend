@@ -358,7 +358,7 @@ async function searchInDocument(userId, documentId, searchQuery) {
 /**
  * Tool 8: List all documents (using Drive API)
  * @param {string} userId - User ID
- * @param {Object} options - { pageSize, query }
+ * @param {Object} options - { pageSize, limit, sortBy }
  * @returns {Object} - { success, documents }
  */
 async function listDocuments(userId, options = {}) {
@@ -366,21 +366,32 @@ async function listDocuments(userId, options = {}) {
     const drive = await getDriveClient(userId);
 
     const query = options.query || "mimeType='application/vnd.google-apps.document'";
-    const pageSize = options.pageSize || 50;
+    const pageSize = options.pageSize || options.limit || 50;
+    
+    // Support sortBy parameter
+    let orderBy = 'modifiedTime desc'; // default: most recent first
+    if (options.sortBy === 'name') {
+      orderBy = 'name asc';
+    } else if (options.sortBy === 'modifiedTime' || options.sortBy === 'time') {
+      orderBy = 'modifiedTime desc';
+    }
 
     const response = await drive.files.list({
       q: query,
       pageSize: pageSize,
       fields: 'files(id, name, createdTime, modifiedTime, webViewLink, owners)',
-      orderBy: 'modifiedTime desc'
+      orderBy: orderBy
     });
 
-    const documents = response.data.files.map(file => ({
+    const documents = (response.data.files || []).map(file => ({
       documentId: file.id,
+      id: file.id,
       title: file.name,
+      name: file.name,
       createdTime: file.createdTime,
       modifiedTime: file.modifiedTime,
       url: file.webViewLink,
+      webViewLink: file.webViewLink,
       owners: file.owners
     }));
 
@@ -393,7 +404,8 @@ async function listDocuments(userId, options = {}) {
     console.error('Error listing documents:', error);
     return {
       success: false,
-      error: error.message
+      error: error.message,
+      documents: []
     };
   }
 }

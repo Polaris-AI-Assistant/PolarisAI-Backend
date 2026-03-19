@@ -491,6 +491,64 @@ class DocsAgentMultiStep extends BaseAgent {
             throw error;
           }
         }
+      },
+
+      listDocuments: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'listDocuments',
+            description: 'List all Google Documents for the user, optionally filtered by sorting options',
+            parameters: {
+              type: 'object',
+              properties: {
+                sortBy: {
+                  type: 'string',
+                  enum: ['name', 'time', 'starred'],
+                  description: 'Sort results by name, modification time, or starred status. Default: time (most recent first)'
+                },
+                limit: {
+                  type: 'number',
+                  description: 'Maximum number of documents to return. Default: 10'
+                }
+              }
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[DocsAgent] 📋 Listing documents (sortBy: ${params.sortBy || 'time'}, limit: ${params.limit || 10})`);
+          
+          try {
+            const result = await docsService.listDocuments(context.userId, {
+              sortBy: params.sortBy || 'modifiedTime',
+              limit: params.limit || 10
+            });
+
+            if (!result.success) {
+              console.error(`[DocsAgent] ❌ Failed to list documents:`, result.error);
+              throw new Error(result.error || 'Failed to list documents');
+            }
+
+            const documents = result.documents || [];
+            console.log(`[DocsAgent] ✅ Retrieved ${documents.length} documents`);
+            
+            return {
+              success: true,
+              count: documents.length,
+              documents: documents.map(doc => ({
+                id: doc.documentId || doc.id,
+                name: doc.title || doc.name,
+                url: doc.url || `https://docs.google.com/document/d/${doc.documentId || doc.id}/edit`,
+                createdTime: doc.createdTime,
+                modifiedTime: doc.modifiedTime,
+                owners: doc.owners ? doc.owners.map(o => o.displayName || o.emailAddress) : []
+              }))
+            };
+          } catch (error) {
+            console.error(`[DocsAgent] ❌ Error listing documents:`, error.message);
+            throw error;
+          }
+        }
       }
     };
 

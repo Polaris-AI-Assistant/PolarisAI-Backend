@@ -220,23 +220,23 @@ class GmailAgentMultiStep extends BaseAgent {
           type: 'function',
           function: {
             name: 'listMessages',
-            description: 'List emails from the inbox or search for emails. Use when user wants to see their emails or search for specific messages.',
+            description: 'Search for and list emails from the inbox. MUST be used FIRST to find email IDs before using readMessage. Supports Gmail search syntax like "from:sender-name", "subject:keyword", "has:attachment", etc. Use when user wants to see emails, search for messages, or find a specific email to read.',
             parameters: {
               type: 'object',
               properties: {
                 query: {
                   type: 'string',
-                  description: 'Search query (e.g., "from:john@example.com", "subject:meeting")'
+                  description: 'Gmail search query (e.g., "from:john@example.com", "from:Google AI Studio", "subject:meeting", "has:attachment"). Multi-word sender names work too: "from:Google AI Studio"'
                 },
                 maxResults: {
                   type: 'number',
-                  description: 'Maximum number of emails to return (default: 10)',
+                  description: 'Maximum number of emails to return (default: 10). Use 1 or 5 for specific searches.',
                   default: 10
                 },
                 labelIds: {
                   type: 'array',
                   items: { type: 'string' },
-                  description: 'Filter by label IDs'
+                  description: 'Filter by label IDs (optional)'
                 }
               },
               required: []
@@ -247,17 +247,37 @@ class GmailAgentMultiStep extends BaseAgent {
           console.log(`[GmailAgent] 📋 Listing messages`);
           
           try {
-            const messages = await gmailService.listMessages(
-              context.userId,
-              params
-            );
+            let result;
+            
+            // Use searchEmails if query is provided, otherwise getLatestEmails
+            if (params.query) {
+              result = await gmailService.searchEmails(
+                context.userId,
+                {
+                  query: params.query,
+                  maxResults: params.maxResults || 10
+                }
+              );
+            } else {
+              result = await gmailService.getLatestEmails(
+                context.userId,
+                {
+                  maxResults: params.maxResults || 10,
+                  labelIds: params.labelIds
+                }
+              );
+            }
 
-            console.log(`[GmailAgent] ✅ Retrieved ${messages.length} messages`);
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to retrieve emails');
+            }
+
+            console.log(`[GmailAgent] ✅ Retrieved ${result.count} messages`);
             
             return {
               success: true,
-              messages: messages,
-              count: messages.length
+              emails: result.emails || [],
+              count: result.count || 0
             };
           } catch (error) {
             console.error(`[GmailAgent] ❌ Error listing messages:`, error.message);
@@ -271,13 +291,13 @@ class GmailAgentMultiStep extends BaseAgent {
           type: 'function',
           function: {
             name: 'readMessage',
-            description: 'Read the full content of a specific email. Use when user wants to see the details of an email.',
+            description: 'Read the full content of a specific email. MUST be used AFTER listMessages to get a real messageId. NEVER guess or make up messageIds. Use when you have a specific messageId from listMessages results and user wants to see the full email content.',
             parameters: {
               type: 'object',
               properties: {
                 messageId: {
                   type: 'string',
-                  description: 'The ID of the email to read (required)'
+                  description: 'The actual message ID from listMessages results (required). This must be a real ID returned by listMessages, not a guessed value like "1" or "abc123"'
                 }
               },
               required: ['messageId']
@@ -288,20 +308,25 @@ class GmailAgentMultiStep extends BaseAgent {
           console.log(`[GmailAgent] 📖 Reading message: ${params.messageId}`);
           
           try {
-            const message = await gmailService.readMessage(
+            const result = await gmailService.readEmail(
               context.userId,
-              params.messageId
+              { messageId: params.messageId }
             );
+
+            if (!result.success) {
+              throw new Error(result.error || 'Failed to read email');
+            }
 
             console.log(`[GmailAgent] ✅ Message read successfully`);
             
             return {
               success: true,
-              messageId: message.id,
-              from: message.from,
-              subject: message.subject,
-              body: message.body,
-              date: message.date
+              messageId: result.email.id,
+              from: result.email.from,
+              subject: result.email.subject,
+              body: result.email.body,
+              date: result.email.date,
+              labels: result.email.labels
             };
           } catch (error) {
             console.error(`[GmailAgent] ❌ Error reading message:`, error.message);
@@ -494,10 +519,30 @@ GMAIL SPECIFIC GUIDELINES:
    - Mark emails as read after processing
    - Delete emails when user requests
 
-5. **Search and Retrieval**
+5. **Search and Retrieval - CRITICAL WORKFLOW**
    - Use listMessages to search for emails
    - Use readMessage to get full email content
-   - Support Gmail search syntax (from:, subject:, etc.)`;
+   - Support Gmail search syntax (from:, subject:, etc.)
+   
+   **IMPORTANT - Multi-Step Workflow:**
+   When user asks to "read email from [sender]" or "show email about [topic]":
+   ✅ STEP 1: Call listMessages with appropriate search query
+      - For "read email from Google AI Studio" → listMessages({ query: "from:Google AI Studio", maxResults: 1 })
+      - For "show emails about meetings" → listMessages({ query: "subject:meetings", maxResults: 5 })
+   ✅ STEP 2: Extract messageId from the returned emails
+   ✅ STEP 3: Call readMessage with the actual messageId
+   
+   ❌ NEVER call readMessage without first using listMessages
+   ❌ NEVER make up or guess messageIds (like "1", "abc123", etc.)
+   ❌ NEVER call readMessage if listMessages finds no results - inform user instead
+   
+   **Example CORRECT flow for "read the email from Google AI Studio":**
+   Step 1: listMessages({ query: "from:Google AI Studio", maxResults: 1 })
+   Step 2: Extract messageId from results (e.g., "19d049da96d7fcb5")
+   Step 3: readMessage({ messageId: "19d049da96d7fcb5" })
+   
+   **Example WRONG flow:**
+   Step 1: readMessage({ messageId: "1" }) ❌ WRONG - no search done, no real messageId`;
   }
 
   /**

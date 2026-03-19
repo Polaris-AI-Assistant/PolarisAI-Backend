@@ -119,7 +119,8 @@ async function listEmails(userId, options = {}) {
     skip = 0,
     filter = null,
     search = null,
-    orderBy = 'receivedDateTime desc'
+    orderBy = 'receivedDateTime desc',
+    unreadOnly = false
   } = options;
 
   let endpoint = `/me/mailFolders/${folder}/messages`;
@@ -130,11 +131,104 @@ async function listEmails(userId, options = {}) {
     '$select': 'id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments,importance'
   };
 
-  if (filter) params['$filter'] = filter;
+  // If unreadOnly is true, filter for unread emails
+  if (unreadOnly) {
+    params['$filter'] = 'isRead eq false';
+  } else if (filter) {
+    params['$filter'] = filter;
+  }
+  
   if (search) params['$search'] = `"${search}"`;
 
-  const response = await graphRequest(userId, endpoint, 'GET', null, params);
-  return response.value || [];
+  try {
+    const response = await graphRequest(userId, endpoint, 'GET', null, params);
+    const emails = response.value || [];
+    
+    return {
+      success: true,
+      emails: emails.map(email => ({
+        id: email.id,
+        subject: email.subject,
+        from: email.from?.emailAddress?.address || 'Unknown',
+        fromName: email.from?.emailAddress?.name || 'Unknown',
+        receivedDateTime: email.receivedDateTime,
+        bodyPreview: email.bodyPreview,
+        isRead: email.isRead,
+        hasAttachments: email.hasAttachments,
+        importance: email.importance,
+        toRecipients: email.toRecipients?.map(r => r.emailAddress?.address) || []
+      })),
+      count: emails.length,
+      folder: folder,
+      unreadOnly: unreadOnly
+    };
+  } catch (error) {
+    console.error('Error listing emails:', error);
+    return {
+      success: false,
+      emails: [],
+      count: 0,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Search emails by keyword/subject
+ * @param {string} userId - User ID
+ * @param {string} query - Search query (subject, from, body, etc.)
+ * @param {object} options - Additional options (folder, top, etc.)
+ * @returns {object} Search results with emails
+ */
+async function searchEmails(userId, query, options = {}) {
+  const {
+    folder = 'inbox',
+    top = 20,
+    fields = 'id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments'
+  } = options;
+
+  try {
+    let endpoint = `/me/mailFolders/${folder}/messages`;
+    const params = {
+      '$top': top,
+      '$select': fields
+      // NOTE: Do NOT add $orderby here - Microsoft Graph API doesn't support $orderby with $search
+    };
+
+    // Use $search for keyword search
+    if (query) {
+      params['$search'] = `"${query}"`;
+    }
+
+    const response = await graphRequest(userId, endpoint, 'GET', null, params);
+    const emails = response.value || [];
+
+    return {
+      success: true,
+      emails: emails.map(email => ({
+        id: email.id,
+        subject: email.subject,
+        from: email.from?.emailAddress?.address || 'Unknown',
+        fromName: email.from?.emailAddress?.name || 'Unknown',
+        receivedDateTime: email.receivedDateTime,
+        bodyPreview: email.bodyPreview,
+        isRead: email.isRead,
+        hasAttachments: email.hasAttachments
+      })),
+      count: emails.length,
+      query: query,
+      folder: folder
+    };
+  } catch (error) {
+    console.error('Error searching emails:', error);
+    return {
+      success: false,
+      emails: [],
+      count: 0,
+      query: query,
+      error: error.message
+    };
+  }
 }
 
 /**
@@ -309,11 +403,34 @@ async function markEmailUnread(userId, messageId) {
  * @param {string} userId - User ID
  * @returns {array} List of mail folders
  */
-async function listMailFolders(userId) {
-  const response = await graphRequest(userId, '/me/mailFolders', 'GET', null, {
-    '$select': 'id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount'
-  });
-  return response.value || [];
+async function listMailFolders(userId, options = {}) {
+  try {
+    const response = await graphRequest(userId, '/me/mailFolders', 'GET', null, {
+      '$select': 'id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount'
+    });
+    
+    const folders = response.value || [];
+    
+    return {
+      success: true,
+      folders: folders.map(folder => ({
+        id: folder.id,
+        name: folder.displayName,
+        unreadCount: folder.unreadItemCount || 0,
+        totalCount: folder.totalItemCount || 0,
+        childFolderCount: folder.childFolderCount || 0
+      })),
+      count: folders.length
+    };
+  } catch (error) {
+    console.error('Error listing mail folders:', error);
+    return {
+      success: false,
+      folders: [],
+      count: 0,
+      error: error.message
+    };
+  }
 }
 
 /**
@@ -1853,6 +1970,7 @@ module.exports = {
   
   // Outlook Mail
   listEmails,
+  searchEmails,
   getEmail,
   sendEmail,
   replyToEmail,

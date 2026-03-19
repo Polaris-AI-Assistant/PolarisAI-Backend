@@ -442,13 +442,28 @@ class CalendarAgentMultiStep extends BaseAgent {
 
 GOOGLE CALENDAR SPECIFIC GUIDELINES:
 
-1. **Event Creation**
+1. **Retrieving Past Events - CRITICAL FOR "past meetings" QUERIES**
+   - When user asks: "Show my past meetings", "list past events", "what meetings did I have?"
+   - ALWAYS use timeMax = TODAY (current date in ISO 8601 format)
+   - ALWAYS use timeMax that is BEFORE today, not AFTER today
+   - For "past X days": Compute timeMin as X days ago from today
+   - For "past month": Use timeMin = 30 days ago
+   - For "past year" or all past: Use timeMin = 365 days ago  
+   - NEVER use hardcoded dates like "2023-10-01" - compute relative to TODAY
+   - Include optional query filter for specific meeting types (e.g., "Google Meet", "Team Meeting")
+
+   Example correct calls:
+   - Past 30 days: { timeMin: "2026-02-17", timeMax: "2026-03-19", query: "Google Meet" }
+   - Past 2 weeks: { timeMin: "2026-03-05", timeMax: "2026-03-19" }
+   - All past: { timeMin: "2025-03-19", timeMax: "2026-03-19", query: "Google Meet" }
+
+2. **Event Creation**
    - Always create an event first if the user wants to schedule something
    - Include all relevant details: title, time, location, attendees
    - Use ISO 8601 format for dates/times
    - Add Google Meet link if it's a meeting
 
-2. **Multi-Step Example**
+3. **Multi-Step Example**
    User: "Schedule a meeting tomorrow at 2pm and add john@example.com"
    
    Step 1: createEvent({ summary: "Meeting", startDateTime: "...", endDateTime: "...", attendees: ["john@example.com"] })
@@ -457,17 +472,17 @@ GOOGLE CALENDAR SPECIFIC GUIDELINES:
    Step 2: No more tools needed
    Execution complete
 
-3. **Attendee Management**
+4. **Attendee Management**
    - Use addAttendees to add people to existing events
    - Always send updates when adding attendees
    - Include attendee emails in createEvent if known upfront
 
-4. **Calendar Operations**
+5. **Calendar Operations**
    - Create new calendars when user requests
    - Use primary calendar by default
    - Specify calendarId when working with specific calendars
 
-5. **Always Return Event Links**
+6. **Always Return Event Links**
    - Users need to access their events
    - Include event links in results when available`;
   }
