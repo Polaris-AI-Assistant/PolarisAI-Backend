@@ -10,6 +10,61 @@ const OpenAI = require('openai');
 class GitHubAgentMultiStep extends BaseAgent {
   constructor(llmClient) {
     const tools = {
+      getGithubProfile: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'getGithubProfile',
+            description: 'Get the authenticated user\'s GitHub profile information including name, bio, followers, public repositories count, location, company, blog, and more. Use this when user asks about their profile, account details, or personal GitHub information.',
+            parameters: {
+              type: 'object',
+              properties: {
+                username: {
+                  type: 'string',
+                  description: 'Optional: GitHub username to get public profile. If not provided, returns the authenticated user\'s profile.'
+                }
+              },
+              required: []
+            }
+          }
+        },
+        execute: async (params, context) => {
+          console.log(`[GitHubAgent] 👤 Getting GitHub profile${params?.username ? ` for user: ${params.username}` : ' for authenticated user'}`);
+          try {
+            const result = await githubTools.github_getUserProfile(params || {}, context);
+            if (!result.success) {
+              throw new Error(result.error?.message || 'Failed to get profile');
+            }
+            const profile = result.data;
+            return {
+              success: true,
+              profile: {
+                username: profile.login,
+                name: profile.name,
+                bio: profile.bio,
+                location: profile.location,
+                company: profile.company,
+                blog: profile.blog,
+                followers: profile.followers,
+                following: profile.following,
+                publicRepos: profile.public_repos,
+                publicGists: profile.public_gists,
+                created: profile.created_at,
+                updated: profile.updated_at,
+                profileUrl: profile.html_url,
+                avatarUrl: profile.avatar_url,
+                email: profile.email,
+                hireable: profile.hireable,
+                twitterUsername: profile.twitter_username
+              }
+            };
+          } catch (error) {
+            console.error(`[GitHubAgent] ❌ Error getting profile:`, error.message);
+            throw error;
+          }
+        }
+      },
+
       createRepository: {
         definition: {
           type: 'function',

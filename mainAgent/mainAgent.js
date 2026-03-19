@@ -2710,7 +2710,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       const response = await this.openai.chat.completions.create({
         model: 'gpt-4o-mini', // Using same model for consistency
         messages: messages,
-        temperature: 0.7
+        temperature: 0.1 // ✅ LOW: Response combining should be deterministic
       });
 
       const combinedResponse = response.choices[0].message.content;

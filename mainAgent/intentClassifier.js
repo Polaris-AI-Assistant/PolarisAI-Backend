@@ -9,9 +9,16 @@
  * - FILE_GENERATION: User wants to generate a file (PDF/TXT)
  * 
  * The LLM understands context, nuance, and edge cases that regex cannot handle.
+ * 
+ * IMPROVEMENTS:
+ * - Uses LLMConfig for consistent temperature (0.1 = deterministic)
+ * - Normalizes input to prevent parsing variations
+ * - Adds chain-of-thought reasoning
+ * - Ensures stable, reproducible classification
  */
 
 const OpenAI = require('openai');
+const LLMConfig = require('../utils/llmConfig');
 
 class IntentClassifier {
   constructor() {
@@ -43,7 +50,12 @@ class IntentClassifier {
    */
   async classifyIntent(query, conversationHistory = []) {
     try {
-      console.log(`[IntentClassifier] 🤖 Classifying intent for query: "${query}"`);
+      // ✅ NORMALIZE INPUT for stable parsing
+      const normalizedQuery = LLMConfig.normalizeInput(query);
+      console.log(`[IntentClassifier] 🤖 Classifying intent for query: "${normalizedQuery}"`);
+      if (normalizedQuery !== query) {
+        console.log(`[IntentClassifier] 📝 Original: "${query}"`);
+      }
 
       // Build conversation context
       let conversationContext = '';
@@ -55,6 +67,15 @@ class IntentClassifier {
       }
 
       const classificationPrompt = `You are an expert at understanding user intent in natural language queries.
+
+REASONING PROCESS (think step by step before classifying):
+1. Analyze the main action verb or intent in the query
+2. Consider the context and conversation history
+3. Determine what the user is trying to achieve
+4. Select the single best matching category
+5. Provide your confidence level
+
+---
 
 Classify the following user query into ONE of these categories:
 
@@ -115,7 +136,7 @@ CRITICAL RULES:
 
 ${conversationContext ? `\nRECENT CONVERSATION:\n${conversationContext}\n` : ''}
 
-User Query: "${query}"
+User Query: "${normalizedQuery}"
 
 Respond with ONLY a JSON object (no markdown, no code blocks):
 {
@@ -127,16 +148,20 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   "requiresWebSearch": true | false
 }`;
 
-      const response = await this.client.chat.completions.create({
-        model: this.model,
-        max_tokens: 300,
-        messages: [
+      // ✅ USE STANDARDIZED LLM CONFIG for deterministic classification
+      const response = await LLMConfig.createCompletion(
+        this.client,
+        [
           {
             role: 'user',
             content: classificationPrompt
           }
-        ]
-      });
+        ],
+        {
+          temperature: LLMConfig.TEMPERATURE.DETERMINISTIC, // 0.1 = deterministic
+          maxTokens: 300,
+        }
+      );
 
       const responseText = response.choices[0].message.content.trim();
       
@@ -231,6 +256,42 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   }
 
   /**
+   * Quick check for GitHub and external API queries (no LLM needed)
+   * These should be ACTIONABLE because they fetch data from external APIs
+   * NOT conversational, because they're not asking about conversation history
+   * 
+   * @param {string} query - User's query
+   * @returns {Object|null} - Classification if obvious, null otherwise
+   */
+  quickCheckGitHubAndAPIs(query) {
+    const lowerQuery = query.toLowerCase().trim();
+    
+    // GitHub/external API patterns that should be ACTIONABLE
+    const apiPatterns = [
+      /\b(github|repo|repository|commit|issue|pull request|pr)\b/i,
+      /\b(tell me|show me|give me|what is|what are)\s+(my\s+)?(github|profile|username|repos?|commits?)/i,
+      /\b(weather|temperature|forecast)\b/i,
+      /\b(email|calendar|schedule|meeting)\b.*\b(from|for)\b/i,
+      /\b(my|show|list|get)\s+(my\s+)?(profile|account|information|details)\b/i
+    ];
+
+    for (const pattern of apiPatterns) {
+      if (pattern.test(query)) {
+        return {
+          type: 'actionable',
+          confidence: 0.9,
+          reasoning: 'Query asks for external API data (GitHub, Weather, Email, etc.)',
+          actionType: 'get',
+          shouldUseAgents: true,
+          requiresWebSearch: false
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Quick check for obvious conversational queries (no LLM needed)
    * These are patterns that are ALWAYS conversational
    * 
@@ -240,7 +301,7 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   quickCheckConversational(query) {
     const lowerQuery = query.toLowerCase().trim();
     
-    // Obvious conversational patterns
+    // Obvious conversational patterns - EXCLUDE queries about external APIs
     const conversationalPatterns = [
       /^what\s+(is|was)\s+my\s+name/i,
       /^who\s+am\s+i/i,
@@ -253,13 +314,16 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
 
     for (const pattern of conversationalPatterns) {
       if (pattern.test(query)) {
-        return {
-          type: 'conversational',
-          confidence: 0.99,
-          reasoning: 'Obvious conversational query pattern',
-          actionType: null,
-          shouldUseAgents: false
-        };
+        // But exclude if query mentions GitHub or external APIs
+        if (!/\b(github|repo|profile|username)\b/i.test(query)) {
+          return {
+            type: 'conversational',
+            confidence: 0.99,
+            reasoning: 'Obvious conversational query pattern',
+            actionType: null,
+            shouldUseAgents: false
+          };
+        }
       }
     }
 
@@ -315,14 +379,45 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
   }
 
   /**
-   * Classify intent using LLM only (no pattern matching)
+   * Classify intent using quick checks first, then LLM if needed
    * 
    * @param {string} query - User's query
    * @param {Array} conversationHistory - Recent conversation history
    * @returns {Promise<Object>} - Intent classification
    */
   async classify(query, conversationHistory = []) {
-    // Always use LLM for classification - no pattern matching
+    // Try quick checks first (no LLM needed)
+    // Order matters: check more specific patterns first
+    
+    // 1. Check for GitHub and external API queries (ACTIONABLE)
+    let result = this.quickCheckGitHubAndAPIs(query);
+    if (result) {
+      console.log(`[IntentClassifier] ⚡ Quick check (GitHub/APIs): ${result.type}`);
+      return result;
+    }
+
+    // 2. Check for web search queries
+    result = this.quickCheckWebSearch(query);
+    if (result) {
+      console.log(`[IntentClassifier] ⚡ Quick check (Web Search): ${result.type}`);
+      return result;
+    }
+
+    // 3. Check for file generation
+    result = this.quickCheckFileGeneration(query);
+    if (result) {
+      console.log(`[IntentClassifier] ⚡ Quick check (File Generation): ${result.type}`);
+      return result;
+    }
+
+    // 4. Check for conversational queries (LAST, so GitHub queries don't get caught here)
+    result = this.quickCheckConversational(query);
+    if (result) {
+      console.log(`[IntentClassifier] ⚡ Quick check (Conversational): ${result.type}`);
+      return result;
+    }
+
+    // Fall back to LLM for ambiguous cases
     console.log(`[IntentClassifier] 🤖 Using LLM for intent classification`);
     return await this.classifyIntent(query, conversationHistory);
   }
