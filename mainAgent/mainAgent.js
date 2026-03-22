@@ -72,6 +72,9 @@ const {
 // Timezone detection
 const { getUserTimezone } = require('../utils/timezoneDetection');
 
+// Supabase client import (needed for file operations in confirmation flow)
+const supabase = require('../supabase/supabaseConnect');
+
 class MainAgent {
   constructor() {
     // Initialize OpenAI client
@@ -426,7 +429,13 @@ class MainAgent {
       params,
       previewContent,
       query,
-      conversationHistory
+      conversationHistory,
+      null,  // conversationId - not always available here
+      undefined,  // ttlMs - use default
+      [],  // timelineEvents - not available here
+      null,  // originalAnalysis - not available here
+      {},  // initialResults - not available here
+      this.lastFileIds || []  // ✅ NEW: Pass fileIds for attachment support
     );
 
     return {
@@ -805,13 +814,54 @@ class MainAgent {
       
       console.log(`[MainAgent] 📝 Passing original query to ${agentName}: "${query}"`);
       
+      // 🔴 CRITICAL FIX: Fetch file metadata from Supabase BEFORE passing to agent
+      let attachedFiles = [];
+      if (pendingAction.fileIds && pendingAction.fileIds.length > 0) {
+        console.log(`[MainAgent] 📎 Fetching ${pendingAction.fileIds.length} file(s) from database...`);
+        
+        try {
+          const { data: files, error } = await supabase
+            .from('files')
+            .select('id, original_filename, filename, mime_type, size, storage_path, file_type')
+            .in('id', pendingAction.fileIds)
+            .eq('user_id', userId);
+          
+          if (!error && files && files.length > 0) {
+            attachedFiles = files;
+            console.log(`[MainAgent] ✅ Loaded ${files.length} file(s):`, 
+              files.map(f => `${f.original_filename || f.filename} (${f.id.substring(0, 8)}...)`).join(', '));
+          } else if (error) {
+            console.error(`[MainAgent] ❌ Failed to load files from database:`, error.message);
+          }
+        } catch (fileError) {
+          console.error(`[MainAgent] ❌ Error fetching files:`, fileError.message);
+        }
+      }
+      
+      // ✅ CRITICAL FIX: Merge fetched fileIds into params before forcing execution
+      // The params from confirmation store may have empty fileIds, but we just fetched them
+      const enhancedParams = {
+        ...params,
+        fileIds: pendingAction.fileIds || [],  // ✅ Use fetched fileIds, not the empty ones from confirmation
+        attachedFiles: attachedFiles  // ✅ Also include metadata
+      };
+      
+      console.log(`[MainAgent] 📋 Merged params for forceToolExecution:`, {
+        toolName,
+        hasFileIds: enhancedParams.fileIds && enhancedParams.fileIds.length > 0,
+        fileIdCount: enhancedParams.fileIds ? enhancedParams.fileIds.length : 0,
+        originalFileIdCount: params.fileIds ? params.fileIds.length : 0
+      });
+      
       const result = await agent.processQuery(query, { 
         userId,
         conversationHistory,
         conversationId,  // ✅ CRITICAL: Pass conversationId for context
+        fileIds: pendingAction.fileIds || [],  // ✅ Pass fileIds array
+        attachedFiles: attachedFiles,  // ✅ CRITICAL FIX: Pass file metadata
         forceToolExecution: {
           toolName,
-          params
+          params: enhancedParams  // ✅ Use merged params with fileIds
         }
       });
 
@@ -2437,7 +2487,9 @@ CORE RULES:
               conversationHistory: conversationHistory,
               ...(agentName === 'maps' && userLocation ? { userLocation } : {}),
               // Add timezone for schedules agent
-              ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {})
+              ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {}),
+              // ✅ NEW: Pass fileIds for attachment support (gmail agent)
+              ...(this.lastFileIds ? { fileIds: this.lastFileIds } : {})
             };
             
             // ✅ CRITICAL FIX: Add researchContent to options if it was returned
@@ -2552,7 +2604,9 @@ CORE RULES:
               conversationHistory: conversationHistory,
               ...(agentName === 'maps' && userLocation ? { userLocation } : {}),
               // Add timezone for schedules agent
-              ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {})
+              ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {}),
+              // ✅ NEW: Pass fileIds for attachment support (gmail agent)
+              ...(this.lastFileIds ? { fileIds: this.lastFileIds } : {})
             };
 
             const result = await agent.processQuery(agentQuery, agentOptions);
@@ -2750,6 +2804,18 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
   async processQueryWithStreaming(query, userId, options = {}, onChunk) {
     const startTime = Date.now();
     const conversationId = options.conversationId;
+    
+    // ✅ NEW: Extract and store fileIds from options for passing to agents
+    if (options.fileIds && options.fileIds.length > 0) {
+      this.lastFileIds = options.fileIds;
+      console.log(`[MainAgent] 📎 Storing fileIds for agent use: ${options.fileIds.length} file(s) - ${options.fileIds.join(', ')}`);
+    } else if (options.fileContext && options.fileContext.fileIds && options.fileContext.fileIds.length > 0) {
+      // Fallback: extract fileIds from fileContext if available
+      this.lastFileIds = options.fileContext.fileIds;
+      console.log(`[MainAgent] 📎 Extracted fileIds from fileContext: ${options.fileContext.fileIds.length} file(s)`);
+    } else {
+      this.lastFileIds = null;
+    }
     
     // ✅ CRITICAL: Detect language at the VERY START using LLM before any processing
     const languageDetection = require('../utils/languageDetection');
@@ -3377,7 +3443,9 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
           conversationId,
           undefined,  // ttlMs - use default
           timeline ? timeline.getEvents() : [],  // Pass timeline events from initial query
-          analysis  // Pass original analysis for sequential multi-agent execution
+          analysis,  // Pass original analysis for sequential multi-agent execution
+          {},  // initialResults - empty for single action
+          this.lastFileIds || []  // ✅ NEW: Pass fileIds for attachment support
         );
         
         return {
@@ -3764,7 +3832,8 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
         undefined,  // ttlMs - use default
         timeline ? timeline.getEvents() : [],  // Pass timeline events from initial query
         analysis,  // Pass original analysis for sequential multi-agent execution
-        nonConfirmationResults  // ✅ NEW: Pass results from non-confirmation agents
+        nonConfirmationResults,  // Pass results from non-confirmation agents
+        this.lastFileIds || []  // ✅ NEW: Pass fileIds for attachment support
       );
 
       return {
@@ -3975,7 +4044,33 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       ],
       gmail: [
         {
-          // Only match when user explicitly wants to SEND an email
+          // 🔴 PRIORITY 1: sendEmailWithAttachment - matches ONLY when user wants to attach files
+          // Must be BEFORE sendEmail pattern so it takes precedence
+          patterns: ['send', 'compose', 'email to', 'mail to', 'mail', 'send email'],
+          keywords: ['email', 'mail', '@'],
+          hasContext: ['attach', 'attachment', 'pdf', 'file', 'document', 'with file', 'include file'],  // CRITICAL: Must have attachment keywords
+          toolName: 'sendEmailWithAttachment',
+          extractParams: async (q, userId, conversationHistory) => {
+            // ✅ Use the same email parameter extraction as sendEmail
+            // This will generate AI subject/body and extract user name from Gmail account
+            console.log(`[sendEmailWithAttachment] 📎 Generating email parameters with AI and user profile...`);
+            
+            // Call the standard email extraction with AI generation
+            const emailParams = await this.extractEmailParamsWithAI(q, userId, conversationHistory);
+            
+            // Add attachment context
+            return {
+              ...emailParams,
+              fileIds: [],  // Will be populated from context
+              _originalQuery: q
+            };
+          },
+          isAsync: true,
+          excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list']
+        },
+        {
+          // 🔴 PRIORITY 2: sendEmail - matches ONLY when user wants to send WITHOUT attachments
+          // Only match when user explicitly wants to SEND an email (no attachments)
           // Exclude read/search/get/show/check/find/what patterns
           patterns: ['send', 'compose', 'write to', 'email to', 'mail to', 'send email'],
           keywords: ['email', 'mail', 'message', '@'],  // Added @ to catch email addresses
@@ -4083,7 +4178,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             }
           },
           isAsync: true,  // Changed to async for AI generation
-          excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox']
+          excludePatterns: ['read', 'show', 'get', 'find', 'search', 'check', 'what', 'list', 'unread', 'recent', 'latest', 'inbox', 'attach', 'attachment', 'pdf', 'file', 'document', 'with file', 'include file']  // Exclude attachment keywords - they should use sendEmailWithAttachment
         },
         {
           patterns: ['reply', 'respond'],
@@ -4179,6 +4274,11 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       const hasAction = pattern.patterns.some(p => query.includes(p));
       const hasTarget = pattern.keywords.some(k => query.includes(k));
       
+      // Check for context patterns (e.g., attachment keywords for sendEmailWithAttachment)
+      const hasContext = pattern.hasContext 
+        ? pattern.hasContext.some(c => query.includes(c))
+        : true;  // If no hasContext requirement, always pass
+      
       // Check for exclusion patterns - if any exclusion pattern is found, skip this pattern
       // Use word boundaries to avoid false positives (e.g., "budget" shouldn't match "get")
       const hasExclusion = pattern.excludePatterns 
@@ -4196,9 +4296,12 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       console.log(`[detectConfirmationRequiredAction]   Tool: ${pattern.toolName}`);
       console.log(`[detectConfirmationRequiredAction]     hasAction: ${hasAction} (patterns: ${pattern.patterns.join(', ')})`);
       console.log(`[detectConfirmationRequiredAction]     hasTarget: ${hasTarget} (keywords: ${pattern.keywords.join(', ')})`);
+      if (pattern.hasContext) {
+        console.log(`[detectConfirmationRequiredAction]     hasContext: ${hasContext} (context: ${pattern.hasContext.join(', ')})`);
+      }
       console.log(`[detectConfirmationRequiredAction]     hasExclusion: ${hasExclusion}`);
       
-      if (hasAction && hasTarget && !hasExclusion) {
+      if (hasAction && hasTarget && hasContext && !hasExclusion) {
         console.log(`[detectConfirmationRequiredAction]   ✅ MATCH! Extracting params for ${pattern.toolName}`);
         // Handle async extractors (like forms with AI-generated questions, gmail with AI content)
         // Pass userId for extractors that need it (like gmail for user signature)
@@ -5158,6 +5261,11 @@ CRITICAL: This is a MEETING INVITATION email. Focus on:
 - DO NOT talk about documents, files, or forms being shared
 - Keep it professional and clear about the meeting purpose
 
+IMPORTANT - EMOJI CONSTRAINT:
+⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
+Use ONLY standard English text, numbers, and common punctuation marks (. , ! ? - etc.)
+Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
+
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
 ${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
@@ -5165,6 +5273,11 @@ ${userName ? `The sender's name is "${userName}" - include this after "Best rega
 1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
 2. The main message body (friendly, professional tone as appropriate)
 3. A proper sign-off with the sender's name
+
+IMPORTANT - EMOJI CONSTRAINT:
+⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
+Use ONLY standard English text, numbers, and common punctuation marks (. , ! ? - etc.)
+Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
@@ -5212,7 +5325,7 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
           messages: [
             {
               role: "system",
-              content: "Generate a short, catchy email subject line (max 60 chars). Only output the subject text, nothing else. Do not use quotes."
+              content: "Generate a short, catchy email subject line (max 60 chars). Only output the subject text, nothing else. Do not use quotes. CRITICAL: NEVER use any emojis, emoji characters, or special Unicode symbols. Use only standard English text and common punctuation."
             },
             {
               role: "user",
@@ -5351,6 +5464,11 @@ CRITICAL: This is a MEETING INVITATION email. Focus on:
 - DO NOT talk about documents, files, or forms being shared
 - Keep it professional and clear about the meeting purpose
 
+IMPORTANT - EMOJI CONSTRAINT:
+⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
+Use ONLY standard English text, numbers, and common punctuation marks (. , ! ? - etc.)
+Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
+
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
 ${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
@@ -5358,6 +5476,11 @@ ${userName ? `The sender's name is "${userName}" - include this after "Best rega
 1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
 2. The main message body (friendly, professional tone as appropriate)
 3. A proper sign-off with the sender's name
+
+IMPORTANT - EMOJI CONSTRAINT:
+⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
+Use ONLY standard English text, numbers, and common punctuation marks (. , ! ? - etc.)
+Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
@@ -5405,7 +5528,7 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
           messages: [
             {
               role: "system",
-              content: "Generate a short, catchy email subject line (max 60 chars). Only output the subject text, nothing else. Do not use quotes."
+              content: "Generate a short, catchy email subject line (max 60 chars). Only output the subject text, nothing else. Do not use quotes. CRITICAL: NEVER use any emojis, emoji characters, or special Unicode symbols. Use only standard English text and common punctuation."
             },
             {
               role: "user",

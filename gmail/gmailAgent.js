@@ -134,6 +134,50 @@ class GmailAgent {
           }
         }
       },
+      {
+        type: "function",
+        function: {
+          name: "sendEmailWithAttachment",
+          description: "Send an email with file attachments. Files must be uploaded to the platform first and provided as file IDs. Supports Markdown formatting which will be automatically converted to HTML. Use when user wants to send an email with one or more attached files.",
+          parameters: {
+            type: "object",
+            properties: {
+              to: {
+                type: "string",
+                description: "Recipient email address (required)"
+              },
+              subject: {
+                type: "string",
+                description: "Email subject line (required)"
+              },
+              body: {
+                type: "string",
+                description: "Email body content. Can include Markdown formatting which will be automatically converted to HTML (required)"
+              },
+              fileIds: {
+                type: "array",
+                items: {
+                  type: "string"
+                },
+                description: "Array of file IDs from uploaded files to attach to the email (required, minimum 1 file)"
+              },
+              cc: {
+                type: "string",
+                description: "CC recipients (comma-separated emails)"
+              },
+              bcc: {
+                type: "string",
+                description: "BCC recipients (comma-separated emails)"
+              },
+              isHtml: {
+                type: "boolean",
+                description: "Whether the body is already HTML content (default: false). If false and Markdown is detected, it will be auto-converted to HTML"
+              }
+            },
+            required: ["to", "subject", "body", "fileIds"]
+          }
+        }
+      },
 
       // ========== EMAIL READING ==========
       {
@@ -641,6 +685,7 @@ class GmailAgent {
       'sendEmail': gmailService.sendEmailForAgent,
       'replyToEmail': gmailService.replyToEmail,
       'forwardEmail': gmailService.forwardEmail,
+      'sendEmailWithAttachment': gmailService.sendEmailWithAttachmentsForAgent,
       
       // Email Reading
       'readEmail': gmailService.readEmail,

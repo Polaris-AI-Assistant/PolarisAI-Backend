@@ -70,7 +70,7 @@ function generateRequestId() {
  * @param {object} initialResults - Results from non-confirmation agents executed before confirmation (optional)
  * @returns {string} - Request ID for this pending action
  */
-function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = [], originalAnalysis = null, initialResults = {}) {
+function storePendingAction(userId, toolName, agentName, params, previewContent, query, conversationHistory = [], conversationId = null, ttlMs = DEFAULT_TTL_MS, timelineEvents = [], originalAnalysis = null, initialResults = {}, fileIds = []) {
   const requestId = generateRequestId();
   const now = Date.now();
   
@@ -87,6 +87,7 @@ function storePendingAction(userId, toolName, agentName, params, previewContent,
     timelineEvents,  // Store timeline events from initial query
     originalAnalysis,  // Store original analysis for sequential multi-agent execution
     initialResults,  // ✅ NEW: Store results from non-confirmation agents
+    fileIds,  // ✅ NEW: Store fileIds for attachment support
     createdAt: now,
     expiresAt: now + ttlMs
   };
@@ -94,6 +95,9 @@ function storePendingAction(userId, toolName, agentName, params, previewContent,
   pendingActions.set(requestId, pendingAction);
   
   console.log(`[ConfirmationStore] Stored pending action: ${requestId} for tool: ${toolName} (conversation: ${conversationId || 'none'}, timeline events: ${timelineEvents.length})`);
+  if (fileIds && fileIds.length > 0) {
+    console.log(`[ConfirmationStore]   FileIds: ${fileIds.length} file(s) - ${fileIds.join(', ')}`);
+  }
   if (originalAnalysis && originalAnalysis.requiresSequential) {
     console.log(`[ConfirmationStore]   Sequential multi-agent task: ${originalAnalysis.agents.join(', ')}`);
   }

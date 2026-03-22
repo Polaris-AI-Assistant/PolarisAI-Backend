@@ -238,6 +238,7 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         userLocation,  // Pass userLocation for Maps agent
         chatId,  // Pass chatId for reference
         fileContext,  // Pass file context for LLM
+        fileIds,  // ✅ NEW: Pass fileIds for Gmail agent attachment support
         responseLanguage  // Pass response language preference for multi-language support
       }, (chunk) => {
         // Accumulate content chunks for memory storage

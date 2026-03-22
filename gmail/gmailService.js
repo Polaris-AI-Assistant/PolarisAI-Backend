@@ -1,8 +1,10 @@
 const { google } = require('googleapis');
 const supabase = require('../supabase/supabaseConnect');
+const supabaseAdmin = require('../supabase/supabaseAdmin');
 const OpenAI = require('openai');
 const { sendNotification: sendSocketNotification } = require('../socket/socketManager');
 const MarkdownIt = require('markdown-it');
+const crypto = require('crypto');
 
 // Define OAuth scopes - Extended for full Gmail agent functionality
 const SCOPES = [
@@ -1906,6 +1908,431 @@ async function removeLabel(userId, params) {
   }
 }
 
+// ============================================================
+// EMAIL WITH ATTACHMENTS FUNCTIONS
+// ============================================================
+
+/**
+ * Helper function to generate a unique MIME boundary string
+ * @returns {string} Unique boundary string
+ */
+function generateBoundary() {
+  return `boundary_${crypto.randomBytes(16).toString('hex')}`;
+}
+
+/**
+ * Helper function to encode filename for RFC 2231 header parameter encoding
+ * Handles special characters in filenames
+ * @param {string} filename - The filename to encode
+ * @returns {string} RFC 2231 encoded filename
+ */
+function encodeFilename(filename) {
+  // Check if filename contains special characters
+  if (/[^\x20-\x7E]/.test(filename) || /[()<>@,;:\\"[\]?=]/.test(filename)) {
+    // Use RFC 2231 encoding for special characters
+    const encoded = Buffer.from(filename, 'utf-8').toString('base64');
+    return `=?UTF-8?B?${encoded}?=`;
+  }
+  return filename;
+}
+
+/**
+ * Send an email with file attachments using the Gmail API
+ * @param {google.auth.OAuth2} auth - Configured OAuth2 client
+ * @param {string} to - Recipient email address
+ * @param {string} subject - Email subject
+ * @param {string} body - Email body (plain text or HTML)
+ * @param {Array<string>} fileIds - Array of file IDs from the files table
+ * @param {Object} [options] - Additional options
+ * @param {string} [options.userId] - User ID (required for file validation)
+ * @param {string} [options.from] - Sender email (optional)
+ * @param {string} [options.cc] - CC recipients (optional)
+ * @param {string} [options.bcc] - BCC recipients (optional)
+ * @param {boolean} [options.isHtml=false] - Whether the body is HTML
+ * @param {boolean} [options.isMarkdown=false] - Whether to convert Markdown to HTML
+ * @returns {Promise<Object>} Gmail API response with file attachment metadata
+ */
+async function sendEmailWithAttachments(auth, to, subject, body, fileIds, options = {}) {
+  try {
+    const gmail = google.gmail({ version: 'v1', auth });
+    
+    const {
+      userId,
+      from,
+      cc,
+      bcc,
+      isHtml = false,
+      isMarkdown = false,
+      replyTo
+    } = options;
+
+    // Validate fileIds
+    if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+      throw new Error('At least one file ID must be provided');
+    }
+
+    if (fileIds.length > 25) {
+      throw new Error('Gmail API limits attachments to 25 files per message');
+    }
+
+    // Retrieve file metadata and download file buffers
+    console.log(`[Gmail] 📎 Retrieving ${fileIds.length} file(s) from Supabase...`);
+    const files = [];
+    let totalSize = 0;
+    const MAX_TOTAL_SIZE = 25 * 1024 * 1024; // Gmail's 25 MB limit
+
+    for (const fileId of fileIds) {
+      try {
+        // Get file metadata from Supabase
+        const { data: fileRecord, error: fetchError } = await supabase
+          .from('files')
+          .select('*')
+          .eq('id', fileId)
+          .single();
+
+        if (fetchError || !fileRecord) {
+          throw new Error(`File not found: ${fileId}`);
+        }
+
+        // Verify user ownership
+        if (userId && fileRecord.user_id !== userId) {
+          throw new Error(`File access denied: ${fileId} does not belong to this user`);
+        }
+
+        // Check file size
+        if (fileRecord.size > 25 * 1024 * 1024) {
+          throw new Error(`File too large: ${fileRecord.original_filename} (${(fileRecord.size / 1024 / 1024).toFixed(2)}MB exceeds 25MB limit)`);
+        }
+
+        // Check total size
+        totalSize += fileRecord.size;
+        if (totalSize > MAX_TOTAL_SIZE) {
+          throw new Error(`Total attachment size (${(totalSize / 1024 / 1024).toFixed(2)}MB) exceeds Gmail's 25MB limit`);
+        }
+
+        // Download file buffer from Supabase Storage
+        console.log(`[Gmail] 📥 Downloading file: ${fileRecord.original_filename}`);
+        const { data: fileBlob, error: downloadError } = await supabaseAdmin.storage
+          .from('user-uploads')
+          .download(fileRecord.storage_path);
+
+        if (downloadError || !fileBlob) {
+          throw new Error(`Failed to download file: ${fileRecord.original_filename}`);
+        }
+
+        // ✅ Convert Blob to Buffer: Blob → ArrayBuffer → Buffer
+        const arrayBuffer = await fileBlob.arrayBuffer();
+        const fileBuffer = Buffer.from(arrayBuffer);
+
+        console.log(`[Gmail] ✅ Downloaded ${fileRecord.original_filename}: ${fileBuffer.length} bytes`);
+
+        files.push({
+          id: fileRecord.id,
+          filename: fileRecord.original_filename,
+          mimeType: fileRecord.mime_type,
+          buffer: fileBuffer,
+          size: fileRecord.size
+        });
+
+        console.log(`[Gmail] ✅ File retrieved: ${fileRecord.original_filename} (${(fileRecord.size / 1024).toFixed(2)}KB)`);
+
+      } catch (error) {
+        console.error(`[Gmail] ❌ Error retrieving file ${fileId}:`, error.message);
+        throw error;
+      }
+    }
+
+    console.log(`[Gmail] 📧 Constructing multipart MIME message with ${files.length} attachment(s)...`);
+
+    // Convert Markdown to HTML if needed
+    let emailBody = body;
+    let shouldSendAsHtml = isHtml;
+    
+    if (isMarkdown && body) {
+      const md = new MarkdownIt();
+      emailBody = md.render(body);
+      shouldSendAsHtml = true;
+    } else if (isHtml && body) {
+      if (!body.includes('<br>') && !body.includes('<p>') && !body.includes('<div>')) {
+        emailBody = body.replace(/\n/g, '<br>');
+      }
+    }
+
+    // Get the authenticated user's email if 'from' is not provided
+    let fromAddress = from;
+    if (!fromAddress) {
+      try {
+        const profile = await gmail.users.getProfile({ userId: 'me' });
+        fromAddress = profile.data.emailAddress;
+      } catch (error) {
+        console.warn('[Gmail] Could not get user profile, using default from address');
+        fromAddress = 'me';
+      }
+    }
+
+    // Generate unique MIME boundary
+    const boundary = generateBoundary();
+
+    // Construct the multipart MIME message
+    const messageParts = [];
+    
+    // Add headers
+    messageParts.push(`To: ${to}`);
+    if (fromAddress && fromAddress !== 'me') {
+      messageParts.push(`From: ${fromAddress}`);
+    }
+    if (cc) {
+      messageParts.push(`Cc: ${cc}`);
+    }
+    if (bcc) {
+      messageParts.push(`Bcc: ${bcc}`);
+    }
+    if (replyTo) {
+      messageParts.push(`Reply-To: ${replyTo}`);
+    }
+    
+    messageParts.push(`Subject: ${subject}`);
+    messageParts.push('MIME-Version: 1.0');
+    messageParts.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+    messageParts.push('');
+
+    // Add email body as first part
+    messageParts.push(`--${boundary}`);
+    if (shouldSendAsHtml) {
+      messageParts.push('Content-Type: text/html; charset=utf-8');
+    } else {
+      messageParts.push('Content-Type: text/plain; charset=utf-8');
+    }
+    messageParts.push('Content-Transfer-Encoding: 7bit');
+    messageParts.push('');
+    messageParts.push(emailBody);
+
+    // Add each file as an attachment
+    for (const file of files) {
+      messageParts.push('');
+      messageParts.push(`--${boundary}`);
+      messageParts.push(`Content-Type: ${file.mimeType}; name="${encodeFilename(file.filename)}"`);
+      messageParts.push(`Content-Disposition: attachment; filename="${encodeFilename(file.filename)}"`);
+      messageParts.push('Content-Transfer-Encoding: base64');
+      messageParts.push('');
+      
+      // Encode file as base64 and add to message
+      const base64Content = file.buffer.toString('base64');
+      // Split base64 content into 76-character lines (RFC 2045)
+      const wrappedBase64 = base64Content.replace(/(.{76})/g, '$1\r\n');
+      messageParts.push(wrappedBase64);
+    }
+
+    // Add closing boundary
+    messageParts.push('');
+    messageParts.push(`--${boundary}--`);
+
+    // Join all message parts with CRLF (RFC 2822)
+    const rawMessage = messageParts.join('\r\n');
+    
+    // Encode as base64url (base64 with URL-safe characters)
+    const encodedMessage = Buffer.from(rawMessage)
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, ''); // Remove padding
+
+    console.log(`[Gmail] 📤 Sending email via Gmail API...`);
+
+    // Send the email
+    const response = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: {
+        raw: encodedMessage
+      }
+    });
+
+    console.log(`[Gmail] ✅ Email with attachments sent successfully (ID: ${response.data.id})`);
+    
+    return {
+      messageId: response.data.id,
+      threadId: response.data.threadId,
+      attachments: files.map(f => ({
+        id: f.id,
+        filename: f.filename,
+        size: f.size
+      })),
+      totalAttachmentSize: totalSize
+    };
+    
+  } catch (error) {
+    console.error('[Gmail] ❌ Error sending email with attachments:', error.message);
+    throw new Error(`Failed to send email with attachments: ${error.message}`);
+  }
+}
+
+/**
+ * Send an email with attachments using user identifier (email or user_id) to get auth tokens
+ * @param {string} userIdentifier - User email or user_id
+ * @param {string} to - Recipient email address
+ * @param {string} subject - Email subject
+ * @param {string} body - Email body
+ * @param {Array<string>} fileIds - Array of file IDs to attach
+ * @param {Object} [options] - Additional options (from, cc, bcc, isHtml, isMarkdown, replyTo)
+ * @returns {Promise<Object>} Result object with success/error status
+ */
+async function sendEmailWithAttachmentsForUser(userIdentifier, to, subject, body, fileIds, options = {}) {
+  const fallbackNotifyUserId = (typeof userIdentifier === 'string' && !userIdentifier.includes('@'))
+    ? userIdentifier
+    : null;
+
+  try {
+    // Get tokens from Supabase gmail_tokens table
+    let query = supabase.from("gmail_tokens").select("access_token, refresh_token, email, user_id");
+    
+    if (userIdentifier.includes('@')) {
+      query = query.eq("email", userIdentifier);
+    } else {
+      query = query.eq("user_id", userIdentifier);
+    }
+    
+    const { data: tokenRow, error } = await query.single();
+
+    if (error || !tokenRow) {
+      throw new Error("User tokens not found. Please connect Gmail first.");
+    }
+
+    // Create OAuth2 client and set credentials
+    const oAuth2Client = new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      process.env.GMAIL_REDIRECT_URI
+    );
+    
+    oAuth2Client.setCredentials({
+      access_token: tokenRow.access_token,
+      refresh_token: tokenRow.refresh_token
+    });
+
+    // Check if token is expired and refresh if needed
+    if (tokenRow.expiry_date && Date.now() > tokenRow.expiry_date) {
+      try {
+        const { credentials } = await oAuth2Client.refreshAccessToken();
+        
+        // Update tokens in database
+        await supabase
+          .from("gmail_tokens")
+          .update({
+            access_token: credentials.access_token,
+            refresh_token: credentials.refresh_token || tokenRow.refresh_token,
+            expiry_date: credentials.expiry_date
+          })
+          .eq("email", tokenRow.email);
+          
+        // Update the OAuth client with new tokens
+        oAuth2Client.setCredentials({
+          access_token: credentials.access_token,
+          refresh_token: credentials.refresh_token || tokenRow.refresh_token
+        });
+      } catch (refreshError) {
+        throw new Error("Token refresh failed: " + refreshError.message);
+      }
+    }
+
+    // Send the email with attachments
+    const result = await sendEmailWithAttachments(oAuth2Client, to, subject, body, fileIds, {
+      ...options,
+      userId: tokenRow.user_id
+    });
+    
+    // Real-time toast notification (best-effort)
+    try {
+      const notifyUserId = tokenRow.user_id || fallbackNotifyUserId;
+      if (notifyUserId) {
+        sendSocketNotification(notifyUserId, {
+          type: 'success',
+          title: 'Email sent with attachments',
+          message: `Email sent to ${to} with ${fileIds.length} file(s)`,
+          data: {
+            provider: 'gmail',
+            to,
+            subject,
+            threadId: result.threadId,
+            messageId: result.messageId,
+            attachmentCount: fileIds.length,
+            dedupeKey: `email:gmail:sent:${to}:${subject}`,
+          },
+        });
+      }
+    } catch (_) {}
+
+    return {
+      success: true,
+      messageId: result.messageId,
+      threadId: result.threadId,
+      attachmentCount: fileIds.length,
+      totalAttachmentSize: result.totalAttachmentSize,
+      message: 'Email with attachments sent successfully'
+    };
+    
+  } catch (error) {
+    console.error('[Gmail] Send email with attachments for user error:', error);
+
+    // Real-time toast notification (best-effort)
+    try {
+      const notifyUserId = fallbackNotifyUserId;
+      if (notifyUserId) {
+        sendSocketNotification(notifyUserId, {
+          type: 'error',
+          title: 'Email failed',
+          message: error.message || 'Failed to send email with attachments',
+          data: {
+            provider: 'gmail',
+            to,
+            subject,
+            attachmentCount: fileIds.length,
+            dedupeKey: `email:gmail:error:${to}:${subject}`,
+          },
+        });
+      }
+    } catch (_) {}
+
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Send email with attachments - wrapper for agent usage
+ */
+async function sendEmailWithAttachmentsForAgent(userId, params) {
+  const { to, subject, body, fileIds, cc, bcc, isHtml } = params;
+  
+  // Validate required parameters
+  if (!to || !subject || !body) {
+    throw new Error("Missing required fields: to, subject, and body are required");
+  }
+
+  if (!fileIds || !Array.isArray(fileIds) || fileIds.length === 0) {
+    throw new Error("Missing required field: fileIds must be a non-empty array");
+  }
+
+  // Auto-detect Markdown content
+  const hasMarkdownSyntax = body.includes('##') || body.includes('**') || 
+                            body.includes('###') || body.includes('- **') ||
+                            body.includes('\n- ') || body.includes('\n* ');
+  
+  const result = await sendEmailWithAttachmentsForUser(userId, to, subject, body, fileIds, { 
+    cc, 
+    bcc, 
+    isHtml: isHtml || false,
+    isMarkdown: hasMarkdownSyntax && !isHtml
+  });
+
+  if (!result.success) {
+    throw new Error(result.error || 'Failed to send email with attachments');
+  }
+
+  return result;
+}
+
 module.exports = {
   // Original functions
   getGmailMessages,
@@ -1926,6 +2353,9 @@ module.exports = {
   sendEmailForAgent,
   replyToEmail,
   forwardEmail,
+  sendEmailWithAttachments,
+  sendEmailWithAttachmentsForUser,
+  sendEmailWithAttachmentsForAgent,
   
   // Agent tool functions - Email Reading
   readEmail,

@@ -534,6 +534,41 @@ const confirmationConfig = {
         }
         return lines.join('\n');
       }
+    },
+    sendEmailWithAttachment: {
+      confirmationRequired: true,
+      actionType: 'send_email_with_attachment',
+      description: 'Send an email with attachment',
+      generatePreview: (params) => {
+        const lines = ['📎 **Send Email with Attachment**\n'];
+        lines.push(`**To:** ${params.to}`);
+        if (params.cc) lines.push(`**CC:** ${params.cc}`);
+        if (params.bcc) lines.push(`**BCC:** ${params.bcc}`);
+        lines.push(`**Subject:** ${params.subject}`);
+        lines.push('\n**Content:**');
+        
+        // Show body if it exists
+        if (params.body && params.body.trim()) {
+          const preview = params.body.substring(0, 500);
+          lines.push(preview + (params.body.length > 500 ? '...' : ''));
+        } else {
+          lines.push('_(Email content will be generated)_');
+        }
+        
+        // Show user name if extracted
+        if (params.userName) {
+          lines.push(`\n**From:** ${params.userName}`);
+        }
+        
+        // Show attachment info
+        if (params.fileIds && params.fileIds.length > 0) {
+          lines.push(`\n**Attachments:** ${params.fileIds.length} file(s)`);
+        } else {
+          lines.push('\n**Attachments:** Pending (will be attached from uploaded files)');
+        }
+        
+        return lines.join('\n');
+      }
     }
   },
 
