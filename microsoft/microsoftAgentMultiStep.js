@@ -28,18 +28,95 @@ class MicrosoftAgentMultiStep extends BaseAgent {
         },
         execute: async (params, context) => {
           console.log(`[MicrosoftAgent] 📄 Creating document: "${params.title}"`);
+          
+          // ✅ VALIDATION: Prevent createDocument from being called when documentId is provided
+          if (params.documentId || params.id) {
+            throw new Error(
+              '❌ Cannot create document when documentId is provided. A document with this ID already exists. ' +
+              'Use updateWordDocumentContent({ documentId: "' + (params.documentId || params.id) + '", content: "..." }) to update the existing document instead.'
+            );
+          }
+          
           try {
             const doc = await microsoftService.createDocument(context.userId, params);
-            console.log(`[MicrosoftAgent] ✅ Document created: ${doc.id}`);
+            
+            // ✅ CRITICAL FIX: Check if the service returned an error
+            if (!doc.success || !doc.documentId) {
+              console.error(`[MicrosoftAgent] ❌ Error creating document: ${doc.error || 'Unknown error'}`);
+              throw new Error(doc.error || 'Failed to create document');
+            }
+            
+            console.log(`[MicrosoftAgent] ✅ Document created: ${doc.documentId}`);
             return {
               success: true,
-              documentId: doc.id,
+              documentId: doc.documentId,
               title: doc.name,
               url: doc.webUrl,
               createdAt: new Date().toISOString()
             };
           } catch (error) {
             console.error(`[MicrosoftAgent] ❌ Error creating document:`, error.message);
+            throw error;
+          }
+        }
+      },
+
+      updateWordDocumentContent: {
+        definition: {
+          type: 'function',
+          function: {
+            name: 'updateWordDocumentContent',
+            description: 'Update content in an existing Word document by appending or replacing. CRITICAL: Only use this when documentId is provided.',
+            parameters: {
+              type: 'object',
+              properties: {
+                documentId: { type: 'string', description: 'The ID of the Word document to update (REQUIRED)' },
+                content: { type: 'string', description: 'New content to add to or replace in the document' },
+                mode: { 
+                  type: 'string', 
+                  description: 'Update mode: "append" to add content below existing content, "replace" to replace entire content',
+                  enum: ['append', 'replace'],
+                  default: 'append'
+                }
+              },
+              required: ['documentId', 'content']
+            }
+          }
+        },
+        execute: async (params, context) => {
+          const { documentId, content, mode = 'append' } = params;
+          
+          // ✅ VALIDATION: Prevent createDocument from being called when documentId is provided
+          if (!documentId) {
+            throw new Error('documentId is required for updateWordDocumentContent. If you want to create a new document, use createDocument instead.');
+          }
+          
+          console.log(`[MicrosoftAgent] 📝 Updating document (${mode} mode): ${documentId}`);
+          try {
+            const result = await microsoftService.updateWordDocumentContent(
+              context.userId, 
+              documentId, 
+              content, 
+              mode
+            );
+            
+            if (!result.success) {
+              console.error(`[MicrosoftAgent] ❌ Error updating document: ${result.error}`);
+              throw new Error(result.error || 'Failed to update document');
+            }
+            
+            console.log(`[MicrosoftAgent] ✅ Document updated: ${result.documentId}`);
+            return {
+              success: true,
+              documentId: result.documentId,
+              title: result.name,
+              url: result.webUrl,
+              mode: mode,
+              updatedAt: new Date().toISOString(),
+              message: result.message
+            };
+          } catch (error) {
+            console.error(`[MicrosoftAgent] ❌ Error updating document:`, error.message);
             throw error;
           }
         }
@@ -700,6 +777,30 @@ class MicrosoftAgentMultiStep extends BaseAgent {
 
 MICROSOFT 365 SPECIFIC GUIDELINES:
 
+⚠️ **CRITICAL: CREATE vs UPDATE RULES** ⚠️
+   These rules MUST be followed to avoid errors:
+   
+   1. **IF A DOCUMENT ID IS PROVIDED** (e.g., "id=XYZ" or "documentId=ABC"):
+      ✅ MUST use updateWordDocumentContent
+      ❌ NEVER use createDocument
+      → Example: "add content to doc (id=abc123)" → Use updateWordDocumentContent({ documentId: 'abc123', content: '...' })
+   
+   2. **IF NO DOCUMENT ID IS PROVIDED**:
+      ✅ MUST use createDocument to create a new document first
+      ❌ NEVER use updateWordDocumentContent without a documentId
+      → Example: "create a word document with title XYZ" → Use createDocument({ title: 'XYZ', content: '...' })
+   
+   3. **SAFETY GUARDS**:
+      ❌ NEVER call createDocument when documentId is already known/provided
+      ❌ NEVER call addDataToExcel on a Word document (.docx file)
+      ❌ NEVER call Excel tools if file is identified as Word format
+      ❌ NEVER ignore file extensions - they determine the correct tool
+   
+   4. **FILE TYPE DETECTION**:
+      - .docx or .doc extension → Use Word tools ONLY (createDocument, updateWordDocumentContent)
+      - .xlsx or .xls extension → Use Excel tools ONLY (createExcelWorkbook, addDataToExcel)
+      - Don't mix tools between document types
+
 🎯 **CRITICAL: COMPLETE ALL TASKS IN THE USER'S QUERY**
    - If the user asks to "create X and do Y", you MUST complete BOTH tasks sequentially
    - Do NOT stop after completing just the first task
@@ -708,14 +809,34 @@ MICROSOFT 365 SPECIFIC GUIDELINES:
      2. addDataToExcel (using the workbookId from step 1)
    - ALWAYS check if there are multiple tasks in the query before stopping
 
-1. **Email Management (Outlook) - CRITICAL MULTI-STEP WORKFLOW**
+1. **Word Document Operations** - NEW ENHANCED WORKFLOW
+   
+   **Creating New Documents**:
+   - Use createDocument({ title: "Document Name", content: "optional content" })
+   - Creates a new .docx file in OneDrive
+   - Returns { documentId: "...", title: "...", url: "..." }
+   
+   **Updating Existing Documents**:
+   - Use updateWordDocumentContent({ documentId: "...", content: "...", mode: "append|replace" })
+   - mode="append" → Adds content below existing content with separator
+   - mode="replace" → Replaces entire document content
+   - ⚠️ CRITICAL: ALWAYS require documentId parameter
+   - ⚠️ NEVER create duplicate if document already exists
+   
+   **Multi-Step Document Workflow**:
+   Example: "Create a Word document titled 'Final Report' and add details about our project"
+   Step 1: createDocument({ title: "Final Report", content: "Initial section" })
+   Result: { documentId: "xyz789", title: "Final Report.docx", url: "..." }
+   Step 2: updateWordDocumentContent({ documentId: "xyz789", content: "More details about project...", mode: "append" })
+   Result: { documentId: "xyz789", message: "Document updated successfully" }
+
+2. **Email Management (Outlook) - CRITICAL MULTI-STEP WORKFLOW**
    
    ⚠️ **IMPORTANT - Finding Emails by Subject/Sender:**
    When user asks to "delete/reply to/forward email [subject line]", you MUST:
    1. FIRST use searchEmails({ query: "[subject line]" }) to find the email
    2. Get the email ID from the search results
    3. THEN use deleteEmail/replyToEmail/forwardEmail with that ID
-   
    Example: "delete the mail Re: Agile Methodology.docx"
    Step 1: searchEmails({ query: "Re: Agile Methodology" })
    Result: { emails: [{ id: "real-message-id-123", subject: "Re: Agile Methodology.docx" }] }
@@ -734,13 +855,13 @@ MICROSOFT 365 SPECIFIC GUIDELINES:
    - **Mark as Read/Unread**: Use markEmailAsRead or markEmailAsUnread
    - **View Folders**: Use listMailFolders to show all mail folders with unread counts
 
-2. **Document Creation**
+3. **Document Creation**
    - Create Word documents for text content
    - Create Excel workbooks for data
    - Include title and optional initial content
    - **EXCEL SPECIFIC**: If asked to add data/sample data, use addDataToExcel AFTER creating the workbook
 
-3. **Multi-Step Examples**
+4. **Multi-Step Examples**
    
    Example 1: "Create a Word document and send it via email"
    Step 1: createDocument({ title: "Report" })
@@ -774,6 +895,40 @@ MICROSOFT 365 SPECIFIC GUIDELINES:
 5. **Storage**
    - Create OneDrive folders
    - Organize files and documents`;
+  }
+
+  /**
+   * Validate tool usage to prevent CREATE/UPDATE confusion
+   * @param {string} toolName - Name of the tool being used
+   * @param {object} params - Tool parameters
+   * @returns {object} Validation result { valid: boolean, error?: string }
+   */
+  validateToolUsage(toolName, params = {}) {
+    // Rule 1: If documentId is provided, only updateWordDocumentContent is allowed
+    if (params.documentId && toolName === 'createDocument') {
+      return {
+        valid: false,
+        error: 'Cannot use createDocument when documentId is provided. Use updateWordDocumentContent instead.'
+      };
+    }
+    
+    // Rule 2: If trying to update a document, documentId must be provided
+    if (toolName === 'updateWordDocumentContent' && !params.documentId) {
+      return {
+        valid: false,
+        error: 'updateWordDocumentContent requires a documentId parameter.'
+      };
+    }
+    
+    // Rule 3: Don't mix Excel tools on Word documents
+    if (toolName === 'addDataToExcel' && params.fileName && params.fileName.endsWith('.docx')) {
+      return {
+        valid: false,
+        error: 'Cannot use Excel tools on a Word document (.docx). Use updateWordDocumentContent instead.'
+      };
+    }
+    
+    return { valid: true };
   }
 
   async processQuery(query, userIdOrContext, options = {}) {

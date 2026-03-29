@@ -91,18 +91,24 @@ Classify the following user query into ONE of these categories:
    - IMPORTANT: "Help me create X" is ACTIONABLE (user wants action, not tutorial)
    - IMPORTANT: "Guide me through sending an email" is ACTIONABLE (user wants to perform the action)
 
-2. **WEB_SEARCH**: User wants CURRENT/REAL-TIME information from the internet (NEWS, EVENTS, ARTICLES)
-   - Examples: "Do you know about the AI summit happening in Delhi?"
+2. **WEB_SEARCH**: User wants QUICK/BASIC information from the internet
    - Examples: "What's the latest news about Tesla?"
    - Examples: "Find information about upcoming tech conferences"
-   - Examples: "Tell me about recent AI developments"
    - Examples: "What are the current Bitcoin prices?"
-   - Key indicators: "latest", "current", "recent", "happening", "today", "now", "upcoming", "news", "do you know about"
-   - IMPORTANT: Questions about CURRENT EVENTS, NEWS, or ARTICLES need web search
-   - IMPORTANT: "Do you know about X" where X is a current event → WEB_SEARCH
-   - IMPORTANT: Weather queries are NOT web search - they use dedicated weather API (classify as ACTIONABLE)
+   - Key indicators: "latest", "current", "recent", "find information", "search for"
+   - Use for QUICK searches and basic information lookup
 
-3. **ADVISORY**: User wants ADVICE, GUIDANCE, or GENERAL INFORMATION (not time-sensitive)
+3. **DEEP_RESEARCH**: User wants COMPREHENSIVE, IN-DEPTH research with analysis
+   - Examples: "Do deep research on data science"
+   - Examples: "Please do a deep research on AI models for startups"
+   - Examples: "Comprehensive research on climate change solutions"
+   - Examples: "Analyze and compare the best cloud providers"
+   - Examples: "What are the best options for X" (implies comparison and analysis)
+   - Key indicators: "deep research", "comprehensive", "detailed analysis", "analyze", "compare multiple", "best options", "in-depth"
+   - IMPORTANT: Use when user needs thorough, well-researched answers with multiple sources
+   - IMPORTANT: "Do you know about X" where X needs detailed explanation → DEEP_RESEARCH
+
+4. **ADVISORY**: User wants ADVICE, GUIDANCE, or GENERAL INFORMATION (not time-sensitive)
    - Examples: "How do I create a google docs?"
    - Examples: "What's the best way to send emails?"
    - Examples: "Should I schedule the meeting now or later?"
@@ -111,14 +117,14 @@ Classify the following user query into ONE of these categories:
    - IMPORTANT: These are QUESTIONS about HOW TO DO something, not requests to DO it
    - IMPORTANT: General knowledge questions that don't require current information
 
-4. **CONVERSATIONAL**: User is asking about PAST interactions or information
+5. **CONVERSATIONAL**: User is asking about PAST interactions or information
    - Examples: "What is my name?"
    - Examples: "What did I tell you about the project?"
    - Examples: "What flights did I search for?"
    - Examples: "Remind me what we discussed"
    - Key indicators: Past tense, "what did", "remind me", "tell me about", "what was"
 
-5. **FILE_GENERATION**: User wants to GENERATE a file (PDF/TXT)
+6. **FILE_GENERATION**: User wants to GENERATE a file (PDF/TXT)
    - Examples: "Generate a PDF of the project plan"
    - Examples: "Create a text file with the summary"
    - Examples: "Export this as a PDF"
@@ -126,12 +132,14 @@ Classify the following user query into ONE of these categories:
 
 CRITICAL RULES:
 - Weather queries (temperature, forecast, rain, air quality) → ACTIONABLE (uses weather API, not web search)
-- If query asks about CURRENT NEWS/EVENTS/ARTICLES → WEB_SEARCH
+- If query explicitly asks for "deep research", "comprehensive research", "detailed analysis" → DEEP_RESEARCH
+- If query asks "what are the best" or "compare multiple" options → DEEP_RESEARCH (needs thorough analysis)
+- If query asks about CURRENT NEWS/EVENTS (quick lookup) → WEB_SEARCH
 - If query contains action verbs (create, make, send, schedule, book, search, find, show, list, get) → ACTIONABLE
 - If query is a question asking HOW TO DO something (general knowledge) → ADVISORY
 - If query asks about past actions or information → CONVERSATIONAL
 - If query mentions file formats (PDF, TXT) → FILE_GENERATION
-- "Do you know about [current event]" → WEB_SEARCH
+- "Do you know about [topic]" → DEEP_RESEARCH if needs detailed explanation, WEB_SEARCH if just news
 - Ambiguous cases: Lean towards ACTIONABLE if user seems to want something done
 
 ${conversationContext ? `\nRECENT CONVERSATION:\n${conversationContext}\n` : ''}
@@ -140,12 +148,13 @@ User Query: "${normalizedQuery}"
 
 Respond with ONLY a JSON object (no markdown, no code blocks):
 {
-  "type": "actionable" | "web_search" | "advisory" | "conversational" | "file_generation",
+  "type": "actionable" | "web_search" | "deep_research" | "advisory" | "conversational" | "file_generation",
   "confidence": 0.0-1.0,
   "reasoning": "Brief explanation of why this is classified as [type]",
-  "actionType": "create" | "send" | "schedule" | "search" | "find" | "show" | "list" | "get" | "web_search" | null,
+  "actionType": "create" | "send" | "schedule" | "search" | "find" | "show" | "list" | "get" | "web_search" | "deep_research" | null,
   "shouldUseAgents": true | false,
-  "requiresWebSearch": true | false
+  "requiresWebSearch": true | false,
+  "requiresDeepResearch": true | false
 }`;
 
       // ✅ USE STANDARDIZED LLM CONFIG for deterministic classification

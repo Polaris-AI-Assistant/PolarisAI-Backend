@@ -14,6 +14,15 @@ const BaseAgent = require('../base/BaseAgent');
 const docsService = require('./docsService');
 const OpenAI = require('openai');
 
+// ✅ CRITICAL: Helper to detect if ID is a Microsoft OneDrive document ID
+// This prevents the Docs agent from attempting to use Google Docs API on Word document IDs
+const isOneDriveDocumentId = (documentId) => {
+  // OneDrive/Word document IDs are typically GUIDs like: 5633c23e-8f1b-4950-a6b1-16a68dabc738
+  // Google Docs IDs are alphanumeric without hyphens in this pattern: 1BxiMVs0XRA5nFMKUVfGWWQ_T2XM8oPqP4Z5SplQ3xFU
+  const guidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return guidPattern.test(documentId);
+};
+
 class DocsAgentMultiStep extends BaseAgent {
   constructor(llmClient) {
     // Define tools with definition + execute pattern
@@ -92,6 +101,13 @@ class DocsAgentMultiStep extends BaseAgent {
           console.log(`[DocsAgent] 📝 Appending text to document: ${params.documentId}`);
           
           try {
+            // ✅ CRITICAL FIX: Detect Microsoft OneDrive document IDs and reject them
+            if (isOneDriveDocumentId(params.documentId)) {
+              const error = 'This appears to be a Microsoft OneDrive/Word document ID, not a Google Docs ID. Please use the Microsoft agent to edit Word documents.';
+              console.error(`[DocsAgent] ❌ Document ID mismatch: ${error}`);
+              throw new Error(error);
+            }
+            
             await docsService.appendText(
               context.userId,
               params.documentId,
@@ -138,6 +154,16 @@ class DocsAgentMultiStep extends BaseAgent {
           console.log(`[DocsAgent] 📝 Appending formatted content to document: ${params.documentId}`);
           
           try {
+            // ✅ CRITICAL FIX: Detect Microsoft OneDrive document IDs and reject them
+            // OneDrive/Word document IDs are typically GUIDs like: 5633c23e-8f1b-4950-a6b1-16a68dabc738
+            // Google Docs IDs are alphanumeric: 1BxiMVs0XRA5nFMKUVfGWWQ_T2XM8oPqP4Z5SplQ3xFU
+            const guidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (guidPattern.test(params.documentId)) {
+              const error = 'This appears to be a Microsoft OneDrive/Word document ID, not a Google Docs ID. Please use the Microsoft agent to edit Word documents.';
+              console.error(`[DocsAgent] ❌ Document ID mismatch: ${error}`);
+              throw new Error(error);
+            }
+            
             await docsService.appendFormattedText(
               context.userId,
               params.documentId,
@@ -188,6 +214,13 @@ class DocsAgentMultiStep extends BaseAgent {
           console.log(`[DocsAgent] 📝 Inserting text at position ${params.index || 1}`);
           
           try {
+            // ✅ CRITICAL FIX: Detect Microsoft OneDrive document IDs and reject them
+            if (isOneDriveDocumentId(params.documentId)) {
+              const error = 'This appears to be a Microsoft OneDrive/Word document ID, not a Google Docs ID. Please use the Microsoft agent to edit Word documents.';
+              console.error(`[DocsAgent] ❌ Document ID mismatch: ${error}`);
+              throw new Error(error);
+            }
+            
             await docsService.insertText(
               context.userId,
               params.documentId,
@@ -239,6 +272,13 @@ class DocsAgentMultiStep extends BaseAgent {
           console.log(`[DocsAgent] 🔄 Replacing text in document`);
           
           try {
+            // ✅ CRITICAL FIX: Detect Microsoft OneDrive document IDs and reject them
+            if (isOneDriveDocumentId(params.documentId)) {
+              const error = 'This appears to be a Microsoft OneDrive/Word document ID, not a Google Docs ID. Please use the Microsoft agent to edit Word documents.';
+              console.error(`[DocsAgent] ❌ Document ID mismatch: ${error}`);
+              throw new Error(error);
+            }
+            
             await docsService.replaceText(
               context.userId,
               params.documentId,

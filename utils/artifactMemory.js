@@ -828,6 +828,23 @@ const extractMicrosoftArtifact = (toolName, result) => {
     console.log(`[ArtifactMemory]   After unwrap, toolResult keys: ${Object.keys(toolResult).join(', ')}`);
 
     switch (toolName) {
+        case 'createDocument':
+        case 'microsoft_createWordDocument':
+            // ✅ CRITICAL FIX: Handle Word document creation from Microsoft agent
+            // The tool can be called either 'createDocument' (from microsoft agent) or 'microsoft_createWordDocument'
+            if (toolResult.documentId || toolResult.id || toolResult.itemId) {
+                return {
+                    id: toolResult.documentId || toolResult.id || toolResult.itemId,
+                    type: 'word_document',
+                    title: toolResult.name || toolResult.title || 'Word Document',
+                    data: {
+                        webUrl: toolResult.webUrl || toolResult.url,
+                        createdAt: toolResult.createdDateTime || new Date().toISOString(),
+                        size: toolResult.size
+                    }
+                };
+            }
+            break;
         // ========== OUTLOOK EMAIL ==========
         case 'microsoft_sendEmail':
             // Microsoft sendEmail returns { success: true, message: 'Email sent successfully' }

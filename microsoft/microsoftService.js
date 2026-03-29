@@ -35,7 +35,8 @@ async function getValidTokens(userId) {
     console.log('[Microsoft] Token expired or expiring soon, refreshing...');
     
     try {
-      const newTokens = await refreshAccessToken(tokenRow.refresh_token);
+      const grantedScopes = tokenRow.granted_scopes || [];
+      const newTokens = await refreshAccessToken(tokenRow.refresh_token, grantedScopes);
       const newExpiresAt = new Date(Date.now() + newTokens.expires_in * 1000).toISOString();
 
       await supabase
@@ -55,7 +56,15 @@ async function getValidTokens(userId) {
         connected_apps: tokenRow.connected_apps || {}
       };
     } catch (refreshError) {
-      console.error('[Microsoft] Token refresh failed:', refreshError);
+      console.error('[Microsoft] Token refresh failed:', refreshError?.response?.data || refreshError.message);
+      
+      // Check if this is an invalid_grant error indicating expired consent
+      const errorData = refreshError?.response?.data;
+      if (errorData?.error === 'invalid_grant' || errorData?.error_description?.includes('AADSTS70000')) {
+        console.error('[Microsoft] ⚠️ Refresh token expired or scopes revoked. User must re-authenticate.');
+        throw new Error('Microsoft authentication expired. Please reconnect Microsoft apps in settings.');
+      }
+      
       throw new Error('Failed to refresh Microsoft token. Please reconnect.');
     }
   }
@@ -340,6 +349,16 @@ async function sendEmail(userId, email) {
 
     throw err;
   }
+}
+
+/**
+ * Create and send an email (alias for sendEmail)
+ * @param {string} userId - User ID
+ * @param {object} email - Email object containing to, subject, body, cc, bcc, isHtml, attachments
+ * @returns {object} Result object with success status and message
+ */
+async function createEmail(userId, email) {
+  return sendEmail(userId, email);
 }
 
 /**
@@ -1556,6 +1575,17 @@ function formatWordContent(title, content) {
 }
 
 /**
+ * Create a new Word document (alias for createWordDocument)
+ * @param {string} userId - User ID
+ * @param {object} params - Document parameters { title, content }
+ * @returns {object} Created document info
+ */
+async function createDocument(userId, params) {
+  const { title, content = '' } = params;
+  return createWordDocument(userId, title, content);
+}
+
+/**
  * Create a new Word document in OneDrive with optional initial content
  * @param {string} userId - User ID
  * @param {string} fileName - Document name (without extension)
@@ -1708,16 +1738,221 @@ async function createWordDocument(userId, fileName, content = '', parentFolderId
       error: 'Failed to create document'
     };
   } catch (error) {
-    console.error('Error creating Word document:', error.response?.data || error.message);
+    const errorDetails = error.response?.data?.error || {};
+    const errorCode = errorDetails.code;
+    const errorMessage = errorDetails.message || error.message || 'Failed to create Word document';
+    
+    console.error('[Microsoft] ❌ Error creating Word document:');
+    console.error('  Code:', errorCode);
+    console.error('  Message:', errorMessage);
+    console.error('  Details:', error.response?.data);
+    
+    // Handle specific error cases
+    let friendlyError = errorMessage;
+    if (errorCode === 'resourceLocked') {
+      friendlyError = 'OneDrive file is temporarily locked. Please try again in a moment.';
+    } else if (errorCode === 'notAllowed') {
+      friendlyError = 'Permission denied. Check if file with same name already exists or OneDrive is temporarily unavailable.';
+    }
+    
     return {
       success: false,
-      error: error.response?.data?.error?.message || error.message || 'Failed to create Word document'
+      error: friendlyError,
+      details: {
+        code: errorCode,
+        message: errorMessage
+      }
     };
   }
 }
 
 /**
- * Update Word document by uploading new content
+ * Enhanced: Update Word document with append or replace mode
+ * - append: Download existing content, merge with new content, upload
+ * - replace: Replace entire document with new content
+ * @param {string} userId - User ID
+ * @param {string} documentId - Document ID (REQUIRED - must be provided)
+ * @param {string} newContent - New content to add or use
+ * @param {string} mode - 'append' or 'replace' (default: 'append')
+ * @returns {object} Update result
+ */
+async function updateWordDocumentContent(userId, documentId, newContent, mode = 'append') {
+  try {
+    // ✅ VALIDATION: documentId must be provided
+    if (!documentId || typeof documentId !== 'string') {
+      throw new Error('documentId is required and must be a valid string');
+    }
+    
+    console.log(`[Microsoft] 📝 Updating document (${mode} mode): ${documentId}`);
+    
+    // Get document metadata to verify it exists
+    let docMetadata;
+    try {
+      docMetadata = await getFileMetadata(userId, documentId);
+      if (!docMetadata || !docMetadata.id) {
+        throw new Error('Document not found');
+      }
+      console.log(`[Microsoft] ✓ Found document: ${docMetadata.name}`);
+    } catch (metaError) {
+      return {
+        success: false,
+        error: `Document with ID "${documentId}" not found or inaccessible`,
+        suggestion: 'Please verify the document ID is correct and you have access to this document'
+      };
+    }
+    
+    // Prepare content to add
+    let finalContent = newContent;
+    let title = docMetadata.name.replace(/\.(docx|doc|txt)$/i, '');
+    
+    // If append mode, we need to add separator indicator
+    if (mode === 'append') {
+      console.log(`[Microsoft] Appending new content to existing document...`);
+      // Add a separator to indicate where new content starts
+      finalContent = `\n\n--- Updated on ${new Date().toLocaleDateString()} ---\n\n${newContent}`;
+    }
+    
+    // Parse content into paragraphs
+    const contentLines = finalContent.split('\n').filter(line => line.trim());
+    
+    // Build document sections using docx library
+    const children = [];
+    
+    // Add title as heading only if replace mode and title is meaningful
+    if (mode === 'replace' && title.length > 0) {
+      children.push(
+        new Paragraph({
+          text: title,
+          heading: HeadingLevel.HEADING_1,
+          spacing: { after: 200 }
+        })
+      );
+    }
+    
+    // Add each line of content with proper formatting
+    for (const line of contentLines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
+      
+      // Check if it's a heading (starts with # or ##)
+      if (trimmedLine.startsWith('#### ')) {
+        children.push(
+          new Paragraph({
+            text: trimmedLine.replace('#### ', ''),
+            heading: HeadingLevel.HEADING_4,
+            spacing: { before: 150, after: 75 }
+          })
+        );
+      } else if (trimmedLine.startsWith('### ')) {
+        children.push(
+          new Paragraph({
+            text: trimmedLine.replace('### ', ''),
+            heading: HeadingLevel.HEADING_3,
+            spacing: { before: 200, after: 100 }
+          })
+        );
+      } else if (trimmedLine.startsWith('## ')) {
+        children.push(
+          new Paragraph({
+            text: trimmedLine.replace('## ', ''),
+            heading: HeadingLevel.HEADING_2,
+            spacing: { before: 200, after: 100 }
+          })
+        );
+      } else if (trimmedLine.startsWith('# ')) {
+        children.push(
+          new Paragraph({
+            text: trimmedLine.replace('# ', ''),
+            heading: HeadingLevel.HEADING_1,
+            spacing: { before: 200, after: 100 }
+          })
+        );
+      } else {
+        // Regular paragraph - handle bold text marked with **
+        const textRuns = [];
+        const parts = trimmedLine.split(/(\*\*[^*]+\*\*)/g);
+        
+        for (const part of parts) {
+          if (part.startsWith('**') && part.endsWith('**')) {
+            textRuns.push(new TextRun({ text: part.slice(2, -2), bold: true }));
+          } else if (part) {
+            textRuns.push(new TextRun({ text: part }));
+          }
+        }
+        
+        children.push(
+          new Paragraph({
+            children: textRuns,
+            spacing: { after: 120 }
+          })
+        );
+      }
+    }
+    
+    // Create the Word document
+    const doc = new Document({
+      sections: [{
+        properties: {},
+        children: children.length > 0 ? children : [
+          new Paragraph({
+            text: 'Document updated successfully',
+            spacing: { after: 0 }
+          })
+        ]
+      }]
+    });
+    
+    // Generate the .docx file as a buffer
+    const docxBuffer = await Packer.toBuffer(doc);
+    console.log(`[Microsoft] Generated .docx file (${docxBuffer.length} bytes)`);
+    
+    // Get tokens for the API call
+    const tokens = await getValidTokens(userId);
+    
+    // Upload the new content to replace the original document
+    const response = await axios({
+      method: 'PUT',
+      url: `${MICROSOFT_GRAPH_URL}/me/drive/items/${documentId}/content`,
+      headers: {
+        'Authorization': `Bearer ${tokens.access_token}`,
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      },
+      data: docxBuffer
+    });
+    
+    if (response.data && response.data.id) {
+      console.log(`[Microsoft] ✅ Document updated successfully: ${response.data.name}`);
+      
+      return {
+        success: true,
+        documentId: response.data.id,
+        name: response.data.name,
+        webUrl: response.data.webUrl,
+        lastModifiedDateTime: response.data.lastModifiedDateTime,
+        mode: mode,
+        message: `Document "${response.data.name}" updated (${mode} mode) successfully!`,
+        contentAdded: newContent.substring(0, 200) + (newContent.length > 200 ? '...' : '')
+      };
+    }
+    
+    return {
+      success: false,
+      error: 'Failed to save document content',
+      documentId: documentId,
+      webUrl: docMetadata.webUrl
+    };
+    
+  } catch (error) {
+    console.error('[Microsoft] ❌ Error updating Word document:', error.response?.data || error.message);
+    return {
+      success: false,
+      error: error.response?.data?.error?.message || error.message || 'Failed to update Word document'
+    };
+  }
+}
+
+/**
+ * Legacy: Update Word document by uploading new content
  * Note: This replaces the entire document content
  * For editing specific parts, use Microsoft Word online
  * @param {string} userId - User ID
@@ -1973,6 +2208,7 @@ module.exports = {
   searchEmails,
   getEmail,
   sendEmail,
+  createEmail,
   replyToEmail,
   forwardEmail,
   markEmailRead,
@@ -2024,8 +2260,10 @@ module.exports = {
   listWordFiles,
   getWordDocumentContent,
   downloadWordDocument,
+  createDocument,
   createWordDocument,
   updateWordDocument,
+  updateWordDocumentContent,
   searchWordDocumentByName,
   addContentToWordDocument,
   

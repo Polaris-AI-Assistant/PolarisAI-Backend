@@ -49,6 +49,9 @@ const mapsAgentRoutes = require('./maps/mapsAgentController');
 // Web Search routes
 const webSearchAgentRoutes = require('./websearch/webSearchAgentController');
 
+// Deep Research routes
+const researchAgentRoutes = require('./research/researchController');
+
 // Weather routes
 const weatherAgentRoutes = require('./weather/weatherRoutes');
 
@@ -158,6 +161,9 @@ app.use('/api/maps', mapsAgentRoutes);
 
 // Use Web Search AI Agent routes
 app.use('/api/websearch', webSearchAgentRoutes);
+
+// Use Deep Research AI Agent routes
+app.use('/api/research', researchAgentRoutes);
 
 // Use Weather AI Agent routes
 app.use('/api/weather', weatherAgentRoutes);
@@ -272,7 +278,12 @@ app.get('/api', (req, res) => {
         'POST /api/websearch/agent/query': 'Web Search AI Agent (Serper API - web, news, images)',
         'GET /api/websearch/agent/examples': 'Get web search agent example queries',
         'GET /api/websearch/agent/capabilities': 'Get web search agent capabilities',
-        'GET /api/websearch/agent/status': 'Check web search agent status'
+        'GET /api/websearch/agent/status': 'Check web search agent status',
+        'POST /api/research/agent/query': 'Deep Research AI Agent (Perplexity-style multi-step research)',
+        'GET /api/research/agent/examples': 'Get research agent example queries',
+        'GET /api/research/agent/capabilities': 'Get research agent capabilities',
+        'GET /api/research/agent/status': 'Check research agent status',
+        'POST /api/research/agent/clear-cache': 'Clear research content cache'
       },
       auth: {
         'POST /api/auth/signup': 'Create new user account',

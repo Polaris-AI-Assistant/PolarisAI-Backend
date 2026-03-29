@@ -142,15 +142,20 @@ async function exchangeCodeForTokens(code) {
 /**
  * Refresh Microsoft access token
  * @param {string} refreshToken - Refresh token
+ * @param {string[]} grantedScopes - The scopes originally granted by the user
  * @returns {object} New token response
  */
-async function refreshAccessToken(refreshToken) {
+async function refreshAccessToken(refreshToken, grantedScopes = []) {
+  // Use only the scopes that were originally granted, or ALL_SCOPES if none provided (for backward compatibility)
+  const scopesToRequest = grantedScopes.length > 0 ? grantedScopes : ALL_SCOPES;
+  console.log('[Microsoft] Refreshing token with scopes:', scopesToRequest);
+  
   const params = new URLSearchParams({
     client_id: process.env.MICROSOFT_CLIENT_ID,
     client_secret: process.env.MICROSOFT_CLIENT_SECRET,
     refresh_token: refreshToken,
     grant_type: 'refresh_token',
-    scope: ALL_SCOPES.join(' ')
+    scope: scopesToRequest.join(' ')
   });
 
   const response = await axios.post(MICROSOFT_TOKEN_URL, params, {

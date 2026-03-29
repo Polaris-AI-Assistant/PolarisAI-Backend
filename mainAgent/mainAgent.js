@@ -40,6 +40,7 @@ const SheetsAgentMultiStep = require('../sheets/sheetsAgentMultiStep');
 const FlightsAgentMultiStep = require('../flights/flightsAgentMultiStep');
 const MapsAgentMultiStep = require('../maps/mapsAgentMultiStep');
 const WebSearchAgentMultiStep = require('../websearch/webSearchAgentMultiStep');
+const ResearchAgent = require('../research/researchAgent');
 const MicrosoftAgentMultiStep = require('../microsoft/microsoftAgentMultiStep');
 const WeatherAgentMultiStep = require('../weather/weatherAgentMultiStep');
 const SchedulesAgentMultiStep = require('../schedules/schedulesAgentMultiStep');
@@ -94,6 +95,7 @@ class MainAgent {
       flights: new FlightsAgentMultiStep(),
       maps: new MapsAgentMultiStep(),
       websearch: new WebSearchAgentMultiStep(),
+      research: new ResearchAgent(),
       microsoft: new MicrosoftAgentMultiStep(),
       weather: new WeatherAgentMultiStep(this.openai),
       schedules: new SchedulesAgentMultiStep(this.openai)
@@ -725,6 +727,23 @@ class MainAgent {
         let nextConfirmation = null;
         if (chainId) {
           console.log(`[MainAgent] 🔗 Checking for next action in chain: ${chainId}`);
+          
+          // ✅ CRITICAL FIX: Stop chain if current action failed
+          if (errors[agentName]) {
+            console.log(`[MainAgent] 🛑 Chain execution stopped - ${agentName} failed: ${errors[agentName].error}`);
+            return {
+              success: false,
+              results: results,
+              errors: errors,
+              query: query,
+              toolName: toolName,
+              agentName: agentName,
+              storedArtifacts: storedArtifacts,
+              conversationId: conversationId,
+              chainStopped: true,
+              chainError: `Cannot proceed with next step - ${agentName} action failed: ${errors[agentName].error}`
+            };
+          }
           
           // Build a result object to pass to the next action
           const completedResult = {
@@ -2166,6 +2185,18 @@ Language Detection Rules:
         }
       }
 
+      // Handle deep research queries
+      if (intentClassification.type === 'deep_research' || intentClassification.requiresDeepResearch) {
+        console.log('[MainAgent] 🔬 Detected deep research query - routing to research agent:', query);
+        return {
+          agents: ['research'],
+          reasoning: "User is asking for comprehensive, in-depth research with analysis",
+          queries: {
+            research: query
+          }
+        };
+      }
+
       // Handle conversational queries
       if (intentClassification.type === 'conversational') {
         console.log('[MainAgent] 🎯 Detected conversational query - skipping agents:', query);
@@ -2295,10 +2326,18 @@ AVAILABLE AGENTS AND THEIR CAPABILITIES:
 - **maps**: Google Maps operations (places, directions, distance, geocoding, nearby search)
   * Use for: "find restaurants", "directions to", "distance between", "nearby hotels", "coordinates"
   
-- **websearch**: Web search operations (current/real-time information, news, events)
-  * Use for: "what's latest", "do you know about", "tell me about recent", "current news"
+- **websearch**: Web search operations (quick searches, current information, news)
+  * Use for: "what's latest", "search for", "find information about", "current news"
+  * Use for QUICK searches and basic information lookup
   * Use ONLY for CURRENT/REAL-TIME/UP-TO-DATE information, NOT for user's personal data
   * CRITICAL: Never use websearch for "my docs", "my emails", "my calendar" - use specific agent
+
+- **research**: Deep research operations (comprehensive multi-step research with synthesis)
+  * Use for: "do deep research on", "comprehensive research", "detailed analysis", "research and analyze"
+  * Use for: "what are the best", "compare and analyze", "in-depth information about"
+  * Triggers: "deep research", "comprehensive", "detailed", "analyze", "compare multiple", "best options"
+  * This performs Perplexity-style multi-step research with source citations
+  * Use when user needs thorough, well-researched answers with multiple sources
   
 - **microsoft**: Microsoft 365 operations (Outlook Mail, Calendar, OneDrive, Excel, Teams, Word)
   * Use for: "send via outlook", "outlook email", "microsoft calendar", "onedrive files", "teams chat", "word document"
@@ -2350,6 +2389,17 @@ RULE 7: SCHEDULE vs CALENDAR
 - "remind me to check price tomorrow at 2pm" → schedules agent (reminder)
 - "schedule meeting tomorrow at 2pm" → calendar agent (calendar event)
 - Reminders ≠ Calendar events - they use different agents
+
+RULE 8: ARTIFACT-QUERY MATCHING (CRITICAL)
+- When user has previously created a document and asks to modify/add to it:
+  * If artifact type is "word_document" or "onedrive_file" → ALWAYS use "microsoft" agent
+  * If artifact type is "doc" → ALWAYS use "docs" agent
+  * If artifact type is "sheet" → ALWAYS use "sheets" agent
+  * DO NOT route to Docs agent for Microsoft documents
+  * DO NOT route to Microsoft agent for Google Docs documents
+  * MATCH THE ORIGINAL SERVICE THAT CREATED THE ARTIFACT
+- Example: User creates Word doc "final year project review", then asks "add content" → microsoft agent (NOT docs agent)
+- Example: User creates Google Doc "report", then asks "add information" → docs agent (NOT microsoft agent)
 
 EXAMPLES:
 
