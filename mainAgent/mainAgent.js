@@ -105,6 +105,148 @@ class MainAgent {
     this.systemPrompt = this.createSystemPrompt();
   }
 
+  // ==================== Research Content Extraction from Conversation History ====================
+
+  /**
+   * Detects if user query references previous research content and extracts it
+   * Looks for patterns like "this whole deep research report", "add this research", "the report we just got"
+   * @param {string} query - User query
+   * @param {Array} conversationHistory - Chat history
+   * @returns {Object|null} - researchContent object or null if no research found
+   */
+  extractResearchContentFromHistory(query, conversationHistory) {
+    // Check if query references previous research
+    const researchPatterns = [
+      /this whole.*research/i,
+      /this whole.*report/i,
+      /add this.*research/i,
+      /add.*whole.*research/i,
+      /the report we just/i,
+      /the deep research/i,
+      /research.*we.*generated/i,
+      /research.*we.*just/i,
+      /this entire research/i,
+      /complete.*research/i,
+      /full.*research/i,
+      /whole.*deep.*research/i,
+      /add that too/i,
+      /add the rest/i,
+      /add before that/i,
+      /include the missing/i,
+      /add sections/i
+    ];
+
+    const hasResearchReference = researchPatterns.some(pattern => pattern.test(query));
+    
+    if (!hasResearchReference) {
+      return null;
+    }
+
+    console.log('[MainAgent] 🔍 Query references previous research content');
+
+    // Search conversation history backwards to find most recent research result
+    if (!conversationHistory || conversationHistory.length === 0) {
+      console.log('[MainAgent] ⚠️ No conversation history available to extract research');
+      return null;
+    }
+
+    // Look through history for research agent results - try multiple locations
+    for (let i = conversationHistory.length - 1; i >= 0; i--) {
+      const msg = conversationHistory[i];
+      
+      if (!msg) continue;
+
+      // Attempt 1: Check message metadata for agentResults
+      if (msg.metadata && msg.metadata.agentResults && msg.metadata.agentResults.research && msg.metadata.agentResults.research.success) {
+        const researchResult = msg.metadata.agentResults.research;
+        
+        console.log('[MainAgent] ✅ Found research in msg.metadata.agentResults');
+        console.log('[MainAgent] 📊 Research content: ' + 
+          `${researchResult.answer?.length || 0} chars, ` +
+          `${researchResult.sources?.length || 0} sources`);
+        
+        return {
+          type: 'research_result',
+          content: researchResult.answer || '',
+          sources: researchResult.sources || [],
+          contentProvided: true  // Signal to agent: render mode, don't regenerate
+        };
+      }
+
+      // Attempt 2: Check direct response object for research
+      if (msg.response && typeof msg.response === 'object' && msg.response.research) {
+        const researchResult = msg.response.research;
+        
+        if (researchResult.answer || researchResult.success) {
+          console.log('[MainAgent] ✅ Found research in msg.response.research');
+          
+          return {
+            type: 'research_result',
+            content: researchResult.answer || '',
+            sources: researchResult.sources || [],
+            contentProvided: true
+          };
+        }
+      }
+
+      // Attempt 3: Check for research result nested in content
+      if (msg.content && typeof msg.content === 'object') {
+        if (msg.content.research && msg.content.research.answer) {
+          console.log('[MainAgent] ✅ Found research in msg.content.research');
+          
+          return {
+            type: 'research_result',
+            content: msg.content.research.answer || '',
+            sources: msg.content.research.sources || [],
+            contentProvided: true
+          };
+        }
+      }
+
+      // Attempt 4: Check if entire message IS a research result
+      if (msg.answer && msg.sources && !msg.role) {
+        console.log('[MainAgent] ✅ Found research message structure');
+        
+        return {
+          type: 'research_result',
+          content: msg.answer || '',
+          sources: msg.sources || [],
+          contentProvided: true
+        };
+      }
+
+      // Attempt 5: Check agentsUsed field to verify research was performed
+      if (msg.metadata && msg.metadata.agentsUsed && msg.metadata.agentsUsed.includes('research')) {
+        // This message has research, look for the result in various places
+        console.log('[MainAgent] 🔍 Found message where research agent was used, searching for result...');
+        
+        // Try to find research data in common locations
+        const locations = [
+          msg.research,
+          msg.agentResults?.research,
+          msg.results?.research,
+          msg.executedActions?.find(a => a.agent === 'research' || a.tool === 'conductResearch')?.result
+        ];
+        
+        for (const location of locations) {
+          if (location && location.answer) {
+            console.log('[MainAgent] ✅ Found research result in agent-specific location');
+            
+            return {
+              type: 'research_result',
+              content: location.answer || '',
+              sources: location.sources || [],
+              contentProvided: true
+            };
+          }
+        }
+      }
+    }
+
+    console.log('[MainAgent] ⚠️ No research content found in conversation history');
+    return null;
+  }
+
   // ==================== LLM Parameter Extraction (GitHub) ====================
 
   /**
@@ -2308,14 +2450,19 @@ AVAILABLE AGENTS AND THEIR CAPABILITIES:
   
 - **gmail**: Gmail operations (send/read/search emails, drafts, labels, filters)
   * Use for: "send email" (default), "check gmail", "read email", "list my emails", "search emails"
+  * Use for: Sending emails with links (documents, forms, meetings, etc.)
   * Use ONLY when user explicitly mentions "Gmail" or wants to use Google email services
+  * Special: When user asks "send google meet link to X" → This triggers gmail agents after meet is created
   
-- **meet**: Google Meet operations (standalone meeting spaces, recordings, participants, meeting history)
-  * Use for: "create meeting room", "show meetings", "list past meetings", "view recordings", "who joined meeting", "retrieve meeting history"
+- **meet**: Google Meet operations (create standalone meeting spaces, recordings, participants, meeting history)
+  * Use for: "create google meet", "create meeting room", "show meetings", "list past meetings", "view recordings", "who joined meeting", "retrieve meeting history"
+  * IMPORTANT: Use for creating STANDALONE Google Meet rooms (no scheduled time)
   * IMPORTANT: Use for retrieving past Google Meet conference records (via Meet API)
-  * Do NOT use for scheduled meetings with time - use calendar instead
+  * IMPORTANT: "create google meet" (no time) → meet agent (creates standalone meeting space)
   * IMPORTANT: "list my past Google Meet meetings" → meet agent (gets actual conference records)
   * IMPORTANT: "show meeting history" or "who attended my meetings" → meet agent
+  * Do NOT use for scheduled meetings WITH TIME - use calendar agent instead
+  * Special: When user asks "create google meet and send link to X" → meet + gmail agents (multi-step action chain)
   
 - **sheets**: Google Sheets operations (create/edit spreadsheets, data management)
   * Use for: "create spreadsheet", "create sheet", "add data to sheet", "list sheets"
@@ -2373,10 +2520,12 @@ RULE 4: EMAIL ROUTING BY SERVICE
 
 RULE 5: GOOGLE MEET ROUTING
 - "create google meet tomorrow at 3pm" → calendar agent (scheduled meeting)
+- "create google meet and send link to X@email.com" → meet + gmail agents (multi-step action chain)
 - "create meeting room" (no time) → meet agent (standalone space)
 - "list my past Google Meet meetings" → meet agent (retrieve conference records)
 - "show meeting history" or "who joined my meeting" → meet agent (meeting data retrieval)
 - Scheduled meetings with time → ALWAYS calendar (adds Meet automatically)
+- Standalone meet creation + email sending → BOTH meet and gmail agents with action chain
 - Past meeting history/recordings → ALWAYS meet agent (conference records from Meet API)
 
 RULE 6: MULTI-INTENT QUERIES (Sequential Execution)
@@ -2539,7 +2688,16 @@ CORE RULES:
               // Add timezone for schedules agent
               ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {}),
               // ✅ NEW: Pass fileIds for attachment support (gmail agent)
-              ...(this.lastFileIds ? { fileIds: this.lastFileIds } : {})
+              ...(this.lastFileIds ? { fileIds: this.lastFileIds } : {}),
+              // ✅ NEW: Pass onProgress callback for research agent
+              ...(agentName === 'research' && timeline ? { 
+                onProgress: (update) => {
+                  // Forward research progress events to timeline
+                  if (update.type === 'timeline_research_step') {
+                    timeline.emit(update);
+                  }
+                }
+              } : {})
             };
             
             // ✅ CRITICAL FIX: Add researchContent to options if it was returned
@@ -2656,7 +2814,18 @@ CORE RULES:
               // Add timezone for schedules agent
               ...(agentName === 'schedules' ? { timezone: this._detectUserTimezone(userLocation) } : {}),
               // ✅ NEW: Pass fileIds for attachment support (gmail agent)
-              ...(this.lastFileIds ? { fileIds: this.lastFileIds } : {})
+              ...(this.lastFileIds ? { fileIds: this.lastFileIds } : {}),
+              // ✅ NEW: Pass onProgress callback for research agent
+              ...(agentName === 'research' && timeline ? { 
+                onProgress: (update) => {
+                  console.log('[MainAgent] 📡 Research progress update received:', update.type);
+                  // Forward research progress events to timeline
+                  if (update.type === 'timeline_research_step') {
+                    console.log('[MainAgent] ✅ Forwarding research step to timeline');
+                    timeline.emit(update);
+                  }
+                }
+              } : {})
             };
 
             const result = await agent.processQuery(agentQuery, agentOptions);
@@ -3086,6 +3255,22 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       // Step 2: Check if any agent actions require confirmation
       // For now, we execute queries and check if any tool in the result needs confirmation
       // This will be enhanced when specialized agents report their intended tools
+      
+      // ✅ NEW: Extract research content from conversation history if user references it
+      // This enables docs/forms/sheets to add complete research content without regenerating
+      let extractedResearchContent = null;
+      if (analysis.agents.includes('docs') || analysis.agents.includes('forms') || analysis.agents.includes('sheets')) {
+        extractedResearchContent = this.extractResearchContentFromHistory(enhancedQuery, options.conversationHistory || []);
+        
+        if (extractedResearchContent) {
+          console.log('[MainAgent] 📚 Extracted research content from conversation history');
+          console.log(`[MainAgent] 📊 Research: ${extractedResearchContent.content.length} chars, ${extractedResearchContent.sources.length} sources`);
+          
+          // Attach to options for passing to agents
+          options.researchContent = extractedResearchContent;
+        }
+      }
+      
       const { results, errors, confirmationRequest, storedArtifacts } = await this.executeAgentQueriesWithConfirmationAndTimeline(
         analysis, 
         userId, 
@@ -3513,6 +3698,114 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             originalQuery: query
           }
         };
+      }
+    }
+
+    // ============================================================
+    // ✅ Google Meet + Gmail Multi-Step Pattern Detection (NEW)
+    // ============================================================
+    const isGoogleMeetGmailPattern = (
+      analysis.agents.includes('meet') &&
+      analysis.agents.includes('gmail') &&
+      (lowerQuery.includes('meet') || lowerQuery.includes('google meet')) &&
+      (lowerQuery.includes('create') || lowerQuery.includes('new')) &&
+      (lowerQuery.includes('send') || lowerQuery.includes('email') || lowerQuery.includes('mail'))
+    );
+
+    if (isGoogleMeetGmailPattern) {
+      console.log(`[Confirmation] 🎯 Detected Google Meet + Gmail multi-step pattern`);
+      
+      // Extract meeting title from query
+      // Patterns: "named X", "create google meet called X", "meet titled X"
+      let meetingTitle = 'Team Meeting';
+      
+      const namedMatch = query.match(/(?:named|called|titled)\s+(?:as\s+)?['"]?([a-zA-Z0-9_\-\s]+?)['"]?\s*(?:,|\s+and\s+|\s+send|\s+to|$)/i);
+      if (namedMatch) {
+        meetingTitle = namedMatch[1].trim();
+        console.log(`[Confirmation] 📹 Extracted meeting title: ${meetingTitle}`);
+      }
+      
+      // Extract email recipient
+      const emailMatch = query.match(/(?:to|send\s+to|email)\s+([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i);
+      const emailTo = emailMatch ? emailMatch[1] : null;
+      
+      if (!emailTo) {
+        console.error(`[Confirmation] ❌ No email recipient found in query`);
+        // Proceed without creating action chain - will handle as standard flow
+      } else {
+        console.log(`[Confirmation] 📧 Email recipient: ${emailTo}`);
+        
+        // Build action chain
+        const confirmationActions = [];
+        
+        // Action 1: Create Google Meet
+        confirmationActions.push({
+          agentName: 'meet',
+          agentQuery: `create a google meet titled "${meetingTitle}"`,
+          toolName: 'createMeeting',
+          params: {
+            title: meetingTitle
+          },
+          previewContent: `📹 **Create Google Meet**\n\n**Title:** ${meetingTitle}`,
+          captureOutput: true,
+          outputKey: 'meetLink'
+        });
+        
+        // Action 2: Send Email with Meet Link
+        confirmationActions.push({
+          agentName: 'gmail',
+          agentQuery: `send email to ${emailTo} with the google meet link`,
+          toolName: 'sendEmail',
+          params: {
+            to: emailTo,
+            subject: `Join: ${meetingTitle}`,
+            body: `[Will include the Google Meet link after it is created]`,
+            pendingMeetingLink: true
+          },
+          previewContent: `📧 **Send Email via Gmail**\n\n**To:** ${emailTo}\n**Subject:** Join: ${meetingTitle}\n**Content:** Will include the meeting link after Meet is created`,
+          requiresInput: true,
+          inputKey: 'meetLink'
+        });
+        
+        // Store as action chain
+        if (confirmationActions.length > 1) {
+          console.log(`[Confirmation] 🔗 Creating action chain with ${confirmationActions.length} actions`);
+          
+          const chainResult = confirmationStore.storeActionChain(
+            userId,
+            confirmationActions,
+            query,
+            conversationHistory,
+            conversationId,
+            undefined,  // ttlMs - use default
+            timeline ? timeline.getEvents() : [],  // Pass timeline events from initial query
+            analysis  // Pass original analysis for sequential multi-agent execution
+          );
+          
+          if (chainResult) {
+            const firstAction = confirmationActions[0];
+            return {
+              results: {},
+              errors: {},
+              storedArtifacts: [],
+              confirmationRequest: {
+                requestId: chainResult.firstRequestId,
+                toolName: firstAction.toolName,
+                agentName: firstAction.agentName,
+                actionType: 'create_meeting',
+                description: 'Create a Google Meet',
+                params: firstAction.params,
+                previewContent: firstAction.previewContent,
+                originalQuery: query,
+                chainInfo: {
+                  chainId: chainResult.chainId,
+                  currentStep: 1,
+                  totalSteps: chainResult.totalActions
+                }
+              }
+            };
+          }
+        }
       }
     }
     
@@ -5949,6 +6242,29 @@ Detect the EXACT language of the "Original Query" above and respond ENTIRELY in 
       const languageName = languageDetection.getLanguageName(detectedLanguage);
       console.log(`[MainAgent] 🌐 streamCombinedResponse using language: ${languageName} (${detectedLanguage})`);
       
+      // ✅ CRITICAL FIX: For deep research queries, stream the research answer directly without LLM post-processing
+      const isDeepResearch = analysis.agents && analysis.agents.includes('research') && 
+                            results.research && results.research.success;
+      
+      if (isDeepResearch && results.research.answer) {
+        console.log('[MainAgent] 📚 Deep research query detected - streaming detailed research answer directly (NO LLM summarization)');
+        
+        // Stream the detailed research answer as-is
+        const answer = results.research.answer;
+        
+        // Split into chunks for smooth streaming (every ~500 chars)
+        const chunkSize = 500;
+        for (let i = 0; i < answer.length; i += chunkSize) {
+          const chunk = answer.substring(i, i + chunkSize);
+          onChunk({ type: 'content', text: chunk });
+        }
+        
+        // Done - return without calling LLM
+        console.log('[MainAgent] ✅ Deep research answer streamed successfully');
+        return;
+      }
+      
+      // For non-deep-research queries, continue with LLM processing
       // Build context for the LLM
       const agentResults = Object.entries(results).map(([agent, result]) => {
         return `${agent.toUpperCase()} Agent Result:\n${JSON.stringify(result, null, 2)}`;

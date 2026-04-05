@@ -116,6 +116,7 @@ Classify the following user query into ONE of these categories:
    - Key indicators: Question patterns, "how to", "best way", "should I", "what's the best", "advice", "suggest"
    - IMPORTANT: These are QUESTIONS about HOW TO DO something, not requests to DO it
    - IMPORTANT: General knowledge questions that don't require current information
+   - IMPORTANT: Should route to ConversationalAgent (isConversational: true) for high-quality LLM response
 
 5. **CONVERSATIONAL**: User is asking about PAST interactions or information
    - Examples: "What is my name?"
@@ -131,6 +132,7 @@ Classify the following user query into ONE of these categories:
    - Key indicators: "generate", "export", "create", "save" + "pdf" or "txt" or "text file"
 
 CRITICAL RULES:
+- **PLATFORM KNOWLEDGE QUERIES (IMPORTANT)**: If user asks about Polaris itself (who you are, what you can do, what services you support), these are handled BEFORE reaching this classifier and returned instantly. If one somehow slips through, classify as ADVISORY and suggest giving a specific answer about Polaris capabilities.
 - Weather queries (temperature, forecast, rain, air quality) → ACTIONABLE (uses weather API, not web search)
 - If query explicitly asks for "deep research", "comprehensive research", "detailed analysis" → DEEP_RESEARCH
 - If query asks "what are the best" or "compare multiple" options → DEEP_RESEARCH (needs thorough analysis)
@@ -142,6 +144,23 @@ CRITICAL RULES:
 - "Do you know about [topic]" → DEEP_RESEARCH if needs detailed explanation, WEB_SEARCH if just news
 - Ambiguous cases: Lean towards ACTIONABLE if user seems to want something done
 
+ISCONVERSATIONAL FLAG (NEW):
+Set "isConversational": true when the query should be answered by ConversationalAgent (pure LLM):
+  ✅ "write python code for adding two numbers" → isConversational: true (pure LLM coding)
+  ✅ "give me a study plan for React" → isConversational: true (educational content)
+  ✅ "explain how JWT works" → isConversational: true (explanation)
+  ✅ "what is the difference between A and B" → isConversational: true (knowledge)
+  ✅ "how do I structure my project" → isConversational: true (advisory)
+  ❌ "create a GitHub repo" → isConversational: false (needs GitHub agent)
+  ❌ "send me an email" → isConversational: false (needs Gmail)
+  ❌ "schedule a meeting" → isConversational: false (needs Calendar)
+
+Set "isConversational": false when the query needs external tools/agents:
+  - Explicitly mentions an app (GitHub, Gmail, Calendar, Docs, Sheets, Drive, etc.)
+  - Wants to CREATE/UPDATE/DELETE something in an external system
+  - Requires real-time data from APIs (weather, flights, stocks)
+  - References specific files, repos, emails, or calendar events by name
+
 ${conversationContext ? `\nRECENT CONVERSATION:\n${conversationContext}\n` : ''}
 
 User Query: "${normalizedQuery}"
@@ -149,8 +168,9 @@ User Query: "${normalizedQuery}"
 Respond with ONLY a JSON object (no markdown, no code blocks):
 {
   "type": "actionable" | "web_search" | "deep_research" | "advisory" | "conversational" | "file_generation",
+  "isConversational": true | false,
   "confidence": 0.0-1.0,
-  "reasoning": "Brief explanation of why this is classified as [type]",
+  "reasoning": "Brief explanation of classification and isConversational flag",
   "actionType": "create" | "send" | "schedule" | "search" | "find" | "show" | "list" | "get" | "web_search" | "deep_research" | null,
   "shouldUseAgents": true | false,
   "requiresWebSearch": true | false,
@@ -183,17 +203,30 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
         // Fallback: treat as actionable if it contains action verbs
         classification = {
           type: 'actionable',
+          isConversational: false,
           confidence: 0.5,
           reasoning: 'Fallback classification due to parse error',
           actionType: null,
           shouldUseAgents: true,
-          requiresWebSearch: false
+          requiresWebSearch: false,
+          requiresDeepResearch: false
         };
       }
 
-      // Ensure requiresWebSearch flag is set
+      // Ensure isConversational flag is set
+      if (!classification.hasOwnProperty('isConversational')) {
+        // Default: if it's advisory or conversational type, mark as conversational
+        classification.isConversational = 
+          classification.type === 'advisory' || 
+          classification.type === 'conversational';
+      }
+
+      // Ensure requiresWebSearch and requiresDeepResearch flags are set
       if (!classification.hasOwnProperty('requiresWebSearch')) {
         classification.requiresWebSearch = classification.type === 'web_search';
+      }
+      if (!classification.hasOwnProperty('requiresDeepResearch')) {
+        classification.requiresDeepResearch = classification.type === 'deep_research';
       }
 
       console.log(`[IntentClassifier] ✅ Classification result:`, JSON.stringify(classification, null, 2));
@@ -204,11 +237,13 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
       // Fallback: assume actionable to avoid blocking user
       return {
         type: 'actionable',
+        isConversational: false,
         confidence: 0.3,
         reasoning: 'Error during classification - defaulting to actionable',
         actionType: null,
         shouldUseAgents: true,
-        requiresWebSearch: false
+        requiresWebSearch: false,
+        requiresDeepResearch: false
       };
     }
   }

@@ -80,7 +80,9 @@ const AGENT_NAMES = {
   flights: 'Flights',
   maps: 'Google Maps',
   websearch: 'Web Search',
-  microsoft: 'Microsoft 365'
+  microsoft: 'Microsoft 365',
+  conversational: 'Assistant',
+  research: 'Research'
 };
 
 /**
@@ -618,6 +620,16 @@ class TimelineEmitter {
    */
   getEvents() {
     return this.eventQueue.getEvents();
+  }
+
+  /**
+   * Generic emit method for custom events (e.g., research progress)
+   * Forwards the event directly through onChunk without queuing
+   */
+  emit(event) {
+    if (this.onChunk && typeof this.onChunk === 'function') {
+      this.onChunk(event);
+    }
   }
 }
 

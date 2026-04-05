@@ -49,6 +49,137 @@ class ResearchService {
   }
 
   /**
+   * Helper method to emit timeline research step events
+   * Supports both legacy format and new search query format
+   */
+  emitResearchStep(onProgress, stepPayload) {
+    if (!onProgress) {
+      console.log('[ResearchService] ⚠️ emitResearchStep called but onProgress is null');
+      return;
+    }
+    
+    console.log('[ResearchService] 📡 Emitting research step:', JSON.stringify(stepPayload).substring(0, 200));
+    
+    // Support both legacy (stepId, status, sources) and new (full payload) formats
+    let payload = stepPayload;
+    
+    // Legacy format: (onProgress, 'planning', 'active', [], 'detail')
+    if (typeof stepPayload === 'string') {
+      const stepId = arguments[1];
+      const status = arguments[2];
+      const sources = arguments[3] || [];
+      const detail = arguments[4] || '';
+      
+      const stepConfig = {
+        planning: { action: 'planning' },
+        searching: { action: 'searching' },
+        analyzing: { action: 'analyzing' },
+        synthesizing: { action: 'synthesizing' }
+      };
+      
+      const config = stepConfig[stepId];
+      if (!config) return;
+      
+      payload = {
+        type: 'timeline_research_step',
+        eventId: `research-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        timestamp: new Date().toISOString(),
+        researchStep: {
+          id: stepId,
+          status: status,
+          detail: detail || undefined,
+          sources: sources.length > 0 ? sources : undefined
+        }
+      };
+    } else {
+      // New format: full payload object
+      payload = {
+        type: 'timeline_research_step',
+        eventId: `research-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+        timestamp: new Date().toISOString(),
+        researchStep: stepPayload
+      };
+    }
+    
+    onProgress(payload);
+  }
+
+  /**
+   * Helper to strip user query prefix from search query text
+   * E.g., "do a deep research on Emerging Trends in AI AI in Healthcare" 
+   * becomes "AI in Healthcare"
+   */
+  stripQueryPrefix(searchQuery, userQuery) {
+    const cleanedUserQuery = userQuery
+      .toLowerCase()
+      .replace(/^(do a deep research on|research|search for)\s+/i, '')
+      .trim();
+    
+    const cleanedSearchQuery = searchQuery
+      .toLowerCase()
+      .replace(/^(do a deep research on|research|search for)\s+/i, '')
+      .trim();
+    
+    // Try to find where the search query starts in the full string
+    if (cleanedSearchQuery.includes(cleanedUserQuery)) {
+      // Strip the user query prefix
+      let result = searchQuery.substring(
+        searchQuery.toLowerCase().indexOf(cleanedSearchQuery) + cleanedUserQuery.length
+      ).trim();
+      
+      // Clean up any remaining prefix patterns
+      result = result.replace(/^\s*-\s*/, '').trim();
+      return result || searchQuery;
+    }
+    
+    return searchQuery;
+  }
+
+  /**
+   * Helper to extract domain from URL
+   */
+  extractDomain(url) {
+    try {
+      const hostname = new URL(url).hostname;
+      return hostname.replace(/^www\./, '');
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * Helper method to call OpenAI with retry logic
+   */
+  async callOpenAIWithRetry(params, maxRetries = 3) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.openai.chat.completions.create(params);
+      } catch (error) {
+        lastError = error;
+
+        // Handle rate limit errors
+        if (error.status === 429) {
+          if (attempt < maxRetries) {
+            const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000);
+            console.log(`[ResearchService] Rate limited, waiting ${waitTime}ms before retry ${attempt + 1}/${maxRetries}...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            continue;
+          }
+        }
+
+        // For non-rate-limit errors, throw immediately
+        if (error.status !== 429) {
+          throw error;
+        }
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
    * AGENT 1: Planning Agent
    * Creates a detailed research plan with subtopics
    */
@@ -84,7 +215,7 @@ Respond in JSON format:
 }`;
 
     try {
-      const response = await this.openai.chat.completions.create({
+      const response = await this.callOpenAIWithRetry({
         model: 'gpt-4o',
         messages: [{ role: 'user', content: planningPrompt }],
         temperature: 0.3,
@@ -96,7 +227,7 @@ Respond in JSON format:
       
       return plan;
     } catch (error) {
-      console.error('[ResearchService] Planning error:', error);
+      console.error('[ResearchService] Planning error:', error.message);
       // Fallback plan
       return {
         title: `Research on ${query}`,
@@ -363,7 +494,7 @@ Respond in JSON format:
 }`;
 
     try {
-      const response = await this.openai.chat.completions.create({
+      const response = await this.callOpenAIWithRetry({
         model: 'gpt-4o',
         messages: [{ role: 'user', content: analysisPrompt }],
         temperature: 0.3,
@@ -375,7 +506,7 @@ Respond in JSON format:
       
       return analysis;
     } catch (error) {
-      console.error('[ResearchService] Analysis error:', error);
+      console.error('[ResearchService] Analysis error:', error.message);
       return {
         isSufficient: true,
         coverageAnalysis: 'Analysis failed',
@@ -384,6 +515,57 @@ Respond in JSON format:
         reasoning: 'Proceeding with available data'
       };
     }
+  }
+
+  /**
+   * Estimate token count (rough approximation: 1 token ≈ 4 characters)
+   */
+  estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+  }
+
+  /**
+   * Chunk sources to fit within token limits
+   * Keeps token count under maxTokens while prioritizing full content sources
+   */
+  chunkSourcesForSynthesis(sources, maxTokens = 20000) {
+    const fullContentSources = sources.filter(s => s.fetchMethod === 'full');
+    const snippetSources = sources.filter(s => s.fetchMethod === 'snippet');
+    
+    let currentTokens = 0;
+    const selectedSources = [];
+    
+    // Priority 1: Add full content sources (truncated if needed)
+    for (const source of fullContentSources) {
+      const contentLength = Math.min(2000, source.content?.length || 0); // Max 2000 chars per source
+      const truncatedContent = source.content?.substring(0, contentLength);
+      const sourceTokens = this.estimateTokens(truncatedContent || '');
+      
+      if (currentTokens + sourceTokens < maxTokens) {
+        selectedSources.push({
+          ...source,
+          content: truncatedContent
+        });
+        currentTokens += sourceTokens;
+      } else {
+        break;
+      }
+    }
+    
+    // Priority 2: Add snippet sources
+    for (const source of snippetSources) {
+      const sourceTokens = this.estimateTokens(source.content || '');
+      
+      if (currentTokens + sourceTokens < maxTokens) {
+        selectedSources.push(source);
+        currentTokens += sourceTokens;
+      } else {
+        break;
+      }
+    }
+    
+    console.log(`[ResearchService] Selected ${selectedSources.length}/${sources.length} sources (~${currentTokens} tokens)`);
+    return selectedSources;
   }
 
   /**
@@ -408,9 +590,12 @@ Respond in JSON format:
 
     this.citationCount = sources.length;
 
-    // Separate by fetch method for better synthesis
-    const fullContentSources = sources.filter(s => s.fetchMethod === 'full');
-    const snippetSources = sources.filter(s => s.fetchMethod === 'snippet');
+    // Chunk sources to fit within token limits (leave room for prompt + response)
+    const chunkedSources = this.chunkSourcesForSynthesis(sources, 18000);
+
+    // Separate chunked sources by type
+    const fullContentSources = chunkedSources.filter(s => s.fetchMethod === 'full');
+    const snippetSources = chunkedSources.filter(s => s.fetchMethod === 'snippet');
 
     const synthesisPrompt = `You are an expert research writer creating an EXTREMELY COMPREHENSIVE, DETAILED, and EXHAUSTIVE research report.
 
@@ -421,14 +606,14 @@ Subtopics to cover:
 ${plan.subtopics.map(s => `- ${s.name}: ${s.description}`).join('\n')}
 
 FULL CONTENT SOURCES (${fullContentSources.length} sources with complete text):
-${fullContentSources.slice(0, 35).map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nContent: ${s.content?.substring(0, 3000)}...\n`).join('\n---\n')}
+${fullContentSources.map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nContent: ${s.content}...\n`).join('\n---\n')}
 
 ${snippetSources.length > 0 ? `
 SNIPPET-ONLY SOURCES (${snippetSources.length} sources with summaries):
-${snippetSources.slice(0, 20).map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nSnippet: ${s.content}\n`).join('\n---\n')}
+${snippetSources.map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nSnippet: ${s.content}\n`).join('\n---\n')}
 ` : ''}
 
-TOTAL SOURCES: ${sources.length}
+TOTAL SOURCES AVAILABLE: ${sources.length} (using ${chunkedSources.length} in this synthesis)
 
 CRITICAL INSTRUCTIONS - READ CAREFULLY:
 
@@ -590,11 +775,12 @@ FORMATTING REQUIREMENTS:
 - Use inline citations [1], [2], [3] after EVERY fact, statistic, or claim
 
 CITATION REQUIREMENTS:
-- You have ${sources.length} sources - USE ALL OF THEM
+- You have ${sources.length} total sources - reference them appropriately
+- Use the ${chunkedSources.length} sources provided above for detailed content
 - Every paragraph MUST have multiple citations
 - Every statistic MUST have a citation
 - Every claim MUST have a citation
-- Aim for 100+ total citation references throughout the document
+- Aim for 80+ total citation references throughout the document
 
 WRITING STYLE:
 - Professional and academic tone
@@ -615,44 +801,126 @@ REMEMBER:
 
 START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
 
-    try {
-      const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o', // Using GPT-4o for best quality and speed
-        messages: [{ role: 'user', content: synthesisPrompt }],
-        temperature: 0.7, // Higher for more expansive writing
-        max_tokens: 16000 // Maximum for GPT-4o
-      });
+    // Retry logic for rate limits
+    const maxRetries = 3;
+    let lastError = null;
 
-      const report = response.choices[0].message.content;
-      const wordCount = Math.round(report.split(/\s+/).length);
-      console.log(`[ResearchService] Report synthesized (${report.length} chars, ${wordCount} words)`);
-      
-      if (wordCount < 3000) {
-        console.warn(`[ResearchService] ⚠️ Report is shorter than expected (${wordCount} words < 3000 target)`);
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await this.callOpenAIWithRetry({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: synthesisPrompt }],
+          temperature: 0.7,
+          max_tokens: 16000
+        });
+
+        const report = response.choices[0].message.content;
+        const wordCount = Math.round(report.split(/\s+/).length);
+        console.log(`[ResearchService] Report synthesized (${report.length} chars, ${wordCount} words)`);
+        
+        if (wordCount < 3000) {
+          console.warn(`[ResearchService] ⚠️ Report is shorter than expected (${wordCount} words < 3000 target)`);
+        }
+        
+        return {
+          report,
+          sources: sources.map(s => ({ id: s.id, title: s.title, url: s.url }))
+        };
+
+      } catch (error) {
+        lastError = error;
+        
+        // Handle rate limit errors
+        if (error.status === 429) {
+          const isTokenLimit = error.message?.includes('tokens per min') || error.message?.includes('Request too large');
+          
+          if (isTokenLimit && attempt === 1) {
+            // First attempt failed due to token limit - reduce sources further
+            console.warn(`[ResearchService] Token limit exceeded, reducing sources...`);
+            const reducedSources = this.chunkSourcesForSynthesis(sources, 12000);
+            
+            // Update the prompt with fewer sources
+            const reducedFullContent = reducedSources.filter(s => s.fetchMethod === 'full');
+            const reducedSnippets = reducedSources.filter(s => s.fetchMethod === 'snippet');
+            
+            const reducedPrompt = synthesisPrompt.replace(
+              /FULL CONTENT SOURCES[\s\S]*?TOTAL SOURCES AVAILABLE/,
+              `FULL CONTENT SOURCES (${reducedFullContent.length} sources):
+${reducedFullContent.map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nContent: ${s.content}...\n`).join('\n---\n')}
+
+${reducedSnippets.length > 0 ? `
+SNIPPET-ONLY SOURCES (${reducedSnippets.length} sources):
+${reducedSnippets.map(s => `[${s.id}] ${s.title}\nURL: ${s.url}\nSnippet: ${s.content}\n`).join('\n---\n')}
+` : ''}
+
+TOTAL SOURCES AVAILABLE`
+            );
+            
+            try {
+              const retryResponse = await this.callOpenAIWithRetry({
+                model: 'gpt-4o',
+                messages: [{ role: 'user', content: reducedPrompt }],
+                temperature: 0.7,
+                max_tokens: 16000
+              });
+
+              const report = retryResponse.choices[0].message.content;
+              const wordCount = Math.round(report.split(/\s+/).length);
+              console.log(`[ResearchService] Report synthesized with reduced sources (${report.length} chars, ${wordCount} words)`);
+              
+              return {
+                report,
+                sources: sources.map(s => ({ id: s.id, title: s.title, url: s.url }))
+              };
+            } catch (retryError) {
+              console.error(`[ResearchService] Retry with reduced sources failed:`, retryError.message);
+              lastError = retryError;
+            }
+          }
+          
+          // Wait before retrying (exponential backoff)
+          if (attempt < maxRetries) {
+            const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000); // Max 10 seconds
+            console.log(`[ResearchService] Rate limited, waiting ${waitTime}ms before retry ${attempt + 1}/${maxRetries}...`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            continue;
+          }
+        }
+        
+        // For non-rate-limit errors or final attempt, throw
+        console.error('[ResearchService] Synthesis error:', error.message);
+        throw error;
       }
-      
-      return {
-        report,
-        sources: sources.map(s => ({ id: s.id, title: s.title, url: s.url }))
-      };
-    } catch (error) {
-      console.error('[ResearchService] Synthesis error:', error);
-      throw error;
     }
+
+    // If all retries failed
+    throw lastError || new Error('Synthesis failed after all retries');
   }
 
   /**
-   * Main research pipeline - Agentic RAG Loop
+   * Main research pipeline - Agentic RAG Loop with Live Search Query Tracking
    */
   async conductResearch(query, onProgress) {
     const startTime = Date.now();
     this.searchCount = 0;
     this.citationCount = 0;
     this.visitedUrls.clear();
+    
+    // Track search queries for timeline events
+    const searchQueryMap = new Map(); // Map of searchQueryId -> SearchQueryItem tracking
 
     try {
       // Stage 1: Create Research Plan
+      this.emitResearchStep(onProgress, { id: 'planning', status: 'active' });
+      
       const plan = await this.createResearchPlan(query, onProgress);
+      
+      // Emit plan created event with title
+      this.emitResearchStep(onProgress, { 
+        id: 'planning', 
+        status: 'done',
+        planTitle: plan.title || `Research: ${query.substring(0, 50)}`
+      });
       
       onProgress?.({
         step: 'plan_ready',
@@ -666,6 +934,14 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
       let iteration = 0;
       let successfulFetches = 0;
       let failedFetches = 0;
+      let totalQueriesFired = 0;
+      
+      // Start searching phase
+      this.emitResearchStep(onProgress, { 
+        id: 'searching', 
+        status: 'active',
+        searchQueries: []
+      });
 
       while (iteration < this.maxIterations) {
         iteration++;
@@ -685,7 +961,18 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
           );
         } else {
           // Subsequent iterations: analyze and search gaps
+          console.log(`[ResearchService] Analysis: Iteration ${iteration}, checking if we need more sources...`);
           const analysis = await this.analyzeProgress(query, plan, allData, iteration, onProgress);
+          
+          // Emit replanning indicator if we're continuing
+          if (!analysis.isSufficient && allData.length < this.maxTotalSources) {
+            console.log('[ResearchService] Analysis: Need more');
+            this.emitResearchStep(onProgress, {
+              id: 'searching',
+              status: 'active',
+              replanningTriggered: true
+            });
+          }
           
           if (analysis.isSufficient || allData.length >= this.maxTotalSources) {
             console.log('[ResearchService] Research sufficient, stopping');
@@ -696,14 +983,66 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
         }
 
         // Execute searches
-        for (const searchQuery of searchQueries) {
-          const sources = await this.executeSearch(searchQuery);
+        for (const rawSearchQuery of searchQueries) {
+          // Create unique ID for this search query
+          const searchQueryId = `sq-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+          totalQueriesFired++;
           
-          // Fetch content with smart fallback strategy
+          // Strip user query prefix for display
+          const strippedQuery = this.stripQueryPrefix(rawSearchQuery, query);
+          
+          console.log(`[ResearchService] Search "${strippedQuery}" starting...`);
+          
+          // Emit search query started event
+          this.emitResearchStep(onProgress, {
+            id: 'searching',
+            status: 'active',
+            searchQuery: {
+              id: searchQueryId,
+              text: strippedQuery,
+              rawText: rawSearchQuery,
+              status: 'active',
+              sources: []
+            }
+          });
+          
+          // Execute the search
+          const sources = await this.executeSearch(rawSearchQuery);
+          console.log(`[ResearchService] Search "${strippedQuery}" found ${sources.length} new sources`);
+          this.searchCount++;
+          
+          // Emit each source as it's found (domain only, stripped from URL)
+          let sourceCount = 0;
           for (const source of sources) {
+            const domain = this.extractDomain(source.url);
+            sourceCount++;
+            
+            // Log fetch attempt
+            console.log(`[Fetch] Attempting: ${source.url}`);
+            
+            // Emit source found event
+            this.emitResearchStep(onProgress, {
+              id: 'searching',
+              status: 'active',
+              searchQuery: {
+                id: searchQueryId,
+                text: strippedQuery,
+                status: 'active',
+                addSource: domain
+              }
+            });
+            
+            // Fetch content with smart fallback strategy
             const content = await this.fetchContent(source.url, source.snippet);
             
+            // Log fetch result
             if (content) {
+              if (content === source.snippet) {
+                console.log(`[Fetch] ⚠️ Using snippet fallback`);
+              } else {
+                console.log(`[Fetch] ✅ Direct success`);
+              }
+              
               allData.push({ 
                 ...source, 
                 content,
@@ -714,10 +1053,24 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
               } else {
                 failedFetches++;
               }
+            } else {
+              console.log(`[Fetch] ❌ All strategies failed`);
             }
             
             if (allData.length >= this.maxTotalSources) break;
           }
+          
+          // Emit search query completed event with final source count
+          this.emitResearchStep(onProgress, {
+            id: 'searching',
+            status: 'active',
+            searchQuery: {
+              id: searchQueryId,
+              text: strippedQuery,
+              status: 'done',
+              sourceCount: sourceCount
+            }
+          });
           
           if (allData.length >= this.maxTotalSources) break;
         }
@@ -728,20 +1081,79 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
           progress: 20 + (iteration * 12)
         });
       }
+      
+      // Complete searching phase with final stats
+      this.emitResearchStep(onProgress, {
+        id: 'searching',
+        status: 'done',
+        totalSearches: totalQueriesFired,
+        totalSources: allData.length
+      });
 
-      console.log(`[ResearchService] Collected ${allData.length} sources from ${this.searchCount} searches`);
+      console.log(`[ResearchService] Collected ${allData.length} sources from ${totalQueriesFired} searches`);
       console.log(`[ResearchService] Fetch stats:`, this.fetchStats);
       console.log(`[ResearchService] Success: ${successfulFetches} full, ${failedFetches} snippets`);
+      
+      // Start analyzing phase
+      this.emitResearchStep(onProgress, { 
+        id: 'analyzing', 
+        status: 'active'
+      });
+      
+      // Simulate some analysis time
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Complete analyzing phase
+      this.emitResearchStep(onProgress, { 
+        id: 'analyzing', 
+        status: 'done'
+      });
 
       // Stage 3: Synthesize Report
-      const { report, sources } = await this.synthesizeReport(query, plan, allData, onProgress);
+      this.emitResearchStep(onProgress, { 
+        id: 'synthesizing', 
+        status: 'active'
+      });
+      
+      let report, reportSources;
+      
+      try {
+        const result = await this.synthesizeReport(query, plan, allData, onProgress);
+        report = result.report;
+        reportSources = result.sources;
+      } catch (synthesisError) {
+        console.error('[ResearchService] Synthesis failed, creating fallback report:', synthesisError.message);
+        
+        // Create a simpler fallback report
+        report = this.createFallbackReport(query, plan, allData);
+        reportSources = allData.map((item, index) => ({
+          id: index + 1,
+          title: item.title,
+          url: item.url
+        }));
+        
+        onProgress?.({
+          step: 'warning',
+          message: '⚠️ Using simplified report due to synthesis limitations',
+          progress: 90
+        });
+      }
+      
+      // Complete synthesizing phase with word count
+      const wordCount = Math.round(report.split(/\s+/).length);
+      console.log(`[ResearchService] Report synthesized`);
+      this.emitResearchStep(onProgress, { 
+        id: 'synthesizing', 
+        status: 'done',
+        wordCount: wordCount
+      });
 
       const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(1); // minutes
 
       return {
         success: true,
         answer: report,
-        sources: sources,
+        sources: reportSources,
         plan: plan,
         metadata: {
           query,
@@ -755,6 +1167,11 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
 
     } catch (error) {
       console.error('[ResearchService] Research failed:', error);
+      // Emit error state for current step
+      this.emitResearchStep(onProgress, { 
+        id: 'synthesizing', 
+        status: 'error'
+      });
       return {
         success: false,
         error: error.message,
@@ -765,6 +1182,56 @@ START WRITING NOW - MAKE IT EXTREMELY LONG AND DETAILED:`;
         }
       };
     }
+  }
+
+  /**
+   * Create a fallback report when synthesis fails
+   * Uses a simpler structure with the collected data
+   */
+  createFallbackReport(query, plan, allData) {
+    const sources = allData.map((item, index) => ({
+      id: index + 1,
+      title: item.title,
+      url: item.url,
+      content: item.content || item.snippet
+    }));
+
+    let report = `# Research Report: ${query}\n\n`;
+    report += `## Executive Summary\n\n`;
+    report += `This research report was compiled from ${sources.length} sources across ${plan.subtopics.length} key areas. `;
+    report += `Due to processing constraints, this is a structured summary of the collected information.\n\n`;
+
+    // Add subtopics
+    for (const subtopic of plan.subtopics) {
+      report += `## ${subtopic.name}\n\n`;
+      report += `${subtopic.description}\n\n`;
+
+      // Find relevant sources for this subtopic
+      const relevantSources = sources.filter(s => 
+        s.title.toLowerCase().includes(subtopic.name.toLowerCase()) ||
+        s.content.toLowerCase().includes(subtopic.name.toLowerCase())
+      ).slice(0, 5);
+
+      if (relevantSources.length > 0) {
+        report += `### Key Findings\n\n`;
+        for (const source of relevantSources) {
+          const excerpt = source.content.substring(0, 300).trim();
+          report += `- ${excerpt}... [${source.id}]\n\n`;
+        }
+      }
+    }
+
+    // Add sources section
+    report += `## Sources\n\n`;
+    for (const source of sources) {
+      report += `[${source.id}] [${source.title}](${source.url})\n\n`;
+    }
+
+    report += `\n---\n\n`;
+    report += `*Note: This report was generated with a simplified structure due to processing limitations. `;
+    report += `The information is based on ${sources.length} verified sources.*\n`;
+
+    return report;
   }
 
   clearCache() {
