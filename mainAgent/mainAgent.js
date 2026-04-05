@@ -44,6 +44,7 @@ const ResearchAgent = require('../research/researchAgent');
 const MicrosoftAgentMultiStep = require('../microsoft/microsoftAgentMultiStep');
 const WeatherAgentMultiStep = require('../weather/weatherAgentMultiStep');
 const SchedulesAgentMultiStep = require('../schedules/schedulesAgentMultiStep');
+const ConversationalAgent = require('../agents/conversationalAgent');
 const confirmationStore = require('./confirmationStore');
 const confirmationUtils = require('./confirmationUtils');
 const { TimelineEmitter, TimelineEventType, AGENT_NAMES } = require('./timelineEvents');
@@ -98,7 +99,8 @@ class MainAgent {
       research: new ResearchAgent(),
       microsoft: new MicrosoftAgentMultiStep(),
       weather: new WeatherAgentMultiStep(this.openai),
-      schedules: new SchedulesAgentMultiStep(this.openai)
+      schedules: new SchedulesAgentMultiStep(this.openai),
+      conversational: new ConversationalAgent()
     };
 
     // System prompt for the main coordinator
@@ -2358,12 +2360,17 @@ Language Detection Rules:
         };
       }
 
-      // Handle advisory queries (general knowledge, not time-sensitive)
-      if (intentClassification.type === 'advisory') {
-        console.log('[MainAgent] 💡 Detected advisory/planning query - skipping agents:', query);
+      // Handle advisory queries (general knowledge, guidance, planning)
+      // ✅ CRITICAL: Route to conversational agent for high-quality LLM responses
+      if (intentClassification.type === 'advisory' || intentClassification.isConversational === true) {
+        console.log('[MainAgent] 💡 Detected advisory/planning query - routing to conversational agent:', query);
         return {
-          agents: [],
-          reasoning: "User is asking for advice, guidance, or planning help - no agents needed, will provide advisory response"
+          agents: ['conversational'],
+          queries: {
+            conversational: query
+          },
+          reasoning: "User is asking for advice, guidance, or planning help - routing to conversational agent for high-quality LLM response",
+          requiresSequential: false
         };
       }
 
@@ -6262,6 +6269,37 @@ Detect the EXACT language of the "Original Query" above and respond ENTIRELY in 
         // Done - return without calling LLM
         console.log('[MainAgent] ✅ Deep research answer streamed successfully');
         return;
+      }
+      
+      // ✅ NEW: For conversational agent queries, stream the response in real-time
+      const isConversational = analysis.agents && analysis.agents.includes('conversational') && 
+                              results.conversational && results.conversational.success;
+      
+      if (isConversational && results.conversational.isStreaming && results.conversational.stream) {
+        console.log('[MainAgent] 💬 Conversational query detected - streaming response in real-time');
+        
+        // Stream the response directly from the conversational agent's stream
+        const stream = results.conversational.stream;
+        
+        try {
+          for await (const chunk of stream) {
+            if (chunk.choices[0].delta.content) {
+              const text = chunk.choices[0].delta.content;
+              onChunk({ type: 'content', text: text });
+            }
+          }
+          
+          console.log('[MainAgent] ✅ Conversational response streamed successfully');
+          return;
+        } catch (streamError) {
+          console.error('[MainAgent] ❌ Error streaming conversational response:', streamError);
+          // Fall through to error handling
+          onChunk({ 
+            type: 'content', 
+            text: '\n\nI encountered an error while streaming the response. Please try again.' 
+          });
+          return;
+        }
       }
       
       // For non-deep-research queries, continue with LLM processing

@@ -74,6 +74,8 @@ function detectFileGenerationRequest(query) {
     /as\s+(?:a\s+)?pdf/i,
     /\bpdf\b.*(?:file|document|export|generate|create|download|format)/i,
     /(?:file|document|export|generate|create|download)\s+.*pdf/i,
+    /(?:with|from|of)\s+(?:the\s+)?(?:above|previous|search|results?).*pdf/i,  // ✅ NEW: "create pdf with the above search results"
+    /pdf.*(?:with|from|of)\s+(?:the\s+)?(?:above|previous|search|results?)/i,  // ✅ NEW: "pdf with the search results"
   ];
 
   const txtPatterns = [
@@ -87,6 +89,8 @@ function detectFileGenerationRequest(query) {
     /in\s+(?:a\s+)?(?:text|txt)\s+(?:file|format)/i,
     /as\s+(?:a\s+)?(?:text|txt)/i,
     /\b(?:text|txt)\b.*(?:file|export|generate|create|download|format)/i,
+    /(?:with|from|of)\s+(?:the\s+)?(?:above|previous|search|results?).*(?:text|txt)/i,  // ✅ NEW: "create txt with the above search results"
+    /(?:text|txt).*(?:with|from|of)\s+(?:the\s+)?(?:above|previous|search|results?)/i,  // ✅ NEW: "txt with the search results"
   ];
 
   // Check for PDF request
@@ -368,15 +372,58 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         if (isExplicit && fileType && completeResponse.length > 0) {
           console.log(`[MainAgentController] 📄 Generating ${fileType.toUpperCase()} for file generation request`);
           
+          // ✅ FIX: Check if user is referencing previous web search results
+          // If conversationId exists, try to get the latest web search artifact
+          let contentToGenerate = completeResponse;
+          let titlePrefix = 'response';
+          
+          if (conversationId) {
+            try {
+              console.log(`[MainAgentController] 🔍 Checking for web search artifacts in conversation: ${conversationId}`);
+              const { getLastArtifactByType } = require('../utils/artifactMemory');
+              const webSearchArtifact = await getLastArtifactByType(conversationId, 'web_search');
+              
+              if (webSearchArtifact && webSearchArtifact.data && webSearchArtifact.data.synthesizedContent) {
+                console.log(`[MainAgentController] ✅ Found web search artifact: ${webSearchArtifact.title}`);
+                console.log(`[MainAgentController] 📊 Using synthesized content (${webSearchArtifact.data.synthesizedContent.length} chars) with ${webSearchArtifact.data.sources?.length || 0} sources`);
+                
+                // Build comprehensive content with sources
+                let fullContent = `# ${webSearchArtifact.data.query}\n\n`;
+                fullContent += webSearchArtifact.data.synthesizedContent;
+                
+                // Add sources section if available
+                if (webSearchArtifact.data.sources && webSearchArtifact.data.sources.length > 0) {
+                  fullContent += '\n\n---\n\n## Sources\n\n';
+                  webSearchArtifact.data.sources.forEach((source, index) => {
+                    fullContent += `${index + 1}. **${source.title}**\n`;
+                    fullContent += `   ${source.url}\n`;
+                    if (source.snippet) {
+                      fullContent += `   ${source.snippet}\n`;
+                    }
+                    fullContent += '\n';
+                  });
+                }
+                
+                contentToGenerate = fullContent;
+                titlePrefix = webSearchArtifact.data.query.substring(0, 50).replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '_');
+              } else {
+                console.log(`[MainAgentController] ℹ️ No web search artifact found, using AI response`);
+              }
+            } catch (artifactError) {
+              console.error(`[MainAgentController] ⚠️ Error retrieving web search artifact:`, artifactError.message);
+              // Continue with completeResponse if artifact retrieval fails
+            }
+          }
+          
           // Generate appropriate file title from query or use default
           const titleMatch = query.match(/["']([^"']+)["']/) || query.match(/(?:titled?\s+|named?\s+)([^\s,\.!?]+)/i);
-          const fileTitle = titleMatch ? titleMatch[1] : `response-${Date.now()}`;
+          const fileTitle = titleMatch ? titleMatch[1] : `${titlePrefix}-${Date.now()}`;
           
           try {
             // Generate and upload file based on type
             const fileResult = await fileGenerationService.generateAndUploadFile({
               type: fileType,
-              content: completeResponse,
+              content: contentToGenerate,
               title: fileTitle,
               userId
             });

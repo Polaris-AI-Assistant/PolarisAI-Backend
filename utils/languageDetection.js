@@ -17,6 +17,70 @@ async function detectLanguage(text) {
   }
 
   try {
+    // ✅ HEURISTIC PRE-CHECK: Quick script-based detection before LLM call
+    // This catches obvious cases and reduces LLM errors
+    const hasDevanagari = /[\u0900-\u097F]/.test(text); // Hindi/Marathi script
+    const hasArabic = /[\u0600-\u06FF]/.test(text); // Arabic script
+    const hasChinese = /[\u4E00-\u9FFF]/.test(text); // Chinese characters
+    const hasJapanese = /[\u3040-\u309F\u30A0-\u30FF]/.test(text); // Hiragana/Katakana
+    const hasKorean = /[\uAC00-\uD7AF]/.test(text); // Hangul
+    const hasCyrillic = /[\u0400-\u04FF]/.test(text); // Russian/Cyrillic
+    
+    // If text contains non-Latin scripts, it's likely that language
+    if (hasDevanagari) {
+      // Check if it's Hindi or Marathi based on common words
+      const hindiWords = /है|हैं|का|की|के|में|से|को|ने|पर|और|या|यह|वह|मैं|तुम|आप/;
+      const marathiWords = /आहे|आहेत|च्या|ची|चे|मध्ये|पासून|ला|ने|वर|आणि|किंवा|हा|तो|मी|तू|तुम्ही/;
+      
+      if (marathiWords.test(text)) {
+        console.log('[LanguageDetection] 🔍 Heuristic: Detected Marathi (Devanagari + Marathi words)');
+        return 'mr';
+      } else {
+        console.log('[LanguageDetection] 🔍 Heuristic: Detected Hindi (Devanagari script)');
+        return 'hi';
+      }
+    }
+    if (hasArabic) {
+      console.log('[LanguageDetection] 🔍 Heuristic: Detected Arabic (Arabic script)');
+      return 'ar';
+    }
+    if (hasChinese) {
+      console.log('[LanguageDetection] 🔍 Heuristic: Detected Chinese (Chinese characters)');
+      return 'zh';
+    }
+    if (hasJapanese) {
+      console.log('[LanguageDetection] 🔍 Heuristic: Detected Japanese (Hiragana/Katakana)');
+      return 'ja';
+    }
+    if (hasKorean) {
+      console.log('[LanguageDetection] 🔍 Heuristic: Detected Korean (Hangul)');
+      return 'ko';
+    }
+    if (hasCyrillic) {
+      console.log('[LanguageDetection] 🔍 Heuristic: Detected Russian (Cyrillic script)');
+      return 'ru';
+    }
+    
+    // ✅ ENGLISH GRAMMAR CHECK: If text has clear English grammar patterns, it's English
+    // This prevents misclassification when text contains foreign proper nouns
+    const englishPatterns = [
+      /\b(the|a|an|is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|should|could|can|may|might|must|shall)\b/i,
+      /\b(it|this|that|these|those|with|from|to|in|on|at|by|for|of|and|or|but|if|when|where|why|how|what|which|who)\b/i,
+      /\b(compare|show|give|create|make|get|find|search|tell|explain|describe)\b/i
+    ];
+    
+    const englishWordCount = (text.match(/\b[a-zA-Z]+\b/g) || []).length;
+    const hasEnglishGrammar = englishPatterns.some(pattern => pattern.test(text));
+    
+    // If text is mostly Latin script with English grammar, it's English
+    if (hasEnglishGrammar && englishWordCount > 2) {
+      console.log('[LanguageDetection] 🔍 Heuristic: Detected English (English grammar + Latin script)');
+      return 'en';
+    }
+
+    // ✅ LLM-BASED DETECTION: For ambiguous cases, use LLM
+    console.log('[LanguageDetection] 🤖 Using LLM for language detection...');
+    
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
@@ -51,11 +115,23 @@ Supported languages:
 - ru: Russian
 - ko: Korean
 
-IMPORTANT:
-- Distinguish between similar languages (e.g., Hindi vs Marathi, Portuguese vs Spanish)
-- If text is mixed language, detect the PRIMARY language
-- Be confident in your detection
-- Return ONLY valid JSON, no other text`
+CRITICAL RULES FOR ACCURATE DETECTION:
+1. Look at the GRAMMAR and SENTENCE STRUCTURE, not just individual words
+2. Proper nouns (names, places, brands) DO NOT determine the language
+   - "ujjain", "mumbai", "delhi" are city names, not Hindi words
+   - "google", "microsoft", "amazon" are brand names, not English words
+3. If the sentence structure, grammar, and function words (it, with, and, the, is, etc.) are in one language, that's the language
+4. Mixed language: Detect the PRIMARY language based on grammar and majority of words
+5. Be especially careful with Indian city/place names in English sentences
+6. Script matters: Devanagari script = Hindi/Marathi, Latin script with English grammar = English
+
+EXAMPLES:
+- "compare it with ujjain weather" → English (grammar is English, "ujjain" is just a city name)
+- "ujjain ka mausam batao" → Hindi (grammar is Hindi)
+- "मुंबई का मौसम कैसा है" → Hindi (Devanagari script)
+- "show me mumbai weather" → English (grammar is English, "mumbai" is just a city name)
+
+Return ONLY valid JSON, no other text`
         },
         {
           role: 'user',

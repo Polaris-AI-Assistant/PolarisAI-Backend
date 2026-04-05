@@ -41,7 +41,7 @@ class ConversationalAgent {
    * @param {string} options.language - Target language (detected or specified)
    * @param {string} options.userId - User ID for logging
    * @param {string} options.conversationId - Conversation ID for tracking
-   * @returns {Promise<Object>} - Response with streaming support
+   * @returns {Promise<Object>} - Response with stream for real-time streaming
    */
   async processQuery(query, options = {}) {
     const { 
@@ -125,10 +125,18 @@ RESPONSE GUIDELINES BY QUERY TYPE:
 - Mention limitations or edge cases if important
 - Offer follow-up considerations when appropriate
 
+🍳 FOR COOKING/RECIPE QUESTIONS:
+- Provide step-by-step instructions
+- List ingredients clearly
+- Include cooking times and temperatures
+- Add helpful tips and variations
+- Mention common mistakes to avoid
+
 RESPONSE LENGTH:
 - Coding samples: 500-1500 words with examples
 - Study plans: 600-1200 words with structured sections
 - Explanations: 300-800 words with examples
+- Recipes/cooking: 400-800 words with clear steps
 - Never artificially cut responses short - provide complete thoughts
 
 LANGUAGE:
@@ -163,17 +171,23 @@ LANGUAGE:
 
       console.log(`[ConversationalAgent] ✅ Created streaming completion`);
 
-      // Return the stream - the caller will handle streaming to the client
-      return stream;
+      // ✅ CRITICAL: Return stream wrapped in result object for MainAgent compatibility
+      // The stream will be consumed by streamCombinedResponse in MainAgent
+      return {
+        success: true,
+        stream: stream,  // ✅ Return the stream for real-time streaming
+        agentName: 'conversational',
+        isStreaming: true  // ✅ Flag to indicate this is a streaming response
+      };
 
     } catch (error) {
       console.error(`[ConversationalAgent] ❌ Error processing query:`, error.message);
       
-      // Return a friendly error response
+      // Return error in expected format
       return {
-        error: true,
-        message: `I encountered an error processing your request: ${error.message}`,
-        originalError: error
+        success: false,
+        error: `I encountered an error processing your request: ${error.message}`,
+        agentName: 'conversational'
       };
     }
   }
