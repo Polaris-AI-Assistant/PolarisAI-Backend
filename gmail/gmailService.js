@@ -655,6 +655,60 @@ async function getGmailClient(userId) {
 }
 
 /**
+ * Get sender name for email signatures
+ * Tries multiple sources in order:
+ * 1. Gmail tokens (name from Google profile)
+ * 2. Auth users metadata
+ * 3. Email username as fallback
+ * 
+ * @param {string} userId - User ID
+ * @returns {Promise<string>} Sender name or fallback
+ */
+async function getSenderName(userId) {
+  try {
+    // Try 1: Get from Gmail tokens (name from Google profile)
+    const { data: gmailData } = await supabase
+      .from('gmail_tokens')
+      .select('name, email')
+      .eq('user_id', userId)
+      .single();
+    
+    if (gmailData?.name) {
+      console.log(`[Gmail] Got sender name from Gmail tokens: "${gmailData.name}"`);
+      return gmailData.name;
+    }
+    
+    // Try 2: Get from auth.users metadata
+    const { data: userData } = await supabaseAdmin.auth.admin.getUserById(userId);
+    if (userData?.user) {
+      const name = userData.user.user_metadata?.full_name ||
+                   userData.user.user_metadata?.name ||
+                   userData.user.user_metadata?.display_name || '';
+      
+      if (name) {
+        console.log(`[Gmail] Got sender name from auth metadata: "${name}"`);
+        return name;
+      }
+    }
+    
+    // Try 3: Use email username as fallback
+    if (gmailData?.email) {
+      const username = gmailData.email.split('@')[0];
+      console.log(`[Gmail] Using email username as fallback: "${username}"`);
+      return username;
+    }
+    
+    // Last resort fallback
+    console.log('[Gmail] Could not determine sender name, using default');
+    return 'the sender';
+    
+  } catch (error) {
+    console.error('[Gmail] Error getting sender name:', error);
+    return 'the sender';
+  }
+}
+
+/**
  * Parse email headers to get common fields
  */
 function parseEmailHeaders(headers) {
@@ -2345,6 +2399,7 @@ module.exports = {
   
   // Helper functions
   getGmailClient,
+  getSenderName,
   getMessageBody,
   parseEmailHeaders,
   formatEmail,

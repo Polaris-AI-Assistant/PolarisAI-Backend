@@ -1230,6 +1230,9 @@ class MainAgent {
 
       // Try to get the sender's name based on which service is being used
       try {
+        const supabase = require('../supabase/supabaseConnect');
+        const supabaseAdmin = require('../supabase/supabaseAdmin');
+        
         if (emailAction.agentName === 'microsoft') {
           const microsoftService = require('../microsoft/microsoftService');
           const userProfile = await microsoftService.getUserProfile(userId);
@@ -1238,9 +1241,33 @@ class MainAgent {
             console.log(`[MainAgent] 📧 Got Microsoft sender name: ${senderName}`);
           }
         } else {
-          // For Gmail, try to get from stored user data or use a default
-          // Gmail API doesn't have a simple profile endpoint, so we'll use what's available
-          senderName = null; // Will be handled by the agent
+          // For Gmail, extract name from gmail_tokens or auth.users
+          const { data: gmailData } = await supabase
+            .from('gmail_tokens')
+            .select('name, email')
+            .eq('user_id', userId)
+            .single();
+          
+          if (gmailData?.name) {
+            senderName = gmailData.name;
+            console.log(`[MainAgent] 📧 Got Gmail sender name from tokens: ${senderName}`);
+          } else {
+            // Fallback to auth.users metadata
+            const { data: userData } = await supabaseAdmin.auth.admin.getUserById(userId);
+            if (userData?.user) {
+              senderName = userData.user.user_metadata?.full_name ||
+                           userData.user.user_metadata?.name ||
+                           userData.user.user_metadata?.display_name || '';
+              
+              if (senderName) {
+                console.log(`[MainAgent] 📧 Got sender name from auth metadata: ${senderName}`);
+              } else if (gmailData?.email) {
+                // Last resort: use email username
+                senderName = gmailData.email.split('@')[0];
+                console.log(`[MainAgent] 📧 Using email username as fallback: ${senderName}`);
+              }
+            }
+          }
         }
       } catch (profileError) {
         console.log(`[MainAgent] ⚠️ Could not fetch sender profile:`, profileError.message);
@@ -1366,20 +1393,62 @@ class MainAgent {
       const recipientName = recipientEmail.split('@')[0].replace(/[0-9]/g, '');
       const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
       
-      // Get sender name
+      // Get sender name with proper fallback chain
       let senderName = 'the sender';
       try {
         const supabase = require('../supabase/supabaseConnect');
-        const { data: calendarData } = await supabase
-          .from('calendar_tokens')
+        const supabaseAdmin = require('../supabase/supabaseAdmin');
+        
+        // Try 1: Get from Gmail tokens (name from Google profile)
+        const { data: gmailData } = await supabase
+          .from('gmail_tokens')
           .select('name')
           .eq('user_id', userId)
           .single();
-        if (calendarData?.name) {
-          senderName = calendarData.name;
+        
+        if (gmailData?.name) {
+          senderName = gmailData.name;
+          console.log(`[MainAgent] Got sender name from Gmail tokens: "${senderName}"`);
+        } else {
+          // Try 2: Get from auth.users metadata
+          const { data: userData } = await supabaseAdmin.auth.admin.getUserById(userId);
+          if (userData?.user) {
+            senderName = userData.user.user_metadata?.full_name ||
+                         userData.user.user_metadata?.name ||
+                         userData.user.user_metadata?.display_name || '';
+            
+            if (senderName) {
+              console.log(`[MainAgent] Got sender name from auth metadata: "${senderName}"`);
+            } else {
+              // Try 3: Get from calendar tokens as last resort
+              const { data: calendarData } = await supabase
+                .from('calendar_tokens')
+                .select('name')
+                .eq('user_id', userId)
+                .single();
+              
+              if (calendarData?.name) {
+                senderName = calendarData.name;
+                console.log(`[MainAgent] Got sender name from calendar tokens: "${senderName}"`);
+              } else {
+                // Fallback: Use email username
+                const { data: gmailTokenData } = await supabase
+                  .from('gmail_tokens')
+                  .select('email')
+                  .eq('user_id', userId)
+                  .single();
+                
+                if (gmailTokenData?.email) {
+                  senderName = gmailTokenData.email.split('@')[0];
+                  console.log(`[MainAgent] Using email username as fallback: "${senderName}"`);
+                }
+              }
+            }
+          }
         }
       } catch (err) {
-        // Use default
+        console.error('[MainAgent] Error getting sender name:', err);
+        // Keep default 'the sender'
       }
       
       let prompt;

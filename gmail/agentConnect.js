@@ -148,6 +148,7 @@ router.get('/auth/gmail/callback', async (req, res) => {
     
     console.log('Saving Gmail tokens:', {
       email: userEmail,
+      name: userName,
       user_id: user_id_to_store,
       expiry_date: tokens.expiry_date,
       expiry_timestamp: expiryTimestamp
@@ -158,6 +159,7 @@ router.get('/auth/gmail/callback', async (req, res) => {
       .upsert([
         {
           email: userEmail,
+          name: userName, // Store user's display name from Google
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
           expiry_date: expiryTimestamp,
@@ -649,6 +651,7 @@ router.post('/auth/gmail/callback/api', async (req, res) => {
       .upsert([
         {
           email: userEmail,
+          name: userInfo.data.name, // Store user's display name from Google
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
           expiry_date: expiryTimestamp,

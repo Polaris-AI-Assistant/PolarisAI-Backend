@@ -121,6 +121,9 @@ router.post('/signup/verify-otp', async (req, res) => {
         id: data.user?.id,
         email: data.user?.email,
         emailConfirmed: true,
+        first_name: data.user?.user_metadata?.first_name || data.user?.user_metadata?.full_name?.split(' ')[0] || '',
+        last_name: data.user?.user_metadata?.last_name || data.user?.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
+        display_name: data.user?.user_metadata?.display_name || data.user?.user_metadata?.full_name || data.user?.user_metadata?.first_name || '',
         metadata: data.user?.user_metadata,
       },
       session: {
@@ -211,7 +214,10 @@ router.post('/signin', async (req, res) => {
         id: data.user?.id,
         email: data.user?.email,
         emailConfirmed: data.user?.email_confirmed_at ? true : false,
-        lastSignIn: data.user?.last_sign_in_at
+        lastSignIn: data.user?.last_sign_in_at,
+        first_name: data.user?.user_metadata?.first_name || data.user?.user_metadata?.full_name?.split(' ')[0] || '',
+        last_name: data.user?.user_metadata?.last_name || data.user?.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
+        display_name: data.user?.user_metadata?.display_name || data.user?.user_metadata?.full_name || data.user?.user_metadata?.first_name || ''
       },
       session: {
         access_token: data.session?.access_token,
@@ -274,7 +280,15 @@ router.get('/callback', async (req, res) => {
     // Redirect to success page or send JSON response
     res.json({
       message: 'Authentication successful',
-      user: data.user,
+      user: {
+        id: data.user?.id,
+        email: data.user?.email,
+        emailConfirmed: data.user?.email_confirmed_at ? true : false,
+        lastSignIn: data.user?.last_sign_in_at,
+        first_name: data.user?.user_metadata?.first_name || data.user?.user_metadata?.full_name?.split(' ')[0] || '',
+        last_name: data.user?.user_metadata?.last_name || data.user?.user_metadata?.full_name?.split(' ').slice(1).join(' ') || '',
+        display_name: data.user?.user_metadata?.display_name || data.user?.user_metadata?.full_name || data.user?.user_metadata?.first_name || ''
+      },
       session: data.session
     });
   } catch (err) {
