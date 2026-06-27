@@ -14,13 +14,14 @@
  */
 
 const OpenAI = require('openai');
+const { getPrimaryModel } = require('../utils/modelConfig');
 
 class BaseAgent {
   constructor(agentName, tools, llmClient) {
     this.agentName = agentName;
     this.tools = tools; // { toolName: { definition, execute }, ... }
     this.llm = llmClient || new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    this.model = 'gpt-4o-mini';
+    this.model = getPrimaryModel();
   }
 
   /**

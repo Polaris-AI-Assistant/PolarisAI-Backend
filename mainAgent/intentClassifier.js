@@ -19,6 +19,7 @@
 
 const OpenAI = require('openai');
 const LLMConfig = require('../utils/llmConfig');
+const { getPrimaryModel } = require('../utils/modelConfig');
 
 class IntentClassifier {
   constructor() {
@@ -28,7 +29,7 @@ class IntentClassifier {
     this.client = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY
     });
-    this.model = 'gpt-4o-mini';
+    this.model = getPrimaryModel();
   }
 
   /**

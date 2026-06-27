@@ -5,6 +5,7 @@
  */
 
 const OpenAI = require('openai');
+const { getPrimaryModel } = require('./modelConfig');
 
 /**
  * Detect the language of a text query using LLM
@@ -86,7 +87,7 @@ async function detectLanguage(text) {
     });
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: getPrimaryModel(),
       messages: [
         {
           role: 'system',
