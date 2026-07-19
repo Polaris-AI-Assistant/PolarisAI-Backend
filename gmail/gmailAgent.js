@@ -902,30 +902,33 @@ Remember: You have full access to Gmail operations. Help users manage their emai
             delete params.userName;
           } else {
             // Only regenerate if not already AI-generated (legacy path or fallback)
-            console.log(`[GmailAgent] Generating professional email content with AI...`);
+            console.log(`[GmailAgent] Generating contextual email content with AI...`);
             
             // Extract recipient's first name for personalized greeting
             const recipientEmail = params.to;
             const recipientName = recipientEmail.split('@')[0].split('.')[0];
             const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
+            const originalRequest = params._originalQuery || query;
             
             const generationResponse = await this.openai.chat.completions.create({
               model: "gpt-4o-mini",
               messages: [
                 {
                   role: "system",
-                  content: `You are a professional email writing assistant. Generate polished, well-structured emails.
+                  content: `You are a professional email writing assistant. Generate a polished email draft that directly follows the user's request.
 
 REQUIRED FORMAT:
 1. Personalized greeting: "Hi [First Name]," (use the recipient's first name provided)
 2. Opening line: "I hope this message finds you well." or similar
-3. Main purpose paragraph (2-3 sentences explaining why you're writing)
-4. Details or action items (if applicable)
+3. Main purpose paragraph that explicitly reflects the user's request
+4. Details or action items from the request, including date/time or meeting purpose if mentioned
 5. Closing line: "Please feel free to reach out if you have any questions."
 6. Professional sign-off: "Best regards," followed by sender name
 
 CRITICAL RULES:
 - NEVER use placeholders like "[Your Name]"
+- Do not write a vague or generic email; use the user's requested wording and intent
+- If the user mentions a date, time, place, or meeting purpose, include it naturally in the body
 - Use proper line breaks between paragraphs
 - Be warm but professional
 - Keep it concise but complete
@@ -934,14 +937,14 @@ Only output the email body text. Do not include "Subject:" line.`
                 },
                 {
                   role: "user",
-                  content: `Write a professional email:
+                  content: `Write a professional email based on this request:
 To: ${params.to}
 Recipient Name: ${capitalizedRecipient}
 Subject: ${params.subject}
-Purpose/Context: ${params.body || query}
+Purpose/Context: ${params.body || originalRequest}
 Sender's Name: ${params.userName || 'Best regards'}
 
-Write a complete, professional email that looks like it was written by a real person.`
+Write a complete, professional email that looks like it was written by a real person and follows the request exactly.`
                 }
               ],
               max_tokens: 600,

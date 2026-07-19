@@ -30,6 +30,7 @@
  */
 
 const OpenAI = require('openai');
+const { getPrimaryModel } = require('../utils/modelConfig');
 const CalendarAgentMultiStep = require('../calendar/calendarAgentMultiStep');
 const DocsAgentMultiStep = require('../docs/docsAgentMultiStep');
 const FormsAgentMultiStep = require('../forms/formsAgentMultiStep');
@@ -303,7 +304,7 @@ class MainAgent {
 
     try {
       const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
@@ -1522,7 +1523,7 @@ Return ONLY valid JSON:
       }
       
       const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         messages: [
           { role: 'system', content: 'You are a professional email writer. Return only valid JSON. Use actual names, not placeholders.\n\n' + languageInstruction },
           { role: 'user', content: prompt }
@@ -1642,7 +1643,7 @@ Return ONLY a JSON object:
       }
 
       const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         messages: [
           { 
             role: 'system', 
@@ -2378,6 +2379,19 @@ Language Detection Rules:
         console.log('[MainAgent] ✅ URL validation passed:', urlValidation.urls.map(u => u.originalURL));
       }
 
+      // Handle deep research queries FIRST (before web search)
+      // Deep research is more specific than web search
+      if (intentClassification.type === 'deep_research' || intentClassification.requiresDeepResearch) {
+        console.log('[MainAgent] 🔬 Detected deep research query - routing to research agent:', query);
+        return {
+          agents: ['research'],
+          reasoning: "User is asking for comprehensive, in-depth research with analysis",
+          queries: {
+            research: query
+          }
+        };
+      }
+
       // Handle web search queries - BUT check if it's part of a multi-step request
       if (intentClassification.type === 'web_search' || intentClassification.requiresWebSearch) {
         // Check if query also contains other actions (e.g., "search for X and email it")
@@ -2396,18 +2410,6 @@ Language Detection Rules:
             }
           };
         }
-      }
-
-      // Handle deep research queries
-      if (intentClassification.type === 'deep_research' || intentClassification.requiresDeepResearch) {
-        console.log('[MainAgent] 🔬 Detected deep research query - routing to research agent:', query);
-        return {
-          agents: ['research'],
-          reasoning: "User is asking for comprehensive, in-depth research with analysis",
-          queries: {
-            research: query
-          }
-        };
       }
 
       // Handle conversational queries
@@ -2672,7 +2674,7 @@ CORE RULES:
       ];
 
       const routingResponse = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         messages: routingMessages,
         temperature: 0.2,
         response_format: { type: "json_object" }
@@ -3057,7 +3059,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
       ];
 
       const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini', // Using same model for consistency
+        model: getPrimaryModel(), // Using same model for consistency
         messages: messages,
         temperature: 0.1 // ✅ LOW: Response combining should be deterministic
       });
@@ -4086,12 +4088,22 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             console.error(`[Confirmation] ❌ NO ARTIFACTS FOUND - This should NEVER happen!`);
             console.error(`[Confirmation] ❌ Conversation ID: ${conversationId}`);
             console.error(`[Confirmation] ❌ Query: ${query}`);
-            // Generate generic email to avoid showing placeholder
+            // Draft the email from the original request instead of using a generic placeholder
+            const originalEmailQuery = params._originalQuery || query;
+            console.log(`[Confirmation] ✍️ Drafting email from original query: ${originalEmailQuery}`);
+
+            const draftedEmail = await this.extractEmailParamsWithAI(
+              originalEmailQuery,
+              userId,
+              conversationHistory || []
+            );
+
             params = {
-              to: params.to,
-              subject: 'Sharing Information',
-              body: `Hello,\n\nI wanted to share some information with you.\n\nBest regards`,
-              isAIGenerated: true  // Mark as AI-generated so preview shows the full body
+              ...params,
+              ...draftedEmail,
+              to: params.to || draftedEmail.to,
+              _originalQuery: originalEmailQuery,
+              isAIGenerated: true
             };
           }
         }
@@ -4287,7 +4299,30 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
    * Returns async because some extractors (like forms, gmail) need AI generation
    */
   async detectConfirmationRequiredAction(agentName, agentQuery, userId = null, conversationHistory = []) {
-    const query = agentQuery.toLowerCase();
+    const normalizedQuery = typeof agentQuery === 'string'
+      ? agentQuery
+      : [agentQuery?.to, agentQuery?.subject, agentQuery?.body, agentQuery?.message]
+          .filter(Boolean)
+          .join(' ');
+    const query = normalizedQuery.toLowerCase();
+
+    // Structured Gmail payloads can already contain the draft content we should preview/send.
+    if (agentName === 'gmail' && agentQuery && typeof agentQuery === 'object') {
+      const hasDraftContent = typeof agentQuery.to === 'string' && agentQuery.to.trim() !== '' &&
+                              typeof agentQuery.subject === 'string' && agentQuery.subject.trim() !== '' &&
+                              typeof agentQuery.body === 'string' && agentQuery.body.trim() !== '';
+
+      if (hasDraftContent) {
+        return {
+          toolName: 'sendEmail',
+          inferredParams: {
+            ...agentQuery,
+            _originalQuery: normalizedQuery,
+            isAIGenerated: true
+          }
+        };
+      }
+    }
     
     // Define patterns for each agent's confirmation-required actions
     const patterns = {
@@ -4987,7 +5022,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
     try {
       // Use OpenAI to generate smart questions based on the form title and query
       const response = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         messages: [
           {
             role: 'system',
@@ -5667,18 +5702,21 @@ Respond with ONLY valid JSON, no markdown formatting.`
       }
       
       // Generate the AI email body with context-aware instructions
-      const systemPrompt = isMeetingEmail 
+            const systemPrompt = isMeetingEmail 
         ? `You are an email writing assistant specializing in MEETING INVITATIONS. Generate a complete, well-formatted meeting invitation email with:
-1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
-2. The main message body explaining the meeting purpose and inviting them to attend
-3. A note that the meeting link/details will be included (use placeholder like "[Meeting Link]" or "The meeting link is included below")
-4. A proper sign-off with the sender's name
+      1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
+      2. A short opening sentence
+      3. The main message body explaining the meeting purpose and inviting them to attend
+      4. A note that the meeting link/details will be included (use placeholder like "[Meeting Link]" or "The meeting link is included below")
+      5. A proper sign-off with the sender's name
 
 CRITICAL: This is a MEETING INVITATION email. Focus on:
 - Inviting the recipient to a meeting/event
 - Mentioning that meeting details/link will be provided
 - DO NOT talk about documents, files, or forms being shared
 - Keep it professional and clear about the meeting purpose
+      - The output must be a full email, not a single sentence
+      - Use multiple paragraphs separated by blank lines
 
 IMPORTANT - EMOJI CONSTRAINT:
 ⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
@@ -5689,9 +5727,10 @@ Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
 ${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
         : `You are an email writing assistant. Generate a complete, well-formatted email with:
-1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
-2. The main message body (friendly, professional tone as appropriate)
-3. A proper sign-off with the sender's name
+      1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
+      2. A short opening sentence
+      3. The main message body (friendly, professional tone as appropriate)
+      4. A proper sign-off with the sender's name
 
 IMPORTANT - EMOJI CONSTRAINT:
 ⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
@@ -5700,6 +5739,8 @@ Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
+      The output must be a full email, not a single sentence.
+      Use multiple paragraphs separated by blank lines.
 ${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`;
       
       const userPrompt = isMeetingEmail
@@ -5719,7 +5760,7 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
       
       // Generate the AI email body
       const generationResponse = await this.openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: getPrimaryModel(),
         messages: [
           {
             role: "system",
@@ -5734,13 +5775,56 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
         temperature: 0.7
       });
       
-      const aiGeneratedBody = generationResponse.choices[0].message.content;
+      let aiGeneratedBody = generationResponse.choices[0].message.content;
+
+      const recipientName = basicParams.to.split('@')[0].split(/[._-]/)[0] || 'there';
+      const capitalizedRecipient = recipientName.charAt(0).toUpperCase() + recipientName.slice(1);
+      const hasGreeting = /^(hi|hello|dear)\s+.+[,!]?/i.test(aiGeneratedBody.trim());
+      const hasSignOff = /(best regards|regards|sincerely|thanks)/i.test(aiGeneratedBody);
+      const lineCount = aiGeneratedBody.split(/\n+/).map(line => line.trim()).filter(Boolean).length;
+      const isTooShort = aiGeneratedBody.trim().length < 120 || lineCount < 4;
+
+      if (!hasGreeting || !hasSignOff || isTooShort) {
+        console.warn('[MainAgent] ⚠️ AI email body was too short or incomplete, using structured fallback draft');
+
+        const lowerOriginalQuery = query.toLowerCase();
+        const timeMatch = lowerOriginalQuery.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+        const timeText = timeMatch ? `${timeMatch[1]}:${timeMatch[2] || '00'} ${timeMatch[3].toUpperCase()}` : '';
+        const schedulePhrase = lowerOriginalQuery.includes('tomorrow')
+          ? `tomorrow${timeText ? ` at ${timeText}` : ''}`
+          : timeText
+          ? `at ${timeText}`
+          : '';
+
+        const actionSentence = lowerOriginalQuery.includes('report to office') || lowerOriginalQuery.includes('report to the office')
+          ? `Please report to the office${schedulePhrase ? ` ${schedulePhrase}` : ''} for the project review.`
+          : lowerOriginalQuery.includes('project review')
+          ? `Please attend the project review${schedulePhrase ? ` ${schedulePhrase}` : ''}.`
+          : lowerOriginalQuery.includes('meeting')
+          ? `Please attend the meeting${schedulePhrase ? ` ${schedulePhrase}` : ''}.`
+          : `Please review the request and respond when you can.`;
+
+        const fallbackLines = [
+          `Hi ${capitalizedRecipient},`,
+          '',
+          'I hope you are doing well.',
+          '',
+          actionSentence,
+          '',
+          'If you need anything before then, please let me know.',
+          '',
+          `Best regards,`,
+          userName || ''
+        ].filter(Boolean);
+
+        aiGeneratedBody = fallbackLines.join('\n');
+      }
       
       // Generate a better subject if it's too generic
       let finalSubject = basicParams.subject;
       if (basicParams.subject === 'New Message' || basicParams.subject === 'Meeting') {
         const subjectResponse = await this.openai.chat.completions.create({
-          model: "gpt-4o-mini",
+          model: getPrimaryModel(),
           messages: [
             {
               role: "system",
@@ -5922,7 +6006,7 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
       
       // Generate the AI email body
       const generationResponse = await this.openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: getPrimaryModel(),
         messages: [
           {
             role: "system",
@@ -5943,7 +6027,7 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
       let finalSubject = basicParams.subject;
       if (basicParams.subject === 'New Message' || basicParams.subject === 'Meeting') {
         const subjectResponse = await this.openai.chat.completions.create({
-          model: "gpt-4o-mini",
+          model: getPrimaryModel(),
           messages: [
             {
               role: "system",
@@ -6270,7 +6354,7 @@ Detect the EXACT language of the "Original Query" above and respond ENTIRELY in 
 
       // Use OpenAI streaming for smooth word-by-word output
       const stream = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         messages: messages,
         temperature: 0.7,
         stream: true,
@@ -6564,7 +6648,7 @@ Respond ENTIRELY in the language of the current query - if they asked in English
 
       // Use OpenAI streaming
       const stream = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: getPrimaryModel(),
         messages: messages,
         temperature: 0.7,
         stream: true,

@@ -576,6 +576,24 @@ function extractEmailTopic(query) {
   if (askingMatch) {
     return askingMatch[1].trim();
   }
+
+  // Pattern 7: "asking him/her/them to [action]"
+  const askingToMatch = query.match(/asking\s+(?:him|her|them)\s+to\s+(.+?)(?:\s+to\s+|\s+and\s+|\s*$)/i);
+  if (askingToMatch) {
+    return askingToMatch[1].trim();
+  }
+
+  // Pattern 8: "requesting him/her/them to [action]"
+  const requestingToMatch = query.match(/requesting\s+(?:him|her|them)\s+to\s+(.+?)(?:\s+to\s+|\s+and\s+|\s*$)/i);
+  if (requestingToMatch) {
+    return requestingToMatch[1].trim();
+  }
+
+  // Pattern 9: action-focused natural language with date/time context
+  const actionWithTimeMatch = query.match(/(?:report|attend|join|come|meet|review|submit|send|share)\s+.+?(?:tomorrow|today|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)|for\s+.+)/i);
+  if (actionWithTimeMatch) {
+    return actionWithTimeMatch[0].trim();
+  }
   
   return null;
 }

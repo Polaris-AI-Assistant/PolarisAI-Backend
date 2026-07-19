@@ -12,6 +12,8 @@
  * - SEED for reproducibility
  */
 
+const { getPrimaryModel } = require('./modelConfig');
+
 class LLMConfig {
   /**
    * Temperature profiles for different use cases
@@ -94,7 +96,7 @@ Follow this process ALWAYS before making decisions.`;
     } = options;
 
     const params = {
-      model: 'gpt-4o-mini', // Consistent model
+      model: getPrimaryModel(), // Use centralized model configuration
       temperature: Math.min(temperature, this.TEMPERATURE.DETERMINISTIC), // Cap at 0.1 max
       max_tokens: maxTokens,
       top_p: topP,

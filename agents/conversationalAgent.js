@@ -18,6 +18,7 @@
 
 const OpenAI = require('openai');
 const languageDetection = require('../utils/languageDetection');
+const { getPrimaryModel } = require('../utils/modelConfig');
 
 class ConversationalAgent {
   constructor() {
@@ -27,7 +28,7 @@ class ConversationalAgent {
     this.openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
-    this.model = 'gpt-4o-mini';
+    this.model = getPrimaryModel();
     this.name = 'conversational';
     this.displayName = 'Assistant';
   }
