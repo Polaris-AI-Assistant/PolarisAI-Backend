@@ -115,6 +115,25 @@ router.post('/signup/verify-otp', async (req, res) => {
       }
     }
 
+    // ✅ Initialize credits for new user
+    try {
+      const { data: creditResult, error: creditError } = await supabase.rpc('initialize_user_credits', {
+        p_user_id: data.user?.id
+      });
+      
+      if (creditError) {
+        console.error('[Auth] Failed to initialize credits:', creditError);
+        // Don't fail signup if credit initialization fails
+      } else if (creditResult?.success) {
+        console.log(`[Auth] ✅ Initialized ${creditResult.balance} credits for user ${data.user?.id}`);
+      } else {
+        console.log('[Auth] ℹ️ Credits already initialized or skipped:', creditResult?.message);
+      }
+    } catch (creditInitError) {
+      console.error('[Auth] Error initializing credits:', creditInitError);
+      // Don't fail signup if credit initialization fails
+    }
+
     res.status(200).json({
       message: 'Email verified successfully',
       user: {

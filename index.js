@@ -82,6 +82,9 @@ const vaultRoutes = require('./files/vaultRoutes');
 const scheduleRoutes = require('./schedules/scheduleController');
 const scheduleEngine = require('./schedules/scheduleEngine');
 
+// Credit System routes
+const creditRoutes = require('./credits/creditController');
+
 const app = express();
 const server = http.createServer(app);
 const port = process.env.PORT || 3000;
@@ -204,6 +207,9 @@ app.use('/api/vault', vaultRoutes);
 
 // Use Schedule routes
 app.use('/api/schedules', scheduleRoutes);
+
+// Use Credit System routes
+app.use('/api/credits', creditRoutes);
 
 // Health check route
 app.get('/health', async (req, res) => {

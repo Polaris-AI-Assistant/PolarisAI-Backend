@@ -19,6 +19,14 @@ const confirmationStore = require('./confirmationStore');
 const { TimelineEmitter } = require('./timelineEvents');
 const { authenticateToken } = require('../middleware/auth');
 
+// Credit System imports
+const { checkCredits } = require('../middleware/creditMiddleware');
+const { 
+  deductCreditsForAgents, 
+  getCreditInfoForStream, 
+  getCreditDeductionInfoForStream 
+} = require('../credits/creditIntegration');
+
 // File context imports
 const { buildFileContexts, trackFileReference } = require('../files/fileContextBuilder');
 
@@ -139,7 +147,7 @@ function shouldAutoStoreMemory(query, response, agentsUsed) {
  * 
  * Response: Server-Sent Events (SSE) stream
  */
-router.post('/query/stream', authenticateToken, async (req, res) => {
+router.post('/query/stream', authenticateToken, checkCredits, async (req, res) => {
   try {
     const { query, conversationHistory, conversationId, addToMemory, userLocation, chatId, messageId, fileIds, userMessageId, responseLanguage } = req.body;
     const userId = req.user.id;
@@ -251,6 +259,13 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         }
         if (chunk.type === 'metadata' && chunk.agentsUsed) {
           agentsUsed = chunk.agentsUsed;
+          
+          // ✅ Send credit info when agents are determined
+          getCreditInfoForStream(agentsUsed, userId).then(creditInfo => {
+            res.write(`data: ${JSON.stringify(creditInfo)}\n\n`);
+          }).catch(err => {
+            console.error('[MainAgentController] Error sending credit info:', err);
+          });
         }
 
         // Emit agent status updates via Socket.io for real-time listeners
@@ -458,6 +473,36 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
         // Don't fail the request if file generation check fails
       }
 
+      // ✅ Deduct credits after successful execution
+      // If we got here without throwing an error and agents were used, deduct credits
+      if (agentsUsed.length > 0) {
+        console.log(`[MainAgentController] 💳 Deducting credits for agents: ${agentsUsed.join(', ')}`);
+        
+        const deductionResult = await deductCreditsForAgents(
+          agentsUsed,
+          userId,
+          {
+            query: query,
+            conversationId: conversationId || chatId || null,
+            messageId: messageId || null,
+            toolsUsed: result?.toolsUsed || [],
+            timestamp: new Date().toISOString()
+          }
+        );
+        
+        // Send deduction info to client
+        const deductionInfo = getCreditDeductionInfoForStream(deductionResult);
+        res.write(`data: ${JSON.stringify(deductionInfo)}\n\n`);
+        
+        if (deductionResult.success) {
+          console.log(`[MainAgentController] ✅ Credits deducted: ${deductionResult.totalDeducted}. New balance: ${deductionResult.newBalance}`);
+        } else {
+          console.error(`[MainAgentController] ⚠️ Credit deduction failed: ${deductionResult.error}`);
+        }
+      } else {
+        console.log('[MainAgentController] ℹ️ No agents used - no credits deducted');
+      }
+
       // Stop AI thinking indicator via Socket.io
       if (conversationId || chatId) {
         emitAIThinking(conversationId || chatId, false);
@@ -519,7 +564,7 @@ router.post('/query/stream', authenticateToken, async (req, res) => {
  *   "timestamp": "2025-01-01T00:00:00.000Z"
  * }
  */
-router.post('/query', authenticateToken, async (req, res) => {
+router.post('/query', authenticateToken, checkCredits, async (req, res) => {
   try {
     const { query, conversationHistory, chatId } = req.body;
     const userId = req.user.id;
@@ -564,6 +609,32 @@ router.post('/query', authenticateToken, async (req, res) => {
 
     // Process the query through the main agent
     const result = await mainAgent.processQuery(query, userId, { conversationHistory: fullChatHistory });
+
+    // ✅ Deduct credits after success (if agents were used)
+    if (result && result.agentsUsed && result.agentsUsed.length > 0) {
+      const deductionResult = await deductCreditsForAgents(
+        result.agentsUsed,
+        userId,
+        {
+          query: query,
+          chatId: chatId || null,
+          toolsUsed: result.toolsUsed || [],
+          timestamp: new Date().toISOString()
+        }
+      );
+      
+      // Attach credit info to response
+      result.creditInfo = {
+        charged: deductionResult.success,
+        amountCharged: deductionResult.totalDeducted || 0,
+        newBalance: deductionResult.newBalance || null,
+        transactions: deductionResult.transactions || []
+      };
+      
+      if (deductionResult.success) {
+        console.log(`[MainAgentController] ✅ Credits deducted: ${deductionResult.totalDeducted}`);
+      }
+    }
 
     // Return the result
     res.json(result);
@@ -717,6 +788,34 @@ router.post('/confirm-action', authenticateToken, async (req, res) => {
       } else {
         // Emit task completed - this is the final step
         timeline.emitTaskCompleted('All tasks completed successfully');
+        
+        // ✅ Deduct credits after successful confirmation
+        if (executionResult.agentsUsed && executionResult.agentsUsed.length > 0) {
+          console.log(`[MainAgentController] 💳 Deducting credits for confirmed action. Agents: ${executionResult.agentsUsed.join(', ')}`);
+          
+          const deductionResult = await deductCreditsForAgents(
+            executionResult.agentsUsed,
+            userId,
+            {
+              query: pendingAction.query || 'Confirmed action',
+              conversationId: pendingAction.conversationId || chatId || null,
+              messageId: messageId || null,
+              requestId: requestId,
+              toolsUsed: executionResult.toolsUsed || [],
+              timestamp: new Date().toISOString()
+            }
+          );
+          
+          // Send deduction info to client
+          const deductionInfo = getCreditDeductionInfoForStream(deductionResult);
+          res.write(`data: ${JSON.stringify(deductionInfo)}\n\n`);
+          
+          if (deductionResult.success) {
+            console.log(`[MainAgentController] ✅ Credits deducted: ${deductionResult.totalDeducted}. New balance: ${deductionResult.newBalance}`);
+          } else {
+            console.error(`[MainAgentController] ⚠️ Credit deduction failed: ${deductionResult.error}`);
+          }
+        }
         
         // Save timeline events now that the chain is complete
         // MERGE initial timeline events from the query with confirmation flow events
