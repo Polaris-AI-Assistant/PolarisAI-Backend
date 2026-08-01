@@ -85,6 +85,9 @@ const scheduleEngine = require('./schedules/scheduleEngine');
 // Credit System routes
 const creditRoutes = require('./credits/creditController');
 
+// Billing System routes
+const billingRoutes = require('./billing/billingController');
+
 const app = express();
 const server = http.createServer(app);
 const port = process.env.PORT || 3000;
@@ -210,6 +213,9 @@ app.use('/api/schedules', scheduleRoutes);
 
 // Use Credit System routes
 app.use('/api/credits', creditRoutes);
+
+// Use Billing System routes
+app.use('/api/billing', billingRoutes);
 
 // Health check route
 app.get('/health', async (req, res) => {

@@ -541,6 +541,18 @@ function validateEmailContent(params) {
  * Extract email topic/intent from query
  */
 function extractEmailTopic(query) {
+  // Pattern 0: Document/Link sharing (NEW)
+  // Detect when user wants to share a document, sheet, or link
+  const documentShareMatch = query.match(/(?:send|share|email)\s+(?:this|the)?\s*(?:google\s+)?(?:doc|document|sheet|link|file)/i);
+  if (documentShareMatch) {
+    // Extract document title from artifact context if present
+    const contextMatch = query.match(/\[Context: User is referring to the (?:document|sheet) "([^"]+)"/i);
+    if (contextMatch) {
+      return contextMatch[1]; // Return document title as topic
+    }
+    return 'document sharing'; // Fallback generic topic
+  }
+  
   // Pattern 1: "about [topic]"
   const aboutMatch = query.match(/about\s+(.+?)(?:\s+to\s+|\s+and\s+|\s*$)/i);
   if (aboutMatch) {
@@ -565,6 +577,13 @@ function extractEmailTopic(query) {
     return sayingMatch[1].trim();
   }
   
+  // Pattern 4b: "asking [pronoun/email] to [message]" - handles emails in the middle
+  // This catches: "send email to x@y.com asking her to [message]"
+  const askingAfterEmailMatch = query.match(/to\s+[^\s]+@[^\s]+\s+asking\s+(?:him|her|them|to)\s+(?:to\s+)?(.+?)(?:\s*$)/i);
+  if (askingAfterEmailMatch) {
+    return askingAfterEmailMatch[1].trim();
+  }
+  
   // Pattern 5: "to tell them [message]"
   const tellMatch = query.match(/to\s+tell\s+(?:them|him|her)\s+(.+?)(?:\s+to\s+|\s+and\s+|\s*$)/i);
   if (tellMatch) {
@@ -578,9 +597,15 @@ function extractEmailTopic(query) {
   }
 
   // Pattern 7: "asking him/her/them to [action]"
-  const askingToMatch = query.match(/asking\s+(?:him|her|them)\s+to\s+(.+?)(?:\s+to\s+|\s+and\s+|\s*$)/i);
+  const askingToMatch = query.match(/asking\s+(?:him|her|them)\s+to\s+(.+?)(?:\s+to\s+@|\s+and\s+|\s*$)/i);
   if (askingToMatch) {
     return askingToMatch[1].trim();
+  }
+  
+  // Pattern 7b: "asking [name/email] to [action]" (handles email addresses too)
+  const askingEmailMatch = query.match(/asking\s+[^\s]+@[^\s]+\s+to\s+(.+?)(?:\s+and\s+|\s*$)/i);
+  if (askingEmailMatch) {
+    return askingEmailMatch[1].trim();
   }
 
   // Pattern 8: "requesting him/her/them to [action]"

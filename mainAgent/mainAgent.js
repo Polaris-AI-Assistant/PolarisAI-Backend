@@ -4088,12 +4088,12 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
             console.error(`[Confirmation] ❌ NO ARTIFACTS FOUND - This should NEVER happen!`);
             console.error(`[Confirmation] ❌ Conversation ID: ${conversationId}`);
             console.error(`[Confirmation] ❌ Query: ${query}`);
-            // Draft the email from the original request instead of using a generic placeholder
-            const originalEmailQuery = params._originalQuery || query;
-            console.log(`[Confirmation] ✍️ Drafting email from original query: ${originalEmailQuery}`);
+            // Draft the email from the ACTUAL USER QUERY (not the LLM's reformulated version)
+            // The 'query' parameter contains the real user input which has better patterns for extraction
+            console.log(`[Confirmation] ✍️ Drafting email from ACTUAL user query: ${query}`);
 
             const draftedEmail = await this.extractEmailParamsWithAI(
-              originalEmailQuery,
+              query,  // Use actual user query, not params._originalQuery
               userId,
               conversationHistory || []
             );
@@ -4102,7 +4102,7 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
               ...params,
               ...draftedEmail,
               to: params.to || draftedEmail.to,
-              _originalQuery: originalEmailQuery,
+              _originalQuery: query,  // Use the actual user query
               isAIGenerated: true
             };
           }
@@ -4299,26 +4299,33 @@ Detect the EXACT language of the user's query above and respond ENTIRELY in that
    * Returns async because some extractors (like forms, gmail) need AI generation
    */
   async detectConfirmationRequiredAction(agentName, agentQuery, userId = null, conversationHistory = []) {
+    // Normalize query - handle both string and object formats
     const normalizedQuery = typeof agentQuery === 'string'
       ? agentQuery
       : [agentQuery?.to, agentQuery?.subject, agentQuery?.body, agentQuery?.message]
           .filter(Boolean)
           .join(' ');
-    const query = normalizedQuery.toLowerCase();
+    
+    const query = typeof normalizedQuery === 'string' ? normalizedQuery.toLowerCase() : '';
 
     // Structured Gmail payloads can already contain the draft content we should preview/send.
+    // BUT we should ALWAYS regenerate with AI for professional formatting
     if (agentName === 'gmail' && agentQuery && typeof agentQuery === 'object') {
       const hasDraftContent = typeof agentQuery.to === 'string' && agentQuery.to.trim() !== '' &&
-                              typeof agentQuery.subject === 'string' && agentQuery.subject.trim() !== '' &&
-                              typeof agentQuery.body === 'string' && agentQuery.body.trim() !== '';
+                              (typeof agentQuery.subject === 'string' || typeof agentQuery.body === 'string') &&
+                              (agentQuery.body?.trim() || agentQuery.subject?.trim());
 
       if (hasDraftContent) {
+        // ✅ CRITICAL: Mark for deferred generation instead of using the short routing email
+        // This ensures we ALWAYS use extractEmailParamsWithAI for professional formatting
         return {
           toolName: 'sendEmail',
           inferredParams: {
-            ...agentQuery,
-            _originalQuery: normalizedQuery,
-            isAIGenerated: true
+            to: agentQuery.to,
+            subject: '⏳ Will be generated after previous action completes',
+            body: 'Email content will be generated with actual details from the previous action.',
+            _deferredGeneration: true,
+            _originalQuery: normalizedQuery
           }
         };
       }
@@ -5569,12 +5576,51 @@ Respond with ONLY valid JSON, no markdown formatting.`
       );
     }
     
-    // ✅ NEW: Check for ambiguous content references
+    // ============================================================
+    // ✅ CHECK FOR DOCUMENT ARTIFACT CONTEXT
+    // If user is sending a document/sheet/doc link, extract the artifact info
+    // ============================================================
+    let documentContext = null;
     const lowerQuery = query.toLowerCase();
+    
+    // Check if query mentions sending a document/link/file
+    const isSendingDocument = lowerQuery.includes('google doc') || 
+                             lowerQuery.includes('google sheet') ||
+                             lowerQuery.includes('document') ||
+                             lowerQuery.includes('sheet') ||
+                             lowerQuery.includes('link') ||
+                             lowerQuery.includes('file');
+    
+    if (isSendingDocument) {
+      console.log('[MainAgent] 📄 Query mentions sending document/link, checking artifacts...');
+      
+      // Extract document info from query context (artifact metadata)
+      // The query should have context like: [Context: User is referring to the document "Title" (documentId=xxx)]
+      const contextMatch = query.match(/\[Context: User is referring to the (document|sheet) "([^"]+)" \((?:documentId|sheetId)=([^\)]+)\)\]/i);
+      
+      if (contextMatch) {
+        const [, artifactType, title, id] = contextMatch;
+        const url = artifactType.toLowerCase() === 'sheet' 
+          ? `https://docs.google.com/spreadsheets/d/${id}/edit`
+          : `https://docs.google.com/document/d/${id}/edit`;
+        
+        documentContext = {
+          type: artifactType.toLowerCase(),
+          title: title,
+          id: id,
+          url: url
+        };
+        
+        console.log(`[MainAgent] ✅ Found ${artifactType} artifact: "${title}"`);
+        console.log(`[MainAgent]    URL: ${url}`);
+      }
+    }
+    
+    // ✅ NEW: Check for ambiguous content references (but allow if document context exists)
     const hasAmbiguousReference = lowerQuery.match(/email\s+(this|that|it)\s+to/i) || 
                                   lowerQuery.match(/send\s+(this|that|it)\s+to/i);
     
-    if (hasAmbiguousReference) {
+    if (hasAmbiguousReference && !documentContext) {
       const reference = hasAmbiguousReference[1];
       console.warn(`[MainAgent] ⚠️ Ambiguous content reference: "${reference}"`);
       
@@ -5618,32 +5664,9 @@ Respond with ONLY valid JSON, no markdown formatting.`
       };
     }
     
-    // Validate email content
-    console.log('[MainAgent] 🔍 Validating email content completeness...');
-    
-    const validation = validateEmailContent({
-      to: basicParams.to,
-      subject: hasExplicitSubject ? explicitSubjectMatch[1] : '',
-      body: hasExplicitBody ? explicitBodyMatch[1] : '',
-      query: query
-    });
-    
-    console.log('[MainAgent] 📊 Email validation result:', JSON.stringify(validation, null, 2));
-    
-    // Only reject if validation failed AND AI can't generate content
-    if (!validation.isValid && !validation.canGenerateAI) {
-      console.log('[MainAgent] ❌ Email content validation failed - no topic/intent found');
-      
-      const errorMessage = formatEmailValidationErrors(validation.errors, validation.warnings);
-      throw new Error(errorMessage);
-    }
-    
-    // If validation passed or AI can generate, continue
-    if (validation.canGenerateAI && validation.topic) {
-      console.log(`[MainAgent] ✅ Email topic detected: "${validation.topic}" - AI will generate content`);
-    } else {
-      console.log('[MainAgent] ✅ Email content validation passed - using provided content');
-    }
+    // ✅ SKIP VALIDATION - Always let LLM generate email content
+    // The LLM is smart enough to understand any email request format
+    console.log('[MainAgent] ✅ Skipping validation - letting LLM handle email generation');
     
     try {
       console.log(`[MainAgent] Generating AI email content for preview...`);
@@ -5664,19 +5687,49 @@ Respond with ONLY valid JSON, no markdown formatting.`
       try {
         const supabase = require('../supabase/supabaseConnect');
         
-        // First try: Get from calendar_tokens (has name field from Google profile)
-        const { data: calendarData, error: calendarError } = await supabase
-          .from('calendar_tokens')
-          .select('name')
+        // First try: Get from gmail_tokens (has name field from Gmail profile)
+        const { data: gmailData, error: gmailError } = await supabase
+          .from('gmail_tokens')
+          .select('name, email')
           .eq('user_id', userId)
           .single();
         
-        if (!calendarError && calendarData?.name) {
-          userName = calendarData.name;
-          console.log(`[MainAgent] Got user display name from calendar_tokens: "${userName}"`);
+        if (!gmailError && gmailData?.name) {
+          userName = gmailData.name;
+          console.log(`[MainAgent] Got user display name from gmail_tokens: "${userName}"`);
+        } else if (!gmailError && gmailData?.email && !userName) {
+          // Fallback: Extract name from email (e.g., john.doe@gmail.com -> John Doe)
+          const emailUsername = gmailData.email.split('@')[0];
+          const nameParts = emailUsername.split(/[._-]/);
+          userName = nameParts
+            .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+            .join(' ');
+          console.log(`[MainAgent] Extracted display name from gmail email: "${userName}"`);
         }
         
-        // Second try: Get from Supabase Auth Admin API
+        // Second try: Get from calendar_tokens (has name field from Google profile)
+        if (!userName) {
+          const { data: calendarData, error: calendarError } = await supabase
+            .from('calendar_tokens')
+            .select('name, email')
+            .eq('user_id', userId)
+            .single();
+          
+          if (!calendarError && calendarData?.name) {
+            userName = calendarData.name;
+            console.log(`[MainAgent] Got user display name from calendar_tokens: "${userName}"`);
+          } else if (!calendarError && calendarData?.email && !userName) {
+            // Fallback: Extract name from email
+            const emailUsername = calendarData.email.split('@')[0];
+            const nameParts = emailUsername.split(/[._-]/);
+            userName = nameParts
+              .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+              .join(' ');
+            console.log(`[MainAgent] Extracted display name from calendar email: "${userName}"`);
+          }
+        }
+        
+        // Third try: Get from Supabase Auth Admin API
         if (!userName) {
           try {
             const { data: userData, error: userError } = await supabase.auth.admin.getUserById(userId);
@@ -5687,6 +5740,14 @@ Respond with ONLY valid JSON, no markdown formatting.`
                          userData.user.user_metadata?.display_name || '';
               if (userName) {
                 console.log(`[MainAgent] Got user display name from auth: "${userName}"`);
+              } else if (userData.user.email) {
+                // Last resort: Extract from Supabase email
+                const emailUsername = userData.user.email.split('@')[0];
+                const nameParts = emailUsername.split(/[._-]/);
+                userName = nameParts
+                  .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+                  .join(' ');
+                console.log(`[MainAgent] Extracted display name from auth email: "${userName}"`);
               }
             }
           } catch (authError) {
@@ -5702,7 +5763,36 @@ Respond with ONLY valid JSON, no markdown formatting.`
       }
       
       // Generate the AI email body with context-aware instructions
-            const systemPrompt = isMeetingEmail 
+      
+      // ✅ Check if this is a document sharing email
+      const isDocumentEmail = documentContext !== null;
+      
+      const systemPrompt = isDocumentEmail
+        ? `You are an email writing assistant specializing in DOCUMENT SHARING. Generate a complete, well-formatted email with:
+      1. A warm, appropriate greeting (e.g., "Hi there," or "Hello,")
+      2. A short opening sentence introducing the document share
+      3. Include the document link on its own line
+      4. A brief explanation of what the document contains
+      5. An invitation to view/edit the document
+      6. A proper sign-off with the sender's name
+
+CRITICAL: This is a DOCUMENT SHARING email. Focus on:
+- Sharing a Google Doc/Sheet link with the recipient
+- Explaining what the document contains
+- Inviting them to view or collaborate
+- DO NOT talk about meetings or events
+- Keep it professional and clear about the document
+
+IMPORTANT - EMOJI CONSTRAINT:
+⚠️ NEVER use ANY emojis, emoji characters, or special Unicode symbols in the email.
+Use ONLY standard English text, numbers, and common punctuation marks (. , ! ? - etc.)
+Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
+
+Only output the email body text. Do not include "Subject:" line.
+Make the email feel natural and personal, not robotic.
+The output must be a full email with multiple paragraphs.
+${userName ? `CRITICAL: The sender's name is "${userName}" - you MUST include this exact name after "Best regards" or similar sign-off. Do NOT use placeholders like "[Your Name]" or "Your Name". Use the actual name: "${userName}".` : 'End with "Best regards" as the sign-off. Do NOT include any placeholder for the name since we don\'t have it - just end with "Best regards" on its own line.'}`
+        : isMeetingEmail 
         ? `You are an email writing assistant specializing in MEETING INVITATIONS. Generate a complete, well-formatted meeting invitation email with:
       1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
       2. A short opening sentence
@@ -5725,7 +5815,7 @@ Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
-${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
+${userName ? `CRITICAL: The sender's name is "${userName}" - you MUST include this exact name after "Best regards" or similar sign-off. Do NOT use placeholders like "[Your Name]" or "Your Name". Use the actual name: "${userName}".` : 'End with "Best regards" as the sign-off. Do NOT include any placeholder for the name since we don\'t have it - just end with "Best regards" on its own line.'}`
         : `You are an email writing assistant. Generate a complete, well-formatted email with:
       1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
       2. A short opening sentence
@@ -5741,9 +5831,22 @@ Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
       The output must be a full email, not a single sentence.
       Use multiple paragraphs separated by blank lines.
-${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`;
+${userName ? `CRITICAL: The sender's name is "${userName}" - you MUST include this exact name after "Best regards" or similar sign-off. Do NOT use placeholders like "[Your Name]" or "Your Name". Use the actual name: "${userName}".` : 'End with "Best regards" as the sign-off. Do NOT include any placeholder for the name since we don\'t have it - just end with "Best regards" on its own line.'}`;
       
-      const userPrompt = isMeetingEmail
+      const userPrompt = isDocumentEmail
+        ? `Write a DOCUMENT SHARING email for:
+To: ${basicParams.to}
+Subject: ${basicParams.subject || `Sharing: ${documentContext.title}`}
+Context/Intent from user: "${query}"
+
+Document details:
+- Type: ${documentContext.type === 'sheet' ? 'Google Sheet' : 'Google Document'}
+- Title: ${documentContext.title}
+- Link: ${documentContext.url}
+
+This email shares a ${documentContext.type} with the recipient. Include the document link clearly in the email body and explain what it contains.
+Make it professional and friendly.`
+        : isMeetingEmail
         ? `Write a MEETING INVITATION email for:
 To: ${basicParams.to}
 Subject: ${basicParams.subject}
@@ -5820,9 +5923,14 @@ Make it ${query.toLowerCase().includes('lovely') || query.toLowerCase().includes
         aiGeneratedBody = fallbackLines.join('\n');
       }
       
-      // Generate a better subject if it's too generic
+      // Generate a better subject if it's too generic or missing
       let finalSubject = basicParams.subject;
-      if (basicParams.subject === 'New Message' || basicParams.subject === 'Meeting') {
+      
+      // ✅ Use document title for subject if no explicit subject provided
+      if (isDocumentEmail && (!finalSubject || finalSubject === 'New Message' || finalSubject === 'Meeting')) {
+        finalSubject = `Sharing: ${documentContext.title}`;
+        console.log(`[MainAgent] Using document-based subject: ${finalSubject}`);
+      } else if (basicParams.subject === 'New Message' || basicParams.subject === 'Meeting') {
         const subjectResponse = await this.openai.chat.completions.create({
           model: getPrimaryModel(),
           messages: [
@@ -5974,7 +6082,7 @@ Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
-${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`
+${userName ? `CRITICAL: The sender's name is "${userName}" - you MUST include this exact name after "Best regards" or similar sign-off. Do NOT use placeholders like "[Your Name]" or "Your Name". Use the actual name: "${userName}".` : 'End with "Best regards" as the sign-off. Do NOT include any placeholder for the name since we don\'t have it - just end with "Best regards" on its own line.'}`
         : `You are an email writing assistant. Generate a complete, well-formatted email with:
 1. A warm, appropriate greeting (e.g., "Hi [name]," or "Dear [name],")
 2. The main message body (friendly, professional tone as appropriate)
@@ -5987,7 +6095,7 @@ Do NOT include: 🎓 📧 🔗 ✓ ✅ 📋 📎 or any other emoji characters.
 
 Only output the email body text. Do not include "Subject:" line.
 Make the email feel natural and personal, not robotic.
-${userName ? `The sender's name is "${userName}" - include this after "Best regards" or similar sign-off.` : 'End with "Best regards" as the sign-off.'}`;
+${userName ? `CRITICAL: The sender's name is "${userName}" - you MUST include this exact name after "Best regards" or similar sign-off. DO NOT use placeholders like "[Your Name]" or "Your Name". Use the actual name: "${userName}".` : 'End with "Best regards" as the sign-off. Do NOT include any placeholder for the name since we don\'t have it - just end with "Best regards" on its own line.'}`;
       
       const userPrompt = isMeetingEmail
         ? `Write a MEETING INVITATION email for:

@@ -23,68 +23,65 @@ const verifyAuth = (req, res, next) => {
   return authMiddleware.authenticateToken(req, res, next);
 };
 
-// Apply authentication middleware to all routes
-router.use(verifyAuth);
-
 /**
  * File Upload Routes
  */
 
 // Get signed upload URL
-router.post('/files/upload-url', filesController.getUploadUrl);
+router.post('/files/upload-url', verifyAuth, filesController.getUploadUrl);
 
 // Confirm upload completion
-router.post('/files/confirm', filesController.confirmUpload);
+router.post('/files/confirm', verifyAuth, filesController.confirmUpload);
 
 // Simple upload endpoints (no background processing required)
-router.post('/files/upload-simple', filesController.uploadSimple);
-router.post('/files/confirm-simple', filesController.confirmSimple);
+router.post('/files/upload-simple', verifyAuth, filesController.uploadSimple);
+router.post('/files/confirm-simple', verifyAuth, filesController.confirmSimple);
 
 /**
  * File Management Routes
  */
 
 // List user's files with filtering
-router.get('/files', filesController.listFiles);
+router.get('/files', verifyAuth, filesController.listFiles);
 
 // Search files
-router.get('/files/search', filesController.searchFiles);
+router.get('/files/search', verifyAuth, filesController.searchFiles);
 
 // Get file statistics
-router.get('/files/stats', filesController.getFileStats);
+router.get('/files/stats', verifyAuth, filesController.getFileStats);
 
 // Get storage usage
-router.get('/files/storage-usage', filesController.getStorageUsage);
+router.get('/files/storage-usage', verifyAuth, filesController.getStorageUsage);
 
 // Get recent files
-router.get('/files/recent', filesController.getRecentFiles);
+router.get('/files/recent', verifyAuth, filesController.getRecentFiles);
 
 // Get files for a specific chat
-router.get('/files/chat/:chatId', filesController.getChatFiles);
+router.get('/files/chat/:chatId', verifyAuth, filesController.getChatFiles);
 
 // Get file details
-router.get('/files/:id', filesController.getFile);
+router.get('/files/:id', verifyAuth, filesController.getFile);
 
 // Download file
-router.get('/files/:id/download', filesController.downloadFile);
+router.get('/files/:id/download', verifyAuth, filesController.downloadFile);
 
 // Delete file
-router.delete('/files/:id', filesController.deleteFile);
+router.delete('/files/:id', verifyAuth, filesController.deleteFile);
 
 // Manually trigger file processing
-router.post('/files/:id/process', filesController.reprocessFile);
+router.post('/files/:id/process', verifyAuth, filesController.reprocessFile);
 
 /**
  * File Generation Routes
  */
 
 // Generate PDF or TXT file from content
-router.post('/files/generate', fileGenerationController.generateFile);
+router.post('/files/generate', verifyAuth, fileGenerationController.generateFile);
 
 // Generate PDF specifically
-router.post('/files/generate-pdf', fileGenerationController.generatePDFFile);
+router.post('/files/generate-pdf', verifyAuth, fileGenerationController.generatePDFFile);
 
 // Generate TXT file specifically
-router.post('/files/generate-txt', fileGenerationController.generateTextFile);
+router.post('/files/generate-txt', verifyAuth, fileGenerationController.generateTextFile);
 
 module.exports = router;
